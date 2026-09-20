@@ -1,0 +1,8 @@
+target/
+.anchor/
+test-ledger/
+genesis/ledger/
+genesis/*.json
+!genesis/primordial.yaml
+node_modules/
+.DS_Store
