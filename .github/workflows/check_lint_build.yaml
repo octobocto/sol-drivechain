@@ -1,0 +1,62 @@
+name: Check, Lint, Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  AGAVE_VERSION: stable
+
+jobs:
+  check-lint-test:
+    name: Check, Lint, Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install the pinned Rust toolchain
+        # The channel comes from rust-toolchain.toml, which is the one source.
+        run: rustup toolchain install
+
+      - name: Install the Agave CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/${AGAVE_VERSION}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Show the tool versions
+        run: |
+          rustc --version
+          cargo --version
+          solana --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
+          workspaces: |
+            .
+            daemon
+
+      - name: Rustfmt
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --all --manifest-path daemon/Cargo.toml -- --check
+
+      - name: Build the bridge program
+        run: cargo-build-sbf --manifest-path programs/bridge/Cargo.toml --sbf-out-dir target/deploy
+
+      - name: Clippy
+        run: |
+          cargo clippy --all-targets -- --deny warnings
+          cargo clippy --all-targets --manifest-path daemon/Cargo.toml -- --deny warnings
+
+      - name: Test the bridge program
+        run: cargo test --all-targets
+
+      - name: Test the daemon
+        run: cargo test --manifest-path daemon/Cargo.toml --all-targets
