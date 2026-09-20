@@ -37,7 +37,9 @@ impl EnforcerArgs {
 
 #[derive(clap::Args, Clone)]
 struct DeclarationArgs {
-    #[arg(long, default_value = "sol-drivechain")]
+    /// BitWindow lists this title beside Thunder and BitNames, so it reads as
+    /// a display name and not as a repository name.
+    #[arg(long, default_value = "Solana")]
     title: String,
     #[arg(long, default_value = "A Solana sidechain")]
     description: String,
