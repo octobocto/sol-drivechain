@@ -1,0 +1,94 @@
+name: Release
+
+# A BIP300 sidechain declaration names a release tarball and a build commit.
+# Both hashes go into the proposal hash, so the miner and the sidechain must
+# read the same two values. A release fixes them: GitHub keeps the exact bytes
+# of every asset and it publishes the SHA-256 of each one.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to build
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  release:
+    name: Build and publish the release tarball
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler libudev-dev \
+            clang libclang-dev cmake
+
+      - name: Install the Agave CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            daemon
+
+      - name: Build the bridge program
+        run: cargo-build-sbf --manifest-path programs/bridge/Cargo.toml --sbf-out-dir target/deploy
+
+      - name: Build the daemon
+        run: cargo build --release --manifest-path daemon/Cargo.toml
+
+      - name: Pack the tarball
+        id: pack
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="sol-drivechain-${version}-${TARGET}.tar.gz"
+          stage="$(mktemp -d)/sol-drivechain-${version}"
+          mkdir -p "$stage"
+          cp daemon/target/release/sol-drivechain-daemon "$stage/"
+          cp target/deploy/sol_drivechain_bridge.so "$stage/"
+          cp README.md LICENSE "$stage/" 2>/dev/null || true
+          tar -czf "$name" -C "$(dirname "$stage")" "sol-drivechain-${version}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$name" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Print the declaration hashes
+        run: |
+          echo "hashid1 (release tarball) ${{ steps.pack.outputs.sha256 }}"
+          echo "hashid2 (build commit)    $GITHUB_SHA"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pack.outputs.name }}
+          body: |
+            BIP300 sidechain declaration for slot 8:
+
+            - hashid1, the release tarball: `${{ steps.pack.outputs.sha256 }}`
+            - hashid2, the build commit: `${{ github.sha }}`
+
+            Read both again from the asset digest and the tag commit:
+
+            ```
+            gh release view ${{ github.ref_name }} --repo ${{ github.repository }} \
+              --json assets,targetCommitish
+            ```
