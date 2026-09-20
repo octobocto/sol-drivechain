@@ -6,3 +6,5 @@ genesis/*.json
 !genesis/primordial.yaml
 node_modules/
 .DS_Store
+keys/*.json
+target/deploy/*-keypair.json
