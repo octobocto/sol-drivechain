@@ -1,0 +1,15 @@
+	# The SOL drivechain JSON-RPC. The validator binds 127.0.0.1 only, and
+	# genesis/close-validator-ports.sh drops outside traffic to its other
+	# ports, so this proxy is the one way in.
+	handle_path /sol/* {
+		@sol_rpc method POST OPTIONS
+		handle @sol_rpc {
+			reverse_proxy 127.0.0.1:8899
+		}
+		respond "method not allowed" 405
+	}
+	# The websocket that a wallet subscribes on. Pass it as `wsEndpoint`,
+	# because a path proxy breaks the address a wallet would guess.
+	handle_path /sol-ws/* {
+		reverse_proxy 127.0.0.1:8900
+	}

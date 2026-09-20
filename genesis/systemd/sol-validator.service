@@ -1,0 +1,21 @@
+[Unit]
+Description=sol-drivechain Solana validator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=AGAVE_VALIDATOR=/root/src/agave/target/release/agave-validator
+Environment=PATH=/root/.local/share/solana/install/active_release/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=/root/src/sol-drivechain
+ExecStart=/usr/bin/bash /root/src/sol-drivechain/genesis/run-validator.sh
+# The validator opens many files at once.
+LimitNOFILE=1000000
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
