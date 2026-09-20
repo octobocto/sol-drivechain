@@ -1,0 +1,40 @@
+diff --git a/genesis/src/main.rs b/genesis/src/main.rs
+index d92fd92..b6879fc 100644
+--- a/genesis/src/main.rs
++++ b/genesis/src/main.rs
+@@ -66,6 +66,7 @@ use {
+ 
+ /// In order to satisfy the VAT we need to fund all vote accounts
+ /// This corresponds to 100 epochs worth of VAT
++#[allow(dead_code)]
+ const DEFAULT_VAT_MINIMUM_LAMPORTS: u64 = DEFAULT_VAT_TO_BURN_PER_EPOCH * 100;
+ 
+ pub enum AccountFileFormat {
+@@ -278,8 +279,10 @@ fn add_validator_accounts(
+             .map(|bls_pubkey| bls_pubkey.0)
+             .unwrap_or([0u8; BLS_PUBLIC_KEY_COMPRESSED_SIZE]);
+         // Vote account needs enough lamports for rent exemption plus VAT
+-        let vote_account_lamports =
+-            rent.minimum_balance(VoteStateV4::size_of()) + DEFAULT_VAT_MINIMUM_LAMPORTS;
++        // sol-drivechain: the genesis deactivates SIMD-0357, so no Validator
++        // Admission Ticket is ever burnt. A reserve for it would be money that
++        // no Bitcoin backs, and only the peg may change the money supply.
++        let vote_account_lamports = rent.minimum_balance(VoteStateV4::size_of());
+         let vote_account = vote_state::create_v4_account_with_authorized(
+             identity_pubkey,
+             identity_pubkey,
+diff --git a/runtime/src/bank/fee_distribution.rs b/runtime/src/bank/fee_distribution.rs
+index 1a9972d..aef794d 100644
+--- a/runtime/src/bank/fee_distribution.rs
++++ b/runtime/src/bank/fee_distribution.rs
+@@ -112,7 +112,9 @@ impl Bank {
+         // needing fee-rate-governor
+         static_assertions::const_assert!(solana_fee_calculator::DEFAULT_BURN_PERCENT <= 100);
+ 
+-        solana_fee_calculator::DEFAULT_BURN_PERCENT as u64
++        // sol-drivechain: a burnt fee destroys pegged Bitcoin, and only the
++        // peg may change the money supply. Upstream hard-codes 50 percent.
++        0
+     }
+ 
+     /// Attempts to deposit the given `deposit` amount into the fee collector account.
