@@ -49,10 +49,7 @@ pub enum PegError {
 }
 
 /// Reads the open withdrawal records, lowest index first.
-pub async fn open_records(
-    rpc: &RpcClient,
-    program_id: &Pubkey,
-) -> Result<Vec<bridge::WithdrawalRecord>, PegError> {
+async fn read_config(rpc: &RpcClient, program_id: &Pubkey) -> Result<bridge::Config, PegError> {
     let (config_key, _) = bridge::config_pda(program_id);
     let config_data = rpc
         .get_account_data(&config_key)
@@ -61,7 +58,14 @@ pub async fn open_records(
             call: "getAccountInfo(config)",
             source,
         })?;
-    let config = bridge::Config::decode(&config_data)?;
+    Ok(bridge::Config::decode(&config_data)?)
+}
+
+pub async fn open_records(
+    rpc: &RpcClient,
+    program_id: &Pubkey,
+) -> Result<Vec<bridge::WithdrawalRecord>, PegError> {
+    let config = read_config(rpc, program_id).await?;
 
     let keys: Vec<Pubkey> = (0..config.withdrawal_count)
         .map(|index| bridge::withdrawal_pda(program_id, index).0)
@@ -160,7 +164,27 @@ async fn deposit_loop(
     oracle: &Keypair,
 ) -> Result<(), PegError> {
     let mut pending = PendingDeposits::new(settings.confirmations);
+    // Subscribe before the backfill, so no block can fall between the two. A
+    // block that both carry goes into the queue twice, and the high-water
+    // check in `credit_deposit` skips the second credit.
     let mut stream = enforcer.subscribe_events().await?;
+
+    // The stream starts at the next block, and the queue lives in memory. A
+    // restart would lose every deposit that still waits, and every block that
+    // connected while the daemon was down.
+    let tip = enforcer.chain_tip().await?;
+    let history = enforcer.two_way_peg_data(tip).await?;
+    tracing::info!(blocks = history.len(), %tip, "the daemon replays the peg history");
+    for event in history {
+        if let PegEvent::Connect {
+            height, deposits, ..
+        } = event
+        {
+            for deposit in pending.connect(height, deposits) {
+                credit_deposit(rpc, settings, oracle, &deposit).await?;
+            }
+        }
+    }
 
     while let Some(item) = stream.next().await {
         let response = item.map_err(PegError::Stream)?;
@@ -223,6 +247,20 @@ async fn credit_deposit(
         }
     };
 
+    // A replay after a restart sees deposits the bridge credited long ago. The
+    // bridge would refuse them, and the refusal would stop the daemon.
+    let high_water = read_config(rpc, &settings.program_id)
+        .await?
+        .deposit_high_water;
+    if already_credited(deposit.sequence_number, high_water) {
+        tracing::debug!(
+            sequence_number = deposit.sequence_number,
+            high_water,
+            "the bridge already credited this deposit"
+        );
+        return Ok(());
+    }
+
     let instruction = bridge::deposit_ix(
         &settings.program_id,
         &oracle.pubkey(),
@@ -238,6 +276,14 @@ async fn credit_deposit(
         "the daemon credited a deposit"
     );
     Ok(())
+}
+
+/// True when the bridge already applied this mainchain sequence number.
+///
+/// The bridge holds the lowest number a deposit may still use, and it moves
+/// only forward.
+fn already_credited(sequence_number: u64, high_water: u64) -> bool {
+    sequence_number < high_water
 }
 
 async fn close_paid_records(
@@ -322,6 +368,29 @@ async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_number_below_the_high_water_is_already_credited() {
+        assert!(already_credited(4, 5));
+        assert!(already_credited(0, 1));
+    }
+
+    #[test]
+    fn the_high_water_itself_is_still_open() {
+        // The bridge stores the lowest number a deposit may still use.
+        assert!(!already_credited(5, 5));
+    }
+
+    #[test]
+    fn a_number_above_the_high_water_is_open() {
+        // A paid withdrawal also moves the mainchain counter, so gaps occur.
+        assert!(!already_credited(9, 5));
+    }
+
+    #[test]
+    fn nothing_is_credited_on_a_fresh_bridge() {
+        assert!(!already_credited(0, 0));
+    }
     use bitcoin::{absolute::LockTime, transaction::Version, TxOut};
 
     fn a_record(index: u64, payout_sats: u64, script: u8) -> bridge::WithdrawalRecord {

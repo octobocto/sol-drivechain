@@ -13,7 +13,7 @@ use crate::proto::mainchain::{
     withdrawal_bundle_event::event::Event as BundleEventKind,
     AckAllProposalsPolicy, CreateDepositTransactionRequest, CreateNewAddressRequest,
     GenerateToAddressRequest, GetBalanceRequest, GetChainInfoRequest, GetChainTipRequest,
-    GetCtipRequest, GetSidechainProposalsRequest, GetSidechainsRequest,
+    GetCtipRequest, GetSidechainProposalsRequest, GetSidechainsRequest, GetTwoWayPegDataRequest,
     GetWithdrawalBundleProposalsRequest, Network as ProtoNetwork, ProposeWithdrawalBundleRequest,
     SetAckAllProposalsRequest, SetSidechainAckRequest, SetWithdrawalBundlePolicyRequest,
     SidechainDeclaration, SubmitSidechainProposalRequest, SubscribeEventsRequest,
@@ -522,6 +522,33 @@ impl Enforcer {
         Ok(())
     }
 
+    /// Every block of this slot's peg history, oldest first, up to `end`.
+    ///
+    /// The event stream carries only blocks that connect after the daemon
+    /// subscribes, so a restart would miss the rest without this.
+    pub async fn two_way_peg_data(&mut self, end: BlockHash) -> Result<Vec<PegEvent>> {
+        let response = self
+            .validator
+            .get_two_way_peg_data(GetTwoWayPegDataRequest {
+                sidechain_id: Some(self.sidechain_id),
+                start_block_hash: None,
+                end_block_hash: Some(crate::proto::common::ReverseHex {
+                    hex: Some(end.to_string()),
+                }),
+            })
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "GetTwoWayPegData",
+                source,
+            })?
+            .into_inner();
+        response
+            .blocks
+            .into_iter()
+            .map(|item| connect_event(item.block_header_info, item.block_info))
+            .collect()
+    }
+
     pub async fn chain_tip(&mut self) -> Result<BlockHash> {
         let response = self
             .validator
@@ -658,38 +685,43 @@ pub fn peg_event(response: SubscribeEventsResponse) -> Result<PegEvent> {
             )?,
         }),
         StreamEvent::ConnectBlock(connect) => {
-            let header = connect
-                .header_info
-                .ok_or(EnforcerError::MissingField("header_info"))?;
-            let block_hash =
-                decode_reverse_hash(header.block_hash.and_then(|hash| hash.hex), "block_hash")?;
-            let block_info = connect
-                .block_info
-                .ok_or(EnforcerError::MissingField("block_info"))?;
-
-            let mut deposits = Vec::new();
-            let mut bundles = Vec::new();
-            for item in block_info.events {
-                match item
-                    .event
-                    .ok_or(EnforcerError::MissingField("block_info.event"))?
-                {
-                    crate::proto::mainchain::block_info::event::Event::Deposit(deposit) => {
-                        deposits.push(deposit_event(deposit)?);
-                    }
-                    crate::proto::mainchain::block_info::event::Event::WithdrawalBundle(bundle) => {
-                        bundles.push(bundle_event(bundle)?);
-                    }
-                }
-            }
-            Ok(PegEvent::Connect {
-                block_hash,
-                height: header.height,
-                deposits,
-                bundles,
-            })
+            connect_event(connect.header_info, connect.block_info)
         }
     }
+}
+
+/// Reads one connected block. The live stream and the backfill both give a
+/// header and a block body, so both go through here.
+fn connect_event(
+    header: Option<crate::proto::mainchain::BlockHeaderInfo>,
+    block_info: Option<crate::proto::mainchain::BlockInfo>,
+) -> Result<PegEvent> {
+    let header = header.ok_or(EnforcerError::MissingField("header_info"))?;
+    let block_hash =
+        decode_reverse_hash(header.block_hash.and_then(|hash| hash.hex), "block_hash")?;
+    let block_info = block_info.ok_or(EnforcerError::MissingField("block_info"))?;
+
+    let mut deposits = Vec::new();
+    let mut bundles = Vec::new();
+    for item in block_info.events {
+        match item
+            .event
+            .ok_or(EnforcerError::MissingField("block_info.event"))?
+        {
+            crate::proto::mainchain::block_info::event::Event::Deposit(deposit) => {
+                deposits.push(deposit_event(deposit)?);
+            }
+            crate::proto::mainchain::block_info::event::Event::WithdrawalBundle(bundle) => {
+                bundles.push(bundle_event(bundle)?);
+            }
+        }
+    }
+    Ok(PegEvent::Connect {
+        block_hash,
+        height: header.height,
+        deposits,
+        bundles,
+    })
 }
 
 fn deposit_event(deposit: crate::proto::mainchain::Deposit) -> Result<DepositEvent> {
