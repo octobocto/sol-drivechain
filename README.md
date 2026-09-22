@@ -152,7 +152,7 @@ D=daemon/target/debug/sol-drivechain-daemon
 E="--network regtest --enforcer-url http://127.0.0.1:19551 --slot 8"
 
 $D propose-slot $E
-ADDRESS=$($D wallet-address $E | head -1)
+ADDRESS=$($D wallet-address $E)
 $D mine $E --blocks 7 --address "$ADDRESS" --ack-new-slots
 $D status $E                       # the slot activates
 

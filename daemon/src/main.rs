@@ -454,8 +454,9 @@ fn main() -> Result<(), CliError> {
         Command::WalletAddress { enforcer } => runtime.block_on(async {
             let mut enforcer = enforcer.open().await?;
             let (confirmed, pending) = enforcer.wallet_balance().await?;
+            // Stdout holds the address alone, so a script captures it whole.
             println!("{}", enforcer.new_wallet_address().await?);
-            println!("balance {confirmed} sats confirmed, {pending} sats pending");
+            eprintln!("balance {confirmed} sats confirmed, {pending} sats pending");
             Ok(())
         }),
         Command::Deposit {
