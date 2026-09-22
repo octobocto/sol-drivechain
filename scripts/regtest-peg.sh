@@ -101,7 +101,7 @@ step "the bridge"
 
 step "claim sidechain slot $SLOT"
 "$D" propose-slot $E >/dev/null
-COINBASE="$("$D" wallet-address $E | head -1)"
+COINBASE="$("$D" wallet-address $E)"
 "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
 "$D" ack-slot $E >/dev/null
 "$D" mine $E --blocks 6 --address "$COINBASE" >/dev/null
@@ -128,11 +128,20 @@ echo "PASS: solana-keygen and the seed phrase name the same account"
 
 step "peg in $DEPOSIT_SATS sats"
 
-nohup "$D" run --network regtest --enforcer-url "$ENFORCER_URL" \
-  --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$PROGRAM_ID" \
-  --oracle "$ROOT/keys/oracle.json" --confirmations 1 --bundle-interval-secs 10 \
-  > "$ROOT/peg.log" 2>&1 &
-sleep 5
+start_peg() {
+  nohup "$D" run --network regtest --enforcer-url "$ENFORCER_URL" \
+    --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$PROGRAM_ID" \
+    --oracle "$ROOT/keys/oracle.json" --confirmations 1 --bundle-interval-secs 10 \
+    >> "$ROOT/peg.log" 2>&1 &
+  PEG_PID=$!
+  sleep 5
+}
+
+lamports_of() {
+  "$SOLANA" -u "$SOLANA_URL" balance "$1" --lamports 2>/dev/null | awk '{print $1}'
+}
+
+start_peg
 
 "$D" deposit $E --pubkey "$USER_PUBKEY" --sats "$DEPOSIT_SATS"
 "$D" mine $E --blocks 2 --address "$COINBASE" >/dev/null
@@ -147,6 +156,32 @@ done
 echo "PASS: the peg in credited $GOT lamports for $DEPOSIT_SATS sats"
 "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID"
 
+step "peg in while the daemon is down"
+# The event stream starts at the next block, so without a replay this deposit
+# would sit in the treasury and nobody could claim it.
+kill "$PEG_PID"
+wait "$PEG_PID" 2>/dev/null || true
+DOWN_SATS=1500000
+DOWN_PUBKEY="$("$D" seed-pubkey --mnemonic-file "$MNEMONIC_FILE" --account 1 | awk '{print $2}')"
+"$D" deposit $E --pubkey "$DOWN_PUBKEY" --sats "$DOWN_SATS"
+"$D" mine $E --blocks 2 --address "$COINBASE" >/dev/null
+start_peg
+
+WANT_DOWN=$((DOWN_SATS * 10))
+for _ in $(seq 1 30); do
+  GOT_DOWN="$(lamports_of "$DOWN_PUBKEY")"
+  [ "${GOT_DOWN:-0}" = "$WANT_DOWN" ] && break
+  sleep 3
+done
+[ "${GOT_DOWN:-0}" = "$WANT_DOWN" ] || fail "the downtime deposit gave ${GOT_DOWN:-0} lamports, not $WANT_DOWN"
+echo "PASS: the replay credited $GOT_DOWN lamports that landed while the daemon was down"
+
+# The replay also walks the first deposit. The bridge credited it before, so
+# the daemon must skip it, and stay up.
+[ "$(lamports_of "$USER_PUBKEY")" = "$WANT_LAMPORTS" ] || fail "the replay credited the first deposit twice"
+kill -0 "$PEG_PID" 2>/dev/null || fail "the daemon stopped on the replay"
+echo "PASS: the replay skipped the deposit it credited before, and the daemon runs"
+
 step "lose the wallet, then recover it from the seed phrase alone"
 rm -f "$USER_KEY"
 [ ! -f "$USER_KEY" ] || fail "the keypair file survived the delete"
@@ -159,7 +194,7 @@ RECOVERED_LAMPORTS="$("$SOLANA" -u "$SOLANA_URL" balance "$RECOVERED" --lamports
 echo "PASS: the seed phrase alone recovered the wallet and its $RECOVERED_LAMPORTS lamports"
 
 step "peg out $WITHDRAW_SATS sats, signed by the recovered wallet"
-PAYOUT_ADDRESS="$("$D" wallet-address $E | head -1)"
+PAYOUT_ADDRESS="$("$D" wallet-address $E)"
 echo "the payout goes to $PAYOUT_ADDRESS"
 
 BEFORE_SATS="$(received "$PAYOUT_ADDRESS")"
