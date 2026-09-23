@@ -339,6 +339,24 @@ treasury          3000000 sats
 The last two lines are the whole point. 30,000,000 lamports is 3,000,000
 satoshis, and the mainchain treasury holds 3,000,000 satoshis.
 
+## A standing regtest chain
+
+`scripts/regtest-peg.sh` proves the chain one time and takes it down.
+`scripts/regtest-chain.sh` keeps one up: a Bitcoin node, an enforcer, a
+validator, the peg, the BMM loop, and a miner that adds a block every 30
+seconds. The sidechain slot is active there, so bids win and settles pay,
+again and again.
+
+```sh
+bash scripts/regtest-chain.sh up
+bash scripts/regtest-chain.sh status
+bash scripts/regtest-chain.sh mine 5
+bash scripts/regtest-chain.sh down
+```
+
+`genesis/systemd/sol-regtest.service` runs the same chain as a service, so it
+comes back after a restart of the host.
+
 ## Two hosts on one regtest chain
 
 `scripts/regtest-two-hosts.sh` starts a stack here and a stack on a remote
