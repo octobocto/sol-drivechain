@@ -268,6 +268,17 @@ enum Command {
         #[command(flatten)]
         enforcer: EnforcerArgs,
     },
+    /// Sends one BIP301 bid for the next eCash block. The payee takes the
+    /// treasury if the bid wins. An operator or a test uses it.
+    BidBmm {
+        #[command(flatten)]
+        enforcer: EnforcerArgs,
+        /// The pubkey that takes the payout. It is the whole h*.
+        #[arg(long)]
+        payee: String,
+        #[arg(long)]
+        sats: u64,
+    },
     /// Settles one eCash height by hand. A test or an operator uses it.
     SettleBmm {
         #[arg(long, default_value = "http://127.0.0.1:8899")]
@@ -839,6 +850,21 @@ fn main() -> Result<(), CliError> {
             let mut enforcer = enforcer.open().await?;
             let (hash, height) = enforcer.tip().await?;
             println!("{height} {hash}");
+            Ok(())
+        }),
+        Command::BidBmm {
+            enforcer,
+            payee,
+            sats,
+        } => runtime.block_on(async {
+            let payee = parse_pubkey(&payee)?;
+            let mut enforcer = enforcer.open().await?;
+            let tip = enforcer.tip().await?;
+            let txid = enforcer
+                .create_bmm_request(sats, tip, &payee.to_bytes())
+                .await?;
+            println!("bid {sats} sats for eCash height {} as {txid}", tip.1 + 1);
+            println!("the payee is {payee}");
             Ok(())
         }),
         Command::SettleBmm {
