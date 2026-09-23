@@ -2,8 +2,7 @@
 # Builds the two Agave binaries that no CLI release carries, with the one
 # patch that this chain needs.
 #
-# The patch changes two things, and both exist so that only the peg may change
-# the money supply.
+# Only the peg may change the money supply:
 #
 # 1. Upstream hard-codes a 50 percent burn of every transaction fee. A burnt
 #    fee destroys pegged Bitcoin. The burn goes to zero.
@@ -11,8 +10,16 @@
 #    Ticket reserve. The genesis deactivates SIMD-0357, so no ticket is ever
 #    burnt, and the reserve would be money that no Bitcoin backs.
 #
-# To move to a later Agave, raise AGAVE_TAG and run this again. If the patch
-# stops applying, open the file and make the same one-line change.
+# BMM pays the fees to eCash miners:
+#
+# 3. Every fee goes to the bridge treasury, not to the leader.
+# 4. A simple vote pays no signature fee.
+# 5. The crate `sol-drivechain-bmm` reads settled eCash heights from the
+#    local enforcer. The bank checks each `settle_bmm` against it, and the
+#    syscall `sol_get_bmm_commitment` answers the bridge from it.
+# 6. The validator takes `--bmm-enforcer-url` and `--bmm-sidechain-slot`.
+#
+# To move to a later Agave, raise AGAVE_TAG and run this again.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,8 +53,7 @@ echo "agave $AGAVE_TAG is commit $(git rev-parse HEAD)"
 # `git apply` writes nothing when one hunk fails, so the tree stays on the tag.
 if ! git apply "$PATCH"; then
   echo "error: the patch does not apply to $AGAVE_TAG." >&2
-  echo "Make burn_percent() in runtime/src/bank/fee_distribution.rs return 0." >&2
-  echo "Drop DEFAULT_VAT_MINIMUM_LAMPORTS from genesis/src/main.rs." >&2
+  echo "Apply it to $AGAVE_TAG by hand, then write it again with git diff." >&2
   exit 1
 fi
 echo "the patch applies to $AGAVE_TAG"

@@ -1,3 +1,258 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 96da5bb..d7dcb6d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -279,6 +279,7 @@ name = "agave-reserved-account-keys"
+ version = "4.2.2"
+ dependencies = [
+  "agave-feature-set",
++ "sol-drivechain-bmm",
+  "solana-frozen-abi",
+  "solana-frozen-abi-macro",
+  "solana-message",
+@@ -413,6 +414,7 @@ dependencies = [
+  "serde",
+  "serde_json",
+  "serde_yaml",
++ "sol-drivechain-bmm",
+  "solana-account 4.3.1",
+  "solana-account-decoder",
+  "solana-accounts-db",
+@@ -6978,6 +6980,21 @@ dependencies = [
+  "sha1",
+ ]
+ 
++[[package]]
++name = "sol-drivechain-bmm"
++version = "4.2.2"
++dependencies = [
++ "hex",
++ "log",
++ "prost 0.14.4",
++ "solana-pubkey 4.2.0",
++ "solana-sha256-hasher",
++ "thiserror 2.0.18",
++ "tokio",
++ "tonic",
++ "tonic-prost",
++]
++
+ [[package]]
+ name = "solana-account"
+ version = "3.4.0"
+@@ -8515,7 +8532,12 @@ version = "4.2.2"
+ dependencies = [
+  "agave-feature-set",
+  "solana-fee-structure",
++ "solana-instruction",
++ "solana-message",
++ "solana-pubkey 4.2.0",
++ "solana-sdk-ids",
+  "solana-svm-transaction",
++ "solana-transaction",
+ ]
+ 
+ [[package]]
+@@ -10266,6 +10288,7 @@ dependencies = [
+  "crossbeam-channel",
+  "crossbeam-utils",
+  "dashmap",
++ "hex",
+  "imbl",
+  "itertools 0.14.0",
+  "libc",
+@@ -10287,6 +10310,7 @@ dependencies = [
+  "serde_with",
+  "shuttle",
+  "smallvec",
++ "sol-drivechain-bmm",
+  "solana-account 4.3.1",
+  "solana-account-info",
+  "solana-accounts-db",
+diff --git a/Cargo.toml b/Cargo.toml
+index 4231f07..42a1ad9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -103,6 +103,7 @@ members = [
+     "svm-measure",
+     "svm-timings",
+     "svm-type-overrides",
++    "sol-drivechain-bmm",
+     "syscalls",
+     "syscalls/gen-syscall-list",
+     "test-validator",
+@@ -502,6 +503,7 @@ solana-svm-measure = { path = "svm-measure", version = "=4.2.2", features = ["ag
+ solana-svm-timings = { path = "svm-timings", version = "=4.2.2", features = ["agave-unstable-api"] }
+ solana-svm-transaction = ">=4.2.0,<4.3.0"
+ solana-svm-type-overrides = { path = "svm-type-overrides", version = "=4.2.2", features = ["agave-unstable-api"] }
++sol-drivechain-bmm = { path = "sol-drivechain-bmm" }
+ solana-syscalls = { path = "syscalls", version = "=4.2.2", default-features = false, features = ["agave-unstable-api"] }
+ solana-system-interface = { version = ">=3.2.0,<3.3.0", features = ["alloc", "bincode", "serde", "wincode"] }
+ solana-system-program = { path = "programs/system", version = "=4.2.2", features = ["agave-unstable-api"] }
+diff --git a/core/src/banking_stage/consumer.rs b/core/src/banking_stage/consumer.rs
+index 9c1e4e5..c709057 100644
+--- a/core/src/banking_stage/consumer.rs
++++ b/core/src/banking_stage/consumer.rs
+@@ -342,6 +342,22 @@ impl Consumer {
+             balance_collector,
+         } = load_and_execute_transactions_output;
+ 
++        // sol-drivechain: a settle for an eCash block that is not deep enough
++        // yet stays in the queue, and the leader tries it again.
++        retryable_transaction_indexes.extend(processing_results.iter().enumerate().filter_map(
++            |(index, processing_result)| {
++                matches!(
++                    processing_result,
++                    Err(TransactionError::ProgramExecutionTemporarilyRestricted { .. })
++                )
++                .then_some(RetryableIndex {
++                    index,
++                    immediately_retryable: false,
++                })
++            },
++        ));
++        retryable_transaction_indexes.sort_unstable();
++
+         let transaction_counts = LeaderProcessedTransactionCounts {
+             processed_count: processed_counts.processed_transactions_count,
+             processed_with_successful_result_count: processed_counts
+diff --git a/fee/Cargo.toml b/fee/Cargo.toml
+index 518446a..0c12fa3 100644
+--- a/fee/Cargo.toml
++++ b/fee/Cargo.toml
+@@ -20,7 +20,14 @@ agave-unstable-api = []
+ [dependencies]
+ agave-feature-set = { workspace = true }
+ solana-fee-structure = { workspace = true }
++solana-sdk-ids = { workspace = true }
+ solana-svm-transaction = { workspace = true }
++solana-transaction = { workspace = true }
++
++[dev-dependencies]
++solana-instruction = { workspace = true }
++solana-message = { workspace = true }
++solana-pubkey = { workspace = true }
+ 
+ [lints]
+ workspace = true
+diff --git a/fee/src/lib.rs b/fee/src/lib.rs
+index 18bf1aa..6383fd3 100644
+--- a/fee/src/lib.rs
++++ b/fee/src/lib.rs
+@@ -2,6 +2,7 @@
+ use {
+     agave_feature_set::FeatureSet, solana_fee_structure::FeeDetails,
+     solana_svm_transaction::svm_message::SVMStaticMessage,
++    solana_transaction::versioned::TransactionVersion,
+ };
+ 
+ /// Bools indicating the activation of features relevant
+@@ -41,10 +42,28 @@ pub fn calculate_fee_details(
+     prioritization_fee: u64,
+     _fee_features: FeeFeatures,
+ ) -> FeeDetails {
+-    FeeDetails::new(
+-        calculate_signature_fee(SignatureCounts::from(message), lamports_per_signature),
+-        prioritization_fee,
+-    )
++    // sol-drivechain: all fees go to the treasury, and a validator gets them
++    // back only through BMM. A vote therefore pays no signature fee.
++    let signature_fee = if is_simple_vote(message) {
++        0
++    } else {
++        calculate_signature_fee(SignatureCounts::from(message), lamports_per_signature)
++    };
++    FeeDetails::new(signature_fee, prioritization_fee)
++}
++
++/// The same test as `is_simple_vote_transaction`: one or two signatures, a
++/// legacy message, and one instruction, to the vote program.
++pub fn is_simple_vote(message: &impl SVMStaticMessage) -> bool {
++    let mut programs = message
++        .program_instructions_iter()
++        .map(|(program_id, _instruction)| program_id);
++    message.num_transaction_signatures() < 3
++        && message.version() == TransactionVersion::LEGACY
++        && programs
++            .next()
++            .xor(programs.next())
++            .is_some_and(|program_id| program_id == &solana_sdk_ids::vote::ID)
+ }
+ 
+ /// Calculate fees from signatures.
+@@ -84,7 +103,71 @@ impl<Tx: SVMStaticMessage> From<&Tx> for SignatureCounts {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::*;
++    use {
++        super::*,
++        solana_instruction::{AccountMeta, Instruction},
++        solana_message::{Message, SanitizedMessage},
++        solana_pubkey::Pubkey,
++        std::collections::HashSet,
++    };
++
++    fn message(instructions: &[Instruction], extra_signers: u8) -> SanitizedMessage {
++        let payer = Pubkey::new_from_array([1; 32]);
++        let mut instructions = instructions.to_vec();
++        if let Some(first) = instructions.first_mut() {
++            for signer in 0..extra_signers {
++                let key = Pubkey::new_from_array([signer.saturating_add(2); 32]);
++                first.accounts.push(AccountMeta::new_readonly(key, true));
++            }
++        }
++        SanitizedMessage::try_from_legacy_message(
++            Message::new(&instructions, Some(&payer)),
++            &HashSet::new(),
++        )
++        .unwrap()
++    }
++
++    fn call(program_id: Pubkey) -> Instruction {
++        Instruction::new_with_bytes(program_id, &[1], vec![])
++    }
++
++    fn signature_fee(message: &SanitizedMessage) -> u64 {
++        calculate_fee_details(message, 5_000, 0, FeeFeatures {}).transaction_fee()
++    }
++
++    #[test]
++    fn a_simple_vote_pays_no_signature_fee() {
++        let vote = message(&[call(solana_sdk_ids::vote::ID)], 1);
++        assert!(is_simple_vote(&vote));
++        assert_eq!(signature_fee(&vote), 0);
++    }
++
++    #[test]
++    fn a_transfer_pays_the_signature_fee() {
++        let transfer = message(&[call(solana_sdk_ids::system_program::ID)], 0);
++        assert!(!is_simple_vote(&transfer));
++        assert_eq!(signature_fee(&transfer), 5_000);
++    }
++
++    #[test]
++    fn a_vote_with_a_second_instruction_pays_the_signature_fee() {
++        let both = message(
++            &[
++                call(solana_sdk_ids::vote::ID),
++                call(solana_sdk_ids::system_program::ID),
++            ],
++            0,
++        );
++        assert!(!is_simple_vote(&both));
++        assert_eq!(signature_fee(&both), 5_000);
++    }
++
++    #[test]
++    fn a_vote_with_three_signatures_pays_the_signature_fee() {
++        let crowded = message(&[call(solana_sdk_ids::vote::ID)], 2);
++        assert!(!is_simple_vote(&crowded));
++        assert_eq!(signature_fee(&crowded), 15_000);
++    }
+ 
+     #[test]
+     fn test_calculate_signature_fee() {
 diff --git a/genesis/src/main.rs b/genesis/src/main.rs
 index d92fd92..b6879fc 100644
 --- a/genesis/src/main.rs
@@ -23,8 +278,171 @@ index d92fd92..b6879fc 100644
          let vote_account = vote_state::create_v4_account_with_authorized(
              identity_pubkey,
              identity_pubkey,
+diff --git a/reserved-account-keys/Cargo.toml b/reserved-account-keys/Cargo.toml
+index 1432f72..e77c934 100644
+--- a/reserved-account-keys/Cargo.toml
++++ b/reserved-account-keys/Cargo.toml
+@@ -20,6 +20,7 @@ frozen-abi = ["dep:solana-frozen-abi", "dep:solana-frozen-abi-macro"]
+ 
+ [dependencies]
+ agave-feature-set = { workspace = true }
++sol-drivechain-bmm = { workspace = true }
+ solana-frozen-abi = { workspace = true, optional = true, features = [
+     "frozen-abi",
+ ] }
+diff --git a/reserved-account-keys/src/lib.rs b/reserved-account-keys/src/lib.rs
+index 0f9cf44..8c296a6 100644
+--- a/reserved-account-keys/src/lib.rs
++++ b/reserved-account-keys/src/lib.rs
+@@ -181,6 +181,9 @@ static RESERVED_ACCOUNTS: std::sync::LazyLock<Vec<ReservedAccount>> =
+             // other
+             ReservedAccount::new_active(native_loader::id()),
+             ReservedAccount::new_active(sysvar::id()),
++            // sol-drivechain: the runtime builds this account for each tx, so
++            // no tx may write it.
++            ReservedAccount::new_active(sol_drivechain_bmm::BMM_ANSWER_ID),
+         ]
+     });
+ 
+diff --git a/runtime/Cargo.toml b/runtime/Cargo.toml
+index 2c2292f..52634d7 100644
+--- a/runtime/Cargo.toml
++++ b/runtime/Cargo.toml
+@@ -75,6 +75,7 @@ dashmap = { workspace = true, features = ["rayon", "raw-api", "serde"] }
+ imbl = { workspace = true, features = ["rayon", "serde"] }
+ itertools = { workspace = true }
+ libc = { workspace = true }
++hex = { workspace = true }
+ log = { workspace = true }
+ mockall = { workspace = true }
+ num-derive = { workspace = true }
+@@ -90,6 +91,7 @@ serde_json = { workspace = true }
+ serde_with = { workspace = true }
+ shuttle = { workspace = true, optional = true }
+ smallvec = { workspace = true, features = ["serde"] }
++sol-drivechain-bmm = { workspace = true }
+ solana-account = { workspace = true }
+ solana-account-info = { workspace = true }
+ solana-accounts-db = { workspace = true }
+diff --git a/runtime/src/bank.rs b/runtime/src/bank.rs
+index c8399cb..5f5ad3a 100644
+--- a/runtime/src/bank.rs
++++ b/runtime/src/bank.rs
+@@ -233,6 +233,7 @@ use {
+ mod accounts_lt_hash;
+ mod address_lookup_table;
+ pub mod bank_hash_details;
++mod bmm;
+ pub mod builtins;
+ mod check_transactions;
+ pub mod entry_bytes_budget;
+@@ -3999,6 +4000,19 @@ impl Bank {
+         ));
+         timings.saturating_add_in_place(ExecuteTimingType::CheckUs, check_us);
+ 
++        // sol-drivechain: `TransactionProcessingConfig` documents
++        // `strict_nonce_size_check` as "a leader-side filtering policy. It
++        // must not be enabled for replay." A simulation sets
++        // `account_overrides`. Only replay has neither.
++        let bmm_check = if processing_config.strict_nonce_size_check
++            || processing_config.account_overrides.is_some()
++        {
++            bmm::BmmCheck::Leader
++        } else {
++            bmm::BmmCheck::Replay
++        };
++        let check_results = self.check_bmm_settles(sanitized_txs, check_results, bmm_check);
++
+         let (blockhash, blockhash_lamports_per_signature) =
+             self.last_blockhash_and_lamports_per_signature();
+         let effective_epoch_of_deployments =
+diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
+new file mode 100644
+index 0000000..10dbd58
+--- /dev/null
++++ b/runtime/src/bank/bmm.rs
+@@ -0,0 +1,79 @@
++//! sol-drivechain: the settle pre-check.
++//!
++//! `settle_bmm(H, M)` pays the winner of eCash block M at height H. Each
++//! validator asks its own enforcer before the tx runs, and it gives the
++//! answer to the bridge in the `BmmAnswer` account.
++
++use {
++    super::Bank,
++    sol_drivechain_bmm::{
++        BMM_ANSWER_ID, REPLAY_WAIT, answer_data, confirmations, settle_bmm_question, view,
++    },
++    solana_account::{Account, AccountSharedData},
++    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
++    solana_svm::account_loader::TransactionCheckResult,
++    solana_transaction_error::TransactionError,
++};
++
++/// Who runs the batch, which sets the depth and the wait of the check.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum BmmCheck {
++    /// A leader or a simulation. It needs N + 1 blocks on top, and it does not
++    /// wait. The banking stage tries a "not ready" tx again later.
++    Leader,
++    /// Replay of a block from another validator. It needs N blocks on top, and
++    /// it waits for the local enforcer.
++    Replay,
++}
++
++impl Bank {
++    /// Answers the first top-level `settle_bmm` of each tx, or fails the tx
++    /// as "not ready".
++    pub(super) fn check_bmm_settles(
++        &self,
++        sanitized_txs: &[impl TransactionWithMeta],
++        check_results: Vec<TransactionCheckResult>,
++        check: BmmCheck,
++    ) -> Vec<TransactionCheckResult> {
++        check_results
++            .into_iter()
++            .zip(sanitized_txs)
++            .map(|(result, tx)| {
++                let details = result?;
++                let Some((program_id_index, (height, block_hash))) = tx
++                    .program_instructions_iter()
++                    .find_map(|(program_id, instruction)| {
++                        settle_bmm_question(program_id, instruction.data)
++                            .map(|question| (instruction.program_id_index, question))
++                    })
++                else {
++                    return Ok(details);
++                };
++                let answer = match check {
++                    BmmCheck::Leader => {
++                        view().answer(height, &block_hash, confirmations().saturating_add(1))
++                    }
++                    BmmCheck::Replay => {
++                        view().wait_for_answer(height, &block_hash, confirmations(), REPLAY_WAIT)
++                    }
++                };
++                let Some(commitment) = answer else {
++                    log::debug!(
++                        "the BMM view has no answer for eCash height {height}, block {}, as {:?}",
++                        hex::encode(block_hash),
++                        check,
++                    );
++                    return Err(TransactionError::ProgramExecutionTemporarilyRestricted {
++                        account_index: program_id_index,
++                    });
++                };
++                let account = AccountSharedData::from(Account {
++                    data: answer_data(height, &block_hash, commitment).to_vec(),
++                    owner: solana_sdk_ids::sysvar::id(),
++                    ..Account::default()
++                });
++                Ok(details.with_runtime_account(BMM_ANSWER_ID, account))
++            })
++            .collect()
++    }
++}
 diff --git a/runtime/src/bank/fee_distribution.rs b/runtime/src/bank/fee_distribution.rs
-index 1a9972d..aef794d 100644
+index 1a9972d..a4c4975 100644
 --- a/runtime/src/bank/fee_distribution.rs
 +++ b/runtime/src/bank/fee_distribution.rs
 @@ -112,7 +112,9 @@ impl Bank {
@@ -38,3 +456,1429 @@ index 1a9972d..aef794d 100644
      }
  
      /// Attempts to deposit the given `deposit` amount into the fee collector account.
+@@ -123,33 +125,10 @@ impl Bank {
+             return 0;
+         }
+ 
+-        // Per SIMD-0232: the commission collector address should be fetched
+-        // from the state of the vote account at the beginning of the previous
+-        // epoch. This is the vote account state used to build the leader
+-        // schedule for the current epoch, which *DOES NOT* correspond to
+-        // `Bank::current_epoch_stakes()`.
+-        let feature_snapshot = self.feature_set.snapshot();
+-        let collector_id = if feature_snapshot.custom_commission_collector {
+-            let vote_account = self
+-                .epoch_stakes
+-                .get(&self.epoch)
+-                .and_then(|stakes| {
+-                    stakes
+-                        .stakes()
+-                        .vote_accounts()
+-                        .get(&self.leader.vote_address)
+-                })
+-                .expect("The vote account for the leader must exist");
+-            // Protection in case the leader is on a vote state without a
+-            // collector id, which can happen if a dormant pre-v4 vote state
+-            // accrues stake.
+-            vote_account
+-                .vote_state_view()
+-                .block_revenue_collector()
+-                .unwrap_or(&self.leader.id)
+-        } else {
+-            &self.leader.id
+-        };
++        // sol-drivechain: every fee goes to the bridge treasury. A validator
++        // gets fees only when it wins a BMM bid on eCash and settles it.
++        let treasury = sol_drivechain_bmm::treasury();
++        let collector_id = &treasury;
+ 
+         match self.deposit_fees(collector_id, deposit) {
+             Ok(post_balance) => {
+diff --git a/sol-drivechain-bmm/Cargo.toml b/sol-drivechain-bmm/Cargo.toml
+new file mode 100644
+index 0000000..2ad3b1a
+--- /dev/null
++++ b/sol-drivechain-bmm/Cargo.toml
+@@ -0,0 +1,30 @@
++[package]
++name = "sol-drivechain-bmm"
++description = "The eCash view that lets the SOL drivechain settle BMM wins"
++version = { workspace = true }
++authors = { workspace = true }
++repository = { workspace = true }
++homepage = { workspace = true }
++license = { workspace = true }
++edition = { workspace = true }
++publish = false
++
++[features]
++# The enforcer client. Only the validator binary starts the poller.
++poller = ["dep:hex", "dep:log", "dep:prost", "dep:thiserror", "dep:tokio", "dep:tonic", "dep:tonic-prost"]
++
++[dependencies]
++hex = { workspace = true, optional = true }
++log = { workspace = true, optional = true }
++prost = { workspace = true, optional = true }
++solana-pubkey = { workspace = true, features = ["curve25519"] }
++thiserror = { workspace = true, optional = true }
++tokio = { workspace = true, features = ["rt", "time"], optional = true }
++tonic = { workspace = true, features = ["transport"], optional = true }
++tonic-prost = { workspace = true, optional = true }
++
++[dev-dependencies]
++solana-sha256-hasher = { workspace = true }
++
++[lints]
++workspace = true
+diff --git a/sol-drivechain-bmm/src/enforcer.rs b/sol-drivechain-bmm/src/enforcer.rs
+new file mode 100644
+index 0000000..4a3af6f
+--- /dev/null
++++ b/sol-drivechain-bmm/src/enforcer.rs
+@@ -0,0 +1,379 @@
++//! A small gRPC client for the enforcer `ValidatorService`. It holds only the
++//! messages that the BMM view reads, so Agave needs no proto build step.
++
++use {
++    crate::{BlockHash, Commitment},
++    tonic::{codegen::http::uri::PathAndQuery, transport::Channel},
++    tonic_prost::ProstCodec,
++};
++
++#[derive(Debug, thiserror::Error)]
++pub enum EnforcerError {
++    #[error("cannot connect to the enforcer at {url}: {source}")]
++    Connect {
++        url: String,
++        source: tonic::transport::Error,
++    },
++    #[error("the enforcer URL {0} is not valid")]
++    BadUrl(String),
++    #[error("the enforcer call {call} failed: {source}")]
++    Call {
++        call: &'static str,
++        source: tonic::Status,
++    },
++    #[error("the enforcer reply to {call} has no {field}")]
++    MissingField {
++        call: &'static str,
++        field: &'static str,
++    },
++    #[error("the enforcer does not know block {0}")]
++    BlockNotFound(String),
++    #[error("the enforcer gave an h* that is not 32 bytes of hex: {0}")]
++    BadCommitment(String),
++    #[error("the enforcer gave a block hash that is not 32 bytes of hex: {0}")]
++    BadBlockHash(String),
++}
++
++/// google.protobuf.StringValue
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct StringValue {
++    #[prost(string, tag = "1")]
++    pub value: String,
++}
++
++/// google.protobuf.UInt32Value
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct UInt32Value {
++    #[prost(uint32, tag = "1")]
++    pub value: u32,
++}
++
++/// cusf.common.v1.ReverseHex and cusf.common.v1.ConsensusHex share this shape.
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct HexValue {
++    #[prost(message, optional, tag = "1")]
++    pub hex: Option<StringValue>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct GetChainTipRequest {}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct BlockHeaderInfo {
++    #[prost(message, optional, tag = "1")]
++    pub block_hash: Option<HexValue>,
++    #[prost(message, optional, tag = "2")]
++    pub prev_block_hash: Option<HexValue>,
++    #[prost(uint32, tag = "3")]
++    pub height: u32,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct GetChainTipResponse {
++    #[prost(message, optional, tag = "1")]
++    pub block_header_info: Option<BlockHeaderInfo>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct GetBlockHeaderInfoRequest {
++    #[prost(message, optional, tag = "1")]
++    pub block_hash: Option<HexValue>,
++    #[prost(uint32, optional, tag = "2")]
++    pub max_ancestors: Option<u32>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct GetBlockHeaderInfoResponse {
++    #[prost(message, repeated, tag = "1")]
++    pub header_infos: Vec<BlockHeaderInfo>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct GetBmmHStarCommitmentRequest {
++    #[prost(message, optional, tag = "1")]
++    pub block_hash: Option<HexValue>,
++    #[prost(message, optional, tag = "2")]
++    pub sidechain_id: Option<UInt32Value>,
++    #[prost(uint32, optional, tag = "3")]
++    pub max_ancestors: Option<u32>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct OptionalCommitment {
++    #[prost(message, optional, tag = "1")]
++    pub commitment: Option<HexValue>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct CommitmentReply {
++    #[prost(message, optional, tag = "1")]
++    pub commitment: Option<HexValue>,
++    /// Newest first.
++    #[prost(message, repeated, tag = "2")]
++    pub ancestor_commitments: Vec<OptionalCommitment>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct BlockNotFoundError {
++    #[prost(message, optional, tag = "1")]
++    pub block_hash: Option<HexValue>,
++}
++
++#[derive(Clone, PartialEq, prost::Oneof)]
++pub enum CommitmentResult {
++    #[prost(message, tag = "1")]
++    BlockNotFound(BlockNotFoundError),
++    #[prost(message, tag = "2")]
++    Commitment(CommitmentReply),
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct GetBmmHStarCommitmentResponse {
++    #[prost(oneof = "CommitmentResult", tags = "1, 2")]
++    pub result: Option<CommitmentResult>,
++}
++
++/// An eCash block, named by its hash in the reversed hex of the enforcer.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Header {
++    pub hash: String,
++    pub prev_hash: String,
++    pub height: u64,
++}
++
++/// Reads the reversed hex of the enforcer into the internal byte order.
++pub fn decode_block_hash(text: &str) -> Result<BlockHash, EnforcerError> {
++    let mut bytes = hex::decode(text).map_err(|_| EnforcerError::BadBlockHash(text.to_owned()))?;
++    bytes.reverse();
++    bytes
++        .try_into()
++        .map_err(|_| EnforcerError::BadBlockHash(text.to_owned()))
++}
++
++pub struct Enforcer {
++    grpc: tonic::client::Grpc<Channel>,
++}
++
++impl Enforcer {
++    pub async fn connect(url: &str) -> Result<Self, EnforcerError> {
++        let endpoint = Channel::from_shared(url.to_owned())
++            .map_err(|_| EnforcerError::BadUrl(url.to_owned()))?;
++        let channel = endpoint
++            .connect()
++            .await
++            .map_err(|source| EnforcerError::Connect {
++                url: url.to_owned(),
++                source,
++            })?;
++        Ok(Self {
++            grpc: tonic::client::Grpc::new(channel),
++        })
++    }
++
++    async fn unary<Request, Response>(
++        &mut self,
++        call: &'static str,
++        path: &'static str,
++        request: Request,
++    ) -> Result<Response, EnforcerError>
++    where
++        Request: prost::Message + Send + Sync + 'static,
++        Response: prost::Message + Default + Send + Sync + 'static,
++    {
++        self.grpc
++            .ready()
++            .await
++            .map_err(|source| EnforcerError::Call {
++                call,
++                source: tonic::Status::unavailable(source.to_string()),
++            })?;
++        self.grpc
++            .unary(
++                tonic::Request::new(request),
++                PathAndQuery::from_static(path),
++                ProstCodec::<Request, Response>::default(),
++            )
++            .await
++            .map(tonic::Response::into_inner)
++            .map_err(|source| EnforcerError::Call { call, source })
++    }
++
++    pub async fn chain_tip(&mut self) -> Result<Header, EnforcerError> {
++        let response: GetChainTipResponse = self
++            .unary(
++                "GetChainTip",
++                "/cusf.mainchain.v1.ValidatorService/GetChainTip",
++                GetChainTipRequest {},
++            )
++            .await?;
++        let info = response
++            .block_header_info
++            .ok_or(EnforcerError::MissingField {
++                call: "GetChainTip",
++                field: "block_header_info",
++            })?;
++        header(info, "GetChainTip")
++    }
++
++    /// The header of `block_hash` and up to `max_ancestors` of its ancestors.
++    pub async fn headers(
++        &mut self,
++        block_hash: &str,
++        max_ancestors: u32,
++    ) -> Result<Vec<Header>, EnforcerError> {
++        let response: GetBlockHeaderInfoResponse = self
++            .unary(
++                "GetBlockHeaderInfo",
++                "/cusf.mainchain.v1.ValidatorService/GetBlockHeaderInfo",
++                GetBlockHeaderInfoRequest {
++                    block_hash: Some(hex_value(block_hash)),
++                    max_ancestors: Some(max_ancestors),
++                },
++            )
++            .await?;
++        response
++            .header_infos
++            .into_iter()
++            .map(|info| header(info, "GetBlockHeaderInfo"))
++            .collect()
++    }
++
++    /// The h* of `block_hash` for the sidechain, then the h* of up to
++    /// `max_ancestors` ancestors, newest first.
++    pub async fn commitments(
++        &mut self,
++        block_hash: &str,
++        sidechain_slot: u8,
++        max_ancestors: u32,
++    ) -> Result<Vec<Option<Commitment>>, EnforcerError> {
++        let response: GetBmmHStarCommitmentResponse = self
++            .unary(
++                "GetBmmHStarCommitment",
++                "/cusf.mainchain.v1.ValidatorService/GetBmmHStarCommitment",
++                GetBmmHStarCommitmentRequest {
++                    block_hash: Some(hex_value(block_hash)),
++                    sidechain_id: Some(UInt32Value {
++                        value: u32::from(sidechain_slot),
++                    }),
++                    max_ancestors: Some(max_ancestors),
++                },
++            )
++            .await?;
++        match response.result {
++            Some(CommitmentResult::Commitment(found)) => {
++                let mut commitments =
++                    Vec::with_capacity(found.ancestor_commitments.len().saturating_add(1));
++                commitments.push(decode_commitment(found.commitment)?);
++                for ancestor in found.ancestor_commitments {
++                    commitments.push(decode_commitment(ancestor.commitment)?);
++                }
++                Ok(commitments)
++            }
++            Some(CommitmentResult::BlockNotFound(_)) => {
++                Err(EnforcerError::BlockNotFound(block_hash.to_owned()))
++            }
++            None => Err(EnforcerError::MissingField {
++                call: "GetBmmHStarCommitment",
++                field: "result",
++            }),
++        }
++    }
++}
++
++fn hex_value(text: &str) -> HexValue {
++    HexValue {
++        hex: Some(StringValue {
++            value: text.to_owned(),
++        }),
++    }
++}
++
++fn hex_text(value: Option<HexValue>) -> Option<String> {
++    value.and_then(|value| value.hex).map(|hex| hex.value)
++}
++
++fn header(info: BlockHeaderInfo, call: &'static str) -> Result<Header, EnforcerError> {
++    Ok(Header {
++        hash: hex_text(info.block_hash).ok_or(EnforcerError::MissingField {
++            call,
++            field: "block_hash",
++        })?,
++        prev_hash: hex_text(info.prev_block_hash).ok_or(EnforcerError::MissingField {
++            call,
++            field: "prev_block_hash",
++        })?,
++        height: u64::from(info.height),
++    })
++}
++
++/// Reads a ConsensusHex h*, which holds the bytes in the order of the coinbase.
++pub fn decode_commitment(value: Option<HexValue>) -> Result<Option<Commitment>, EnforcerError> {
++    let Some(text) = hex_text(value) else {
++        return Ok(None);
++    };
++    let bytes = hex::decode(&text).map_err(|_| EnforcerError::BadCommitment(text.clone()))?;
++    let commitment: Commitment = bytes
++        .try_into()
++        .map_err(|_| EnforcerError::BadCommitment(text))?;
++    Ok(Some(commitment))
++}
++
++#[cfg(test)]
++mod tests {
++    use {super::*, prost::Message as _};
++
++    #[test]
++    fn a_missing_commitment_reads_as_none() {
++        assert_eq!(decode_commitment(None).unwrap(), None);
++        assert_eq!(
++            decode_commitment(Some(HexValue { hex: None })).unwrap(),
++            None
++        );
++    }
++
++    #[test]
++    fn a_hex_commitment_keeps_its_byte_order() {
++        let mut expected = [0u8; 32];
++        expected[0] = 0xab;
++        expected[31] = 0x01;
++        let text = hex::encode(expected);
++        assert_eq!(
++            decode_commitment(Some(hex_value(&text))).unwrap(),
++            Some(expected)
++        );
++    }
++
++    #[test]
++    fn a_block_hash_reads_in_the_internal_byte_order() {
++        let mut text = "00".repeat(31);
++        text.push_str("ab");
++        let hash = decode_block_hash(&text).unwrap();
++        assert_eq!(hash[0], 0xab);
++        assert_eq!(hash[31], 0x00);
++        assert!(decode_block_hash("abcd").is_err());
++    }
++
++    #[test]
++    fn a_short_commitment_fails() {
++        assert!(decode_commitment(Some(hex_value("abcd"))).is_err());
++    }
++
++    #[test]
++    fn the_commitment_reply_decodes_from_the_wire() {
++        // Field numbers from cusf/mainchain/v1/validator.proto.
++        let reply = GetBmmHStarCommitmentResponse {
++            result: Some(CommitmentResult::Commitment(CommitmentReply {
++                commitment: Some(hex_value(&"11".repeat(32))),
++                ancestor_commitments: vec![
++                    OptionalCommitment { commitment: None },
++                    OptionalCommitment {
++                        commitment: Some(hex_value(&"22".repeat(32))),
++                    },
++                ],
++            })),
++        };
++        let bytes = reply.encode_to_vec();
++        let decoded = GetBmmHStarCommitmentResponse::decode(bytes.as_slice()).unwrap();
++        assert_eq!(decoded, reply);
++    }
++}
+diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
+new file mode 100644
+index 0000000..c99da14
+--- /dev/null
++++ b/sol-drivechain-bmm/src/lib.rs
+@@ -0,0 +1,423 @@
++//! The eCash view of a SOL drivechain validator.
++//!
++//! Each validator reads the active eCash chain from its own enforcer. Before a
++//! `settle_bmm(H, M)` runs, the runtime asks this view one question: is block
++//! M the active block at height H, deep enough, and which commitment does its
++//! coinbase hold for the sidechain? The answer goes into the `BmmAnswer`
++//! account of that tx.
++
++#[cfg(feature = "poller")]
++mod enforcer;
++#[cfg(feature = "poller")]
++mod poller;
++
++#[cfg(feature = "poller")]
++pub use poller::start_poller;
++use {
++    solana_pubkey::Pubkey,
++    std::{
++        collections::BTreeMap,
++        sync::{
++            Condvar, Mutex, OnceLock,
++            atomic::{AtomicU64, Ordering},
++        },
++        time::{Duration, Instant},
++    },
++};
++
++/// The bridge program of the SOL drivechain.
++pub const BRIDGE_PROGRAM_ID: Pubkey =
++    Pubkey::from_str_const("ARA8mQfWk85ULDLAujy3b8gLknFF2QzrsAKHYbc8beu");
++
++/// The account that holds the pre-check answer for one tx. The runtime builds
++/// it for each tx, the same way as the instructions sysvar.
++pub const BMM_ANSWER_ID: Pubkey =
++    Pubkey::from_str_const("BmmAnswer1111111111111111111111111111111111");
++
++/// The seed of the treasury PDA, which collects every transaction fee.
++pub const TREASURY_SEED: &[u8] = b"treasury";
++
++/// The Anchor discriminator of `settle_bmm`: sha256("global:settle_bmm")[..8].
++pub const SETTLE_BMM_DISCRIMINATOR: [u8; 8] = [223, 214, 151, 212, 138, 42, 77, 15];
++
++/// The confirmation count when the validator flag does not set one.
++pub const DEFAULT_CONFIRMATIONS: u64 = 6;
++
++/// Replay waits this long for the local enforcer before it rejects a block.
++pub const REPLAY_WAIT: Duration = Duration::from_secs(30);
++
++/// The size of the `BmmAnswer` data: height, block hash, found, commitment.
++pub const BMM_ANSWER_LEN: usize = 8 + 32 + 1 + 32;
++
++/// A 32-byte block hash, in the internal byte order of Bitcoin. That is the
++/// reverse of the hex that block explorers show.
++pub type BlockHash = [u8; 32];
++
++/// A 32-byte BMM commitment from an eCash coinbase.
++pub type Commitment = [u8; 32];
++
++static CONFIRMATIONS: AtomicU64 = AtomicU64::new(DEFAULT_CONFIRMATIONS);
++
++/// Sets N, the blocks that must be on top of a settled block. Every validator
++/// of a cluster must use the same N.
++pub fn set_confirmations(confirmations: u64) {
++    CONFIRMATIONS.store(confirmations, Ordering::Relaxed);
++}
++
++/// N, the blocks that must be on top of a settled block.
++pub fn confirmations() -> u64 {
++    CONFIRMATIONS.load(Ordering::Relaxed)
++}
++
++/// The treasury PDA of the bridge.
++pub fn treasury() -> Pubkey {
++    static TREASURY: OnceLock<Pubkey> = OnceLock::new();
++    *TREASURY.get_or_init(|| Pubkey::find_program_address(&[TREASURY_SEED], &BRIDGE_PROGRAM_ID).0)
++}
++
++/// The eCash height and block that a `settle_bmm` instruction names, or `None`
++/// for any other instruction.
++pub fn settle_bmm_question(program_id: &Pubkey, data: &[u8]) -> Option<(u64, BlockHash)> {
++    if program_id != &BRIDGE_PROGRAM_ID {
++        return None;
++    }
++    let (discriminator, arguments) = data.split_first_chunk::<8>()?;
++    if discriminator != &SETTLE_BMM_DISCRIMINATOR {
++        return None;
++    }
++    let (height, rest) = arguments.split_first_chunk::<8>()?;
++    let block_hash = rest.first_chunk::<32>()?;
++    Some((u64::from_le_bytes(*height), *block_hash))
++}
++
++/// The data of the `BmmAnswer` account for one question and its answer.
++pub fn answer_data(
++    height: u64,
++    block_hash: &BlockHash,
++    commitment: Option<Commitment>,
++) -> [u8; BMM_ANSWER_LEN] {
++    let mut data = [0u8; BMM_ANSWER_LEN];
++    data[..8].copy_from_slice(&height.to_le_bytes());
++    data[8..40].copy_from_slice(block_hash);
++    if let Some(commitment) = commitment {
++        data[40] = 1;
++        data[41..].copy_from_slice(&commitment);
++    }
++    data
++}
++
++/// One block of the active eCash chain.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Block {
++    pub hash: BlockHash,
++    pub prev_hash: BlockHash,
++    pub commitment: Option<Commitment>,
++}
++
++#[derive(Default)]
++struct State {
++    /// The height of the active tip.
++    tip_height: Option<u64>,
++    /// The active chain, from the lowest height that the view holds up to
++    /// the tip.
++    active: BTreeMap<u64, Block>,
++    /// The lowest height that a caller asked for and the view did not hold.
++    wanted_low: Option<u64>,
++}
++
++/// The active eCash chain of the local enforcer.
++#[derive(Default)]
++pub struct BmmView {
++    state: Mutex<State>,
++    changed: Condvar,
++}
++
++/// The view that the runtime reads.
++pub fn view() -> &'static BmmView {
++    static VIEW: OnceLock<BmmView> = OnceLock::new();
++    VIEW.get_or_init(BmmView::default)
++}
++
++impl BmmView {
++    /// The commitment of block `block_hash` if it is the active block at
++    /// `height` with at least `depth` blocks on top of it. `Some(None)` means
++    /// that its coinbase holds no commitment for the sidechain. `None` means
++    /// not ready.
++    pub fn answer(
++        &self,
++        height: u64,
++        block_hash: &BlockHash,
++        depth: u64,
++    ) -> Option<Option<Commitment>> {
++        let mut state = self.state.lock().unwrap();
++        Self::answer_locked(&mut state, height, block_hash, depth)
++    }
++
++    /// The same as `answer`, but it waits up to `timeout` for the enforcer.
++    pub fn wait_for_answer(
++        &self,
++        height: u64,
++        block_hash: &BlockHash,
++        depth: u64,
++        timeout: Duration,
++    ) -> Option<Option<Commitment>> {
++        let deadline = Instant::now().checked_add(timeout)?;
++        let mut state = self.state.lock().unwrap();
++        loop {
++            if let Some(answer) = Self::answer_locked(&mut state, height, block_hash, depth) {
++                return Some(answer);
++            }
++            let remaining = deadline.checked_duration_since(Instant::now())?;
++            state = self.changed.wait_timeout(state, remaining).unwrap().0;
++        }
++    }
++
++    fn answer_locked(
++        state: &mut State,
++        height: u64,
++        block_hash: &BlockHash,
++        depth: u64,
++    ) -> Option<Option<Commitment>> {
++        let lowest = state.active.keys().next().copied();
++        if lowest.is_some_and(|lowest| height < lowest) {
++            state.wanted_low = Some(state.wanted_low.map_or(height, |wanted| wanted.min(height)));
++            return None;
++        }
++        if state.tip_height?.checked_sub(height)? < depth {
++            return None;
++        }
++        let block = state.active.get(&height)?;
++        (&block.hash == block_hash).then_some(block.commitment)
++    }
++
++    /// Replaces the active chain from the lowest height in `blocks` upward.
++    /// `blocks` runs from low to high and ends at the new tip.
++    pub fn replace_from(&self, blocks: &[(u64, Block)]) {
++        let (Some(&(lowest, _)), Some(&(tip_height, _))) = (blocks.first(), blocks.last()) else {
++            return;
++        };
++        let mut state = self.state.lock().unwrap();
++        state.active.split_off(&lowest);
++        state.active.extend(blocks.iter().copied());
++        state.tip_height = Some(tip_height);
++        if state.wanted_low.is_some_and(|wanted| wanted >= lowest) {
++            state.wanted_low = None;
++        }
++        self.changed.notify_all();
++    }
++
++    /// Adds older blocks below the lowest block that the view holds.
++    pub fn extend_below(&self, blocks: &[(u64, Block)]) {
++        let mut state = self.state.lock().unwrap();
++        let lowest = state.active.keys().next().copied();
++        for (height, block) in blocks {
++            if lowest.is_none_or(|lowest| *height < lowest) {
++                state.active.insert(*height, *block);
++            }
++        }
++        let new_lowest = state.active.keys().next().copied();
++        if let (Some(wanted), Some(new_lowest)) = (state.wanted_low, new_lowest)
++            && wanted >= new_lowest
++        {
++            state.wanted_low = None;
++        }
++        self.changed.notify_all();
++    }
++
++    /// The active block at `height`, if the view holds it.
++    pub fn block_at(&self, height: u64) -> Option<Block> {
++        self.state.lock().unwrap().active.get(&height).copied()
++    }
++
++    /// The height and hash of the active tip.
++    pub fn tip(&self) -> Option<(u64, BlockHash)> {
++        let state = self.state.lock().unwrap();
++        state
++            .active
++            .iter()
++            .next_back()
++            .map(|(height, block)| (*height, block.hash))
++    }
++
++    /// The lowest height that the view holds.
++    pub fn lowest(&self) -> Option<u64> {
++        self.state.lock().unwrap().active.keys().next().copied()
++    }
++
++    /// The lowest height that a caller asked for and the view did not hold.
++    pub fn wanted_low(&self) -> Option<u64> {
++        self.state.lock().unwrap().wanted_low
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use {super::*, std::sync::Arc};
++
++    fn hash(byte: u8) -> BlockHash {
++        [byte; 32]
++    }
++
++    /// Blocks from `from` to `to`. The hash of height `h` is `[h + salt; 32]`,
++    /// and even heights hold the commitment `[h; 32]`.
++    fn chain(from: u64, to: u64, salt: u8) -> Vec<(u64, Block)> {
++        (from..=to)
++            .map(|height| {
++                let low = height as u8;
++                (
++                    height,
++                    Block {
++                        hash: hash(low.wrapping_add(salt)),
++                        prev_hash: hash(low.wrapping_sub(1).wrapping_add(salt)),
++                        commitment: (height % 2 == 0).then_some([low; 32]),
++                    },
++                )
++            })
++            .collect()
++    }
++
++    fn settle_data(height: u64, block_hash: &BlockHash) -> Vec<u8> {
++        let mut data = SETTLE_BMM_DISCRIMINATOR.to_vec();
++        data.extend_from_slice(&height.to_le_bytes());
++        data.extend_from_slice(block_hash);
++        data
++    }
++
++    #[test]
++    fn the_discriminator_is_eight_bytes_of_sha256() {
++        let digest = solana_sha256_hasher::hash(b"global:settle_bmm").to_bytes();
++        assert_eq!(SETTLE_BMM_DISCRIMINATOR, digest[..8]);
++    }
++
++    #[test]
++    fn a_settle_instruction_gives_its_question() {
++        assert_eq!(
++            settle_bmm_question(&BRIDGE_PROGRAM_ID, &settle_data(42, &hash(7))),
++            Some((42, hash(7)))
++        );
++    }
++
++    #[test]
++    fn another_program_gives_no_question() {
++        let other = Pubkey::new_from_array([9; 32]);
++        assert_eq!(
++            settle_bmm_question(&other, &settle_data(42, &hash(7))),
++            None
++        );
++    }
++
++    #[test]
++    fn another_instruction_gives_no_question() {
++        let mut data = settle_data(42, &hash(7));
++        data[0] ^= 1;
++        assert_eq!(settle_bmm_question(&BRIDGE_PROGRAM_ID, &data), None);
++    }
++
++    #[test]
++    fn short_data_gives_no_question() {
++        let data = settle_data(42, &hash(7));
++        assert_eq!(settle_bmm_question(&BRIDGE_PROGRAM_ID, &data[..47]), None);
++    }
++
++    #[test]
++    fn the_answer_data_holds_the_question_and_the_commitment() {
++        let data = answer_data(42, &hash(7), Some(hash(9)));
++        assert_eq!(&data[..8], &42u64.to_le_bytes());
++        assert_eq!(&data[8..40], &hash(7));
++        assert_eq!(data[40], 1);
++        assert_eq!(&data[41..], &hash(9));
++        let none = answer_data(42, &hash(7), None);
++        assert_eq!(none[40], 0);
++        assert_eq!(&none[41..], &[0u8; 32]);
++    }
++
++    #[test]
++    fn the_treasury_is_the_bridge_pda() {
++        let expected = Pubkey::find_program_address(&[b"treasury"], &BRIDGE_PROGRAM_ID).0;
++        assert_eq!(treasury(), expected);
++    }
++
++    #[test]
++    fn an_empty_view_is_not_ready() {
++        let view = BmmView::default();
++        assert_eq!(view.answer(10, &hash(10), 6), None);
++    }
++
++    #[test]
++    fn an_active_block_deep_enough_gives_its_commitment() {
++        let view = BmmView::default();
++        view.replace_from(&chain(100, 110, 0));
++        assert_eq!(view.answer(104, &hash(104), 6), Some(Some([104; 32])));
++        assert_eq!(view.answer(103, &hash(103), 6), Some(None));
++    }
++
++    #[test]
++    fn a_block_without_enough_blocks_on_top_is_not_ready() {
++        let view = BmmView::default();
++        view.replace_from(&chain(100, 110, 0));
++        assert_eq!(view.answer(105, &hash(105), 6), None);
++        assert_eq!(view.answer(105, &hash(105), 5), Some(None));
++    }
++
++    #[test]
++    fn a_block_that_is_not_active_is_not_ready() {
++        let view = BmmView::default();
++        view.replace_from(&chain(100, 110, 0));
++        assert_eq!(view.answer(104, &hash(200), 6), None);
++    }
++
++    #[test]
++    fn a_reorg_replaces_the_active_blocks() {
++        let view = BmmView::default();
++        view.replace_from(&chain(100, 110, 0));
++        view.replace_from(&chain(104, 120, 50));
++        assert_eq!(view.answer(104, &hash(104), 6), None);
++        assert_eq!(view.answer(104, &hash(104 + 50), 6), Some(Some([104; 32])));
++        assert_eq!(view.block_at(103).map(|block| block.hash), Some(hash(103)));
++    }
++
++    #[test]
++    fn a_shorter_new_chain_drops_the_old_blocks_above_it() {
++        let view = BmmView::default();
++        view.replace_from(&chain(100, 120, 0));
++        view.replace_from(&chain(110, 112, 50));
++        assert_eq!(view.block_at(115), None);
++        assert_eq!(view.tip(), Some((112, hash(112 + 50))));
++    }
++
++    #[test]
++    fn a_question_below_the_view_asks_for_a_backfill() {
++        let view = BmmView::default();
++        view.replace_from(&chain(100, 120, 0));
++        assert_eq!(view.answer(90, &hash(90), 6), None);
++        assert_eq!(view.wanted_low(), Some(90));
++        view.extend_below(&chain(90, 99, 0));
++        assert_eq!(view.wanted_low(), None);
++        assert_eq!(view.answer(90, &hash(90), 6), Some(Some([90; 32])));
++    }
++
++    #[test]
++    fn wait_for_answer_returns_when_the_block_is_deep_enough() {
++        let view = Arc::new(BmmView::default());
++        view.replace_from(&chain(100, 105, 0));
++        let writer = Arc::clone(&view);
++        let handle = std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(50));
++            writer.replace_from(&chain(106, 110, 0));
++        });
++        assert_eq!(
++            view.wait_for_answer(104, &hash(104), 6, Duration::from_secs(10)),
++            Some(Some([104; 32]))
++        );
++        handle.join().unwrap();
++    }
++
++    #[test]
++    fn wait_for_answer_gives_up_after_the_timeout() {
++        let view = BmmView::default();
++        assert_eq!(
++            view.wait_for_answer(5, &hash(5), 6, Duration::from_millis(20)),
++            None
++        );
++    }
++}
+diff --git a/sol-drivechain-bmm/src/poller.rs b/sol-drivechain-bmm/src/poller.rs
+new file mode 100644
+index 0000000..872956f
+--- /dev/null
++++ b/sol-drivechain-bmm/src/poller.rs
+@@ -0,0 +1,292 @@
++//! Copies the active eCash chain from the local enforcer into the view.
++
++use {
++    crate::{
++        Block, BlockHash, BmmView,
++        enforcer::{Enforcer, EnforcerError, Header, decode_block_hash},
++        view,
++    },
++    std::{
++        sync::{
++            Arc,
++            atomic::{AtomicBool, Ordering},
++        },
++        thread::JoinHandle,
++        time::Duration,
++    },
++};
++
++/// At start, the view reads this many blocks below the tip.
++const INITIAL_WINDOW: u64 = 4032;
++
++/// A tip change first reads this many blocks, then doubles until the new
++/// blocks connect to the view.
++const FIRST_REORG_SPAN: u64 = 16;
++
++/// The largest ancestor count in one enforcer call.
++const MAX_BATCH: u64 = 1000;
++
++const POLL_INTERVAL: Duration = Duration::from_millis(500);
++const RETRY_INTERVAL: Duration = Duration::from_secs(1);
++
++/// After this many failures in a row, the poller writes an error, not a
++/// warning. At one second per try that is about one minute.
++const FAILURES_BEFORE_ALARM: u32 = 60;
++
++/// While the enforcer stays away, the poller repeats the error this often.
++const FAILURES_BETWEEN_ALARMS: u32 = 300;
++
++/// Starts the thread that keeps the view in step with the enforcer at
++/// `enforcer_url`, for the sidechain in `sidechain_slot`.
++pub fn start_poller(
++    enforcer_url: String,
++    sidechain_slot: u8,
++    exit: Arc<AtomicBool>,
++) -> std::io::Result<JoinHandle<()>> {
++    std::thread::Builder::new()
++        .name("solBmmPoller".to_owned())
++        .spawn(move || {
++            let runtime = match tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++            {
++                Ok(runtime) => runtime,
++                Err(error) => {
++                    log::error!("the BMM poller cannot start a tokio runtime: {error}");
++                    return;
++                }
++            };
++            runtime.block_on(poll(enforcer_url, sidechain_slot, exit));
++        })
++}
++
++/// True when a failure count deserves an error in the log. An operator must
++/// see a stalled enforcer before a settle arrives, because the validator
++/// rejects a block with a settle that it cannot check.
++pub(crate) fn alarm_now(failures: u32) -> bool {
++    match failures.checked_sub(FAILURES_BEFORE_ALARM) {
++        None => false,
++        Some(0) => true,
++        Some(since_alarm) => since_alarm.is_multiple_of(FAILURES_BETWEEN_ALARMS),
++    }
++}
++
++async fn poll(enforcer_url: String, sidechain_slot: u8, exit: Arc<AtomicBool>) {
++    let mut enforcer = None;
++    let mut failures: u32 = 0;
++    while !exit.load(Ordering::Relaxed) {
++        let connected = match enforcer.as_mut() {
++            Some(connected) => connected,
++            None => match Enforcer::connect(&enforcer_url).await {
++                Ok(connected) => {
++                    log::info!("the BMM poller reads eCash from {enforcer_url}");
++                    failures = 0;
++                    enforcer.insert(connected)
++                }
++                Err(error) => {
++                    failures = failures.saturating_add(1);
++                    report(failures, &error.to_string());
++                    tokio::time::sleep(RETRY_INTERVAL).await;
++                    continue;
++                }
++            },
++        };
++        match sync(connected, sidechain_slot, view()).await {
++            Ok(()) => {
++                failures = 0;
++                tokio::time::sleep(POLL_INTERVAL).await;
++            }
++            Err(error) => {
++                failures = failures.saturating_add(1);
++                report(failures, &error.to_string());
++                enforcer = None;
++                tokio::time::sleep(RETRY_INTERVAL).await;
++            }
++        }
++    }
++}
++
++fn report(failures: u32, error: &str) {
++    if alarm_now(failures) {
++        log::error!(
++            "the BMM poller cannot read eCash after {failures} tries: {error}. This validator \
++             rejects every block with a BMM settle until the enforcer answers again."
++        );
++    } else {
++        log::warn!("the BMM poller failed, and it connects again: {error}");
++    }
++}
++
++/// Brings the view to the enforcer tip, and fills any old heights that a
++/// caller asked for.
++async fn sync(
++    enforcer: &mut Enforcer,
++    sidechain_slot: u8,
++    view: &BmmView,
++) -> Result<(), EnforcerError> {
++    let tip = enforcer.chain_tip().await?;
++    let tip_hash = decode_block_hash(&tip.hash)?;
++    if view.tip() != Some((tip.height, tip_hash)) {
++        follow_tip(enforcer, sidechain_slot, view, &tip).await?;
++    }
++    backfill(enforcer, sidechain_slot, view).await
++}
++
++/// True when a run of new blocks joins the view. The parent of its lowest
++/// block must be the block that the view holds at that height. Without this
++/// test a jump of the tip leaves a gap, and every height in the gap stays
++/// unanswered.
++pub(crate) fn connects(lowest: u64, oldest_prev_hash: &BlockHash, parent: Option<Block>) -> bool {
++    lowest == 0 || parent.is_some_and(|parent| &parent.hash == oldest_prev_hash)
++}
++
++/// Reads blocks down from the tip until they connect to the view, then puts
++/// them in place of the old blocks at those heights.
++async fn follow_tip(
++    enforcer: &mut Enforcer,
++    sidechain_slot: u8,
++    view: &BmmView,
++    tip: &Header,
++) -> Result<(), EnforcerError> {
++    let mut span = if view.tip().is_none() {
++        INITIAL_WINDOW
++    } else {
++        FIRST_REORG_SPAN
++    };
++    loop {
++        let from = tip.height.saturating_sub(span);
++        let blocks = read_down(enforcer, sidechain_slot, &tip.hash, tip.height, from).await?;
++        let Some(&(lowest, oldest)) = blocks.first() else {
++            return Ok(());
++        };
++        let parent = lowest.checked_sub(1).and_then(|below| view.block_at(below));
++        if connects(lowest, &oldest.prev_hash, parent) || span >= INITIAL_WINDOW {
++            if !connects(lowest, &oldest.prev_hash, parent) {
++                log::warn!(
++                    "the BMM view reaches only eCash height {lowest}, and the heights below it \
++                     stay unanswered until a backfill"
++                );
++            }
++            log::debug!(
++                "the BMM view takes eCash heights {lowest} to {} from the enforcer",
++                tip.height
++            );
++            view.replace_from(&blocks);
++            return Ok(());
++        }
++        span = span.saturating_mul(2).min(INITIAL_WINDOW);
++    }
++}
++
++/// Reads the heights below the view that a caller asked for.
++async fn backfill(
++    enforcer: &mut Enforcer,
++    sidechain_slot: u8,
++    view: &BmmView,
++) -> Result<(), EnforcerError> {
++    let (Some(wanted), Some(lowest)) = (view.wanted_low(), view.lowest()) else {
++        return Ok(());
++    };
++    let (Some(below), Some(block)) = (lowest.checked_sub(1), view.block_at(lowest)) else {
++        return Ok(());
++    };
++    if wanted > below {
++        return Ok(());
++    }
++    let prev_hash_hex = hex::encode(block.prev_hash.iter().rev().copied().collect::<Vec<_>>());
++    let blocks = read_down(enforcer, sidechain_slot, &prev_hash_hex, below, wanted).await?;
++    view.extend_below(&blocks);
++    Ok(())
++}
++
++/// Reads the blocks from `top` (at `top_height`) down to `from`, and returns
++/// them from low to high. It returns fewer if the enforcer holds no BMM data
++/// below its start height.
++async fn read_down(
++    enforcer: &mut Enforcer,
++    sidechain_slot: u8,
++    top: &str,
++    top_height: u64,
++    from: u64,
++) -> Result<Vec<(u64, Block)>, EnforcerError> {
++    let mut blocks = Vec::new();
++    let mut cursor_hash = top.to_owned();
++    let mut cursor_height = top_height;
++    loop {
++        let span = cursor_height.saturating_sub(from).min(MAX_BATCH);
++        let ancestors = u32::try_from(span).unwrap_or(u32::MAX);
++        let commitments = enforcer
++            .commitments(&cursor_hash, sidechain_slot, ancestors)
++            .await?;
++        let headers = enforcer.headers(&cursor_hash, ancestors).await?;
++        let count = commitments.len().min(headers.len());
++        for (header, commitment) in headers.iter().zip(commitments).take(count) {
++            blocks.push((
++                header.height,
++                Block {
++                    hash: decode_block_hash(&header.hash)?,
++                    prev_hash: decode_block_hash(&header.prev_hash)?,
++                    commitment,
++                },
++            ));
++        }
++        let Some(oldest) = count.checked_sub(1).and_then(|index| headers.get(index)) else {
++            break;
++        };
++        let Some(below) = oldest.height.checked_sub(1) else {
++            break;
++        };
++        if oldest.height <= from || (count as u64) <= span {
++            break;
++        }
++        cursor_hash = oldest.prev_hash.clone();
++        cursor_height = below;
++    }
++    blocks.reverse();
++    Ok(blocks)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn block(byte: u8, prev: u8) -> Block {
++        Block {
++            hash: [byte; 32],
++            prev_hash: [prev; 32],
++            commitment: None,
++        }
++    }
++
++    #[test]
++    fn the_alarm_waits_for_a_minute_and_then_repeats() {
++        assert!(!alarm_now(1));
++        assert!(!alarm_now(FAILURES_BEFORE_ALARM - 1));
++        assert!(alarm_now(FAILURES_BEFORE_ALARM));
++        assert!(!alarm_now(FAILURES_BEFORE_ALARM + 1));
++        assert!(alarm_now(FAILURES_BEFORE_ALARM + FAILURES_BETWEEN_ALARMS));
++        assert!(alarm_now(
++            FAILURES_BEFORE_ALARM + 2 * FAILURES_BETWEEN_ALARMS
++        ));
++    }
++
++    #[test]
++    fn the_genesis_block_always_connects() {
++        assert!(connects(0, &[0; 32], None));
++    }
++
++    #[test]
++    fn a_run_connects_when_the_view_holds_its_parent() {
++        assert!(connects(10, &[9; 32], Some(block(9, 8))));
++    }
++
++    #[test]
++    fn a_run_with_no_parent_in_the_view_does_not_connect() {
++        assert!(!connects(10, &[9; 32], None));
++    }
++
++    #[test]
++    fn a_run_after_a_reorg_of_its_parent_does_not_connect() {
++        assert!(!connects(10, &[9; 32], Some(block(99, 98))));
++    }
++}
+diff --git a/svm/src/account_loader.rs b/svm/src/account_loader.rs
+index b395d0f..07775ee 100644
+--- a/svm/src/account_loader.rs
++++ b/svm/src/account_loader.rs
+@@ -76,6 +76,10 @@ pub(crate) enum TransactionLoadResult {
+ pub struct CheckedTransactionDetails {
+     pub(crate) nonce_address: Option<Pubkey>,
+     pub(crate) compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits,
++    /// sol-drivechain: an account that the runtime builds for this tx, the
++    /// same way as the instructions sysvar. The loader puts it in place of
++    /// the stored account with the same key.
++    pub(crate) runtime_account: Option<(Pubkey, AccountSharedData)>,
+ }
+ 
+ #[cfg(feature = "dev-context-only-utils")]
+@@ -88,6 +92,7 @@ impl Default for CheckedTransactionDetails {
+                 loaded_accounts_data_size_limit: 32,
+                 fee_details: FeeDetails::default(),
+             },
++            runtime_account: None,
+         }
+     }
+ }
+@@ -100,8 +105,34 @@ impl CheckedTransactionDetails {
+         Self {
+             nonce_address,
+             compute_budget_and_limits,
++            runtime_account: None,
+         }
+     }
++
++    /// Adds an account that the runtime builds for this tx.
++    pub fn with_runtime_account(mut self, key: Pubkey, account: AccountSharedData) -> Self {
++        self.runtime_account = Some((key, account));
++        self
++    }
++}
++
++/// Puts the account that the runtime built in place of the loaded account
++/// with the same key. A tx that does not list the key gets nothing.
++pub(crate) fn place_runtime_account(
++    load_result: TransactionLoadResult,
++    runtime_account: Option<(Pubkey, AccountSharedData)>,
++) -> TransactionLoadResult {
++    match (load_result, runtime_account) {
++        (TransactionLoadResult::Loaded(mut loaded), Some((key, account))) => {
++            for (loaded_key, loaded_account) in loaded.accounts.iter_mut() {
++                if *loaded_key == key {
++                    *loaded_account = account.clone();
++                }
++            }
++            TransactionLoadResult::Loaded(loaded)
++        }
++        (load_result, _) => load_result,
++    }
+ }
+ 
+ #[derive(PartialEq, Eq, Debug, Clone)]
+@@ -709,6 +740,50 @@ mod tests {
+         },
+     };
+ 
++    #[test]
++    fn the_runtime_account_takes_the_place_of_the_loaded_account() {
++        let key = Pubkey::new_unique();
++        let other = Pubkey::new_unique();
++        let built = AccountSharedData::from(Account {
++            data: vec![7; 4],
++            owner: sysvar::id(),
++            ..Account::default()
++        });
++        let loaded = TransactionLoadResult::Loaded(LoadedTransaction {
++            accounts: vec![
++                (other, AccountSharedData::default()),
++                (key, AccountSharedData::default()),
++            ],
++            ..LoadedTransaction::default()
++        });
++        let TransactionLoadResult::Loaded(placed) =
++            place_runtime_account(loaded, Some((key, built.clone())))
++        else {
++            panic!("the tx stays loaded");
++        };
++        assert_eq!(placed.accounts[1].1, built);
++        assert_eq!(placed.accounts[0].1, AccountSharedData::default());
++    }
++
++    #[test]
++    fn a_tx_that_does_not_list_the_key_gets_no_runtime_account() {
++        let other = Pubkey::new_unique();
++        let loaded = TransactionLoadResult::Loaded(LoadedTransaction {
++            accounts: vec![(other, AccountSharedData::default())],
++            ..LoadedTransaction::default()
++        });
++        let built = AccountSharedData::from(Account {
++            data: vec![7; 4],
++            ..Account::default()
++        });
++        let TransactionLoadResult::Loaded(placed) =
++            place_runtime_account(loaded, Some((Pubkey::new_unique(), built)))
++        else {
++            panic!("the tx stays loaded");
++        };
++        assert_eq!(placed.accounts, vec![(other, AccountSharedData::default())]);
++    }
++
+     fn setup_test_logger() {
+         let _ = env_logger::Builder::from_env(env_logger::Env::new().default_filter_or("error"))
+             .format_timestamp_nanos()
+diff --git a/svm/src/transaction_processor.rs b/svm/src/transaction_processor.rs
+index 460a4d9..29b7c7b 100644
+--- a/svm/src/transaction_processor.rs
++++ b/svm/src/transaction_processor.rs
+@@ -3,7 +3,7 @@ use {
+         account_loader::{
+             AccountLoader, CheckedTransactionDetails, LoadedTransaction, TransactionCheckResult,
+             TransactionLoadResult, ValidatedTransactionDetails, load_transaction,
+-            update_rent_exempt_status_for_account, validate_fee_payer,
++            place_runtime_account, update_rent_exempt_status_for_account, validate_fee_payer,
+         },
+         account_overrides::AccountOverrides,
+         message_processor::process_message,
+@@ -465,6 +465,13 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
+         // in the same batch may modify the same accounts. Transaction order is
+         // preserved within entries written to the ledger.
+         for (tx, check_result) in sanitized_txs.iter().zip(check_results) {
++            let (check_result, runtime_account) = match check_result {
++                Ok(mut details) => {
++                    let runtime_account = details.runtime_account.take();
++                    (Ok(details), runtime_account)
++                }
++                Err(error) => (Err(error), None),
++            };
+             let (validate_result, validate_fees_us) =
+                 measure_us!(check_result.and_then(|tx_details| {
+                     Self::validate_transaction_nonce_and_fee_payer(
+@@ -482,12 +489,15 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
+             execute_timings
+                 .saturating_add_in_place(ExecuteTimingType::ValidateFeesUs, validate_fees_us);
+ 
+-            let (load_result, single_load_us) = measure_us!(load_transaction(
+-                &mut account_loader,
+-                tx,
+-                validate_result,
+-                &mut error_metrics,
+-                &environment.rent,
++            let (load_result, single_load_us) = measure_us!(place_runtime_account(
++                load_transaction(
++                    &mut account_loader,
++                    tx,
++                    validate_result,
++                    &mut error_metrics,
++                    &environment.rent,
++                ),
++                runtime_account,
+             ));
+             load_us = load_us.saturating_add(single_load_us);
+ 
+@@ -687,6 +697,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
+         let CheckedTransactionDetails {
+             nonce_address,
+             compute_budget_and_limits,
++            runtime_account: _,
+         } = checked_details;
+ 
+         // If this is a nonce transaction, validate the nonce info.
+diff --git a/validator/Cargo.toml b/validator/Cargo.toml
+index 2b88952..d0ee0e7 100644
+--- a/validator/Cargo.toml
++++ b/validator/Cargo.toml
+@@ -47,6 +47,7 @@ rayon = { workspace = true }
+ serde = { workspace = true }
+ serde_json = { workspace = true }
+ serde_yaml = { workspace = true }
++sol-drivechain-bmm = { workspace = true, features = ["poller"] }
+ solana-account = { workspace = true }
+ solana-accounts-db = { workspace = true }
+ solana-clap-utils = { workspace = true }
+diff --git a/validator/src/commands/run/args.rs b/validator/src/commands/run/args.rs
+index a1683a4..dde7d04 100644
+--- a/validator/src/commands/run/args.rs
++++ b/validator/src/commands/run/args.rs
+@@ -499,6 +499,36 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a,
+             .hidden(hidden_unless_forced())
+             .help("Skip the check for PoH speed."),
+     )
++    .arg(
++        Arg::with_name("bmm_enforcer_url")
++            .long("bmm-enforcer-url")
++            .value_name("URL")
++            .takes_value(true)
++            .requires("bmm_sidechain_slot")
++            .help(
++                "The gRPC URL of the local eCash enforcer. The validator reads BMM commitments \
++                 from it, and it cannot check a block with a BMM settle without it.",
++            ),
++    )
++    .arg(
++        Arg::with_name("bmm_sidechain_slot")
++            .long("bmm-sidechain-slot")
++            .value_name("SLOT")
++            .takes_value(true)
++            .requires("bmm_enforcer_url")
++            .help("The BIP300 slot of the sidechain on eCash."),
++    )
++    .arg(
++        Arg::with_name("bmm_confirmations")
++            .long("bmm-confirmations")
++            .value_name("N")
++            .takes_value(true)
++            .default_value("6")
++            .help(
++                "The eCash blocks that must be on top of a block before a BMM settle for it can \
++                 run. Every validator of the cluster must use the same value.",
++            ),
++    )
+     .arg(
+         Arg::with_name("no_os_network_limits_test")
+             .hidden(hidden_unless_forced())
+diff --git a/validator/src/commands/run/execute.rs b/validator/src/commands/run/execute.rs
+index 683eebb..48c98e7 100644
+--- a/validator/src/commands/run/execute.rs
++++ b/validator/src/commands/run/execute.rs
+@@ -271,6 +271,16 @@ pub fn execute(
+ 
+     let exit = Arc::new(AtomicBool::new(false));
+ 
++    // sol-drivechain: a validator reads eCash from its own enforcer.
++    sol_drivechain_bmm::set_confirmations(value_t_or_exit!(matches, "bmm_confirmations", u64));
++    if let Some(enforcer_url) = matches.value_of("bmm_enforcer_url") {
++        let sidechain_slot = value_t_or_exit!(matches, "bmm_sidechain_slot", u8);
++        sol_drivechain_bmm::start_poller(enforcer_url.to_owned(), sidechain_slot, exit.clone())
++            .map_err(|error| format!("cannot start the BMM poller: {error}"))?;
++    } else {
++        warn!("no --bmm-enforcer-url: this validator cannot check a block with a BMM settle");
++    }
++
+     #[cfg(not(target_os = "linux"))]
+     let _ = config;
+ 
