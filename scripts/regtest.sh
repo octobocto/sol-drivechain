@@ -111,6 +111,7 @@ start_enforcer() {
     --enable-wallet \
     --wallet-auto-create \
     --wallet-sync-source=disabled \
+    --enable-mempool \
     --log-level=info \
     > "$ENFORCER_DIR/enforcer.log" 2>&1 &
   for _ in $(seq 1 60); do
