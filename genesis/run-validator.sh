@@ -102,6 +102,12 @@ fi
 if [ -n "${NO_SNAPSHOT_FETCH:-}" ]; then
   EXTRA_ARGS+=(--no-snapshot-fetch --no-genesis-fetch)
 fi
+# The RPC passes an airdrop call to this faucet. A browser then asks the chain
+# for test money with the stock `requestAirdrop` call. The faucet holds pegged
+# BTC, so a drip carries Bitcoin behind it.
+if [ -n "${FAUCET_ADDRESS:-}" ]; then
+  EXTRA_ARGS+=(--rpc-faucet-address "$FAUCET_ADDRESS")
+fi
 
 # A node with NO_VOTE only replays. It carries no vote account.
 VOTE_ARGS=(
