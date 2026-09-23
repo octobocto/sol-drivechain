@@ -137,16 +137,21 @@ claim_slot() {
   echo "slot $SLOT is active"
 }
 
+# Mines until the enforcer wallet holds the coins of the faucet and a margin.
+# A coinbase takes 100 blocks to mature, so a fresh chain mines a few hundred.
 fund_wallet() {
-  local balance
-  balance="$("$D" wallet-balance $E 2>/dev/null | awk '/^confirmed/ {print $2}')"
-  if [ "${balance:-0}" -gt 100000000 ]; then
-    echo "the enforcer wallet holds $balance sats"
-    return 0
-  fi
-  echo "funding the enforcer wallet"
-  "$D" mine $E --blocks 101 --address "$(new_address)" >/dev/null
-  sleep 3
+  local want balance
+  want=$(( (FAUCET_BTC + 10) * 100000000 ))
+  for _ in $(seq 1 30); do
+    balance="$("$D" wallet-balance $E 2>/dev/null | awk '/^confirmed/ {print $2}')"
+    if [ "${balance:-0}" -ge "$want" ]; then
+      echo "the enforcer wallet holds $balance sats"
+      return 0
+    fi
+    "$D" mine $E --blocks 25 --address "$(new_address)" >/dev/null
+    sleep 1
+  done
+  fail "the enforcer wallet holds ${balance:-0} sats, and the faucet asks for $want"
 }
 
 # Pegs BTC into the faucet key. The faucet then pays out coins that a deposit
