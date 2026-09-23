@@ -15,6 +15,14 @@ pub const MIN_PAYOUT_SATS: u64 = 546;
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";
+pub const TREASURY_SEED: &[u8] = b"treasury";
+
+/// The account that the patched validator builds for each tx with a
+/// top-level `settle_bmm`. It holds the answer of the local enforcer.
+pub const BMM_ANSWER_ID: Pubkey = pubkey!("BmmAnswer1111111111111111111111111111111111");
+
+/// The `BmmAnswer` data: height, block hash, found, commitment.
+pub const BMM_ANSWER_LEN: usize = 8 + 32 + 1 + 32;
 
 const OP_RETURN: u8 = 0x6a;
 
@@ -22,14 +30,81 @@ const OP_RETURN: u8 = 0x6a;
 pub mod bridge {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, oracle: Pubkey) -> Result<()> {
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        oracle: Pubkey,
+        bmm_start_height: u64,
+    ) -> Result<()> {
         let config = &mut ctx.accounts.config;
         config.oracle = oracle;
         config.deposit_high_water = 0;
         config.pegged_lamports = 0;
         config.withdrawal_count = 0;
+        config.bmm_next_height = bmm_start_height;
+        config.bmm_paid_total = 0;
         config.bump = ctx.bumps.config;
         config.vault_bump = ctx.bumps.vault;
+        config.treasury_bump = ctx.bumps.treasury;
+        Ok(())
+    }
+
+    /// Settles eCash height `height`, which block `block_hash` holds on the
+    /// active chain. The payee in its BMM commitment gets the whole treasury.
+    pub fn settle_bmm(ctx: Context<SettleBmm>, height: u64, block_hash: [u8; 32]) -> Result<()> {
+        require_eq!(
+            height,
+            ctx.accounts.config.bmm_next_height,
+            BridgeError::HeightOutOfOrder
+        );
+        let answer = BmmAnswer::read(&ctx.accounts.bmm_answer)?;
+        require!(
+            answer.height == height && answer.block_hash == block_hash,
+            BridgeError::AnswerForAnotherQuestion
+        );
+
+        if let Some(commitment) = answer.commitment {
+            let payee = &ctx.accounts.payee;
+            require_keys_eq!(
+                payee.key(),
+                Pubkey::new_from_array(commitment),
+                BridgeError::WrongPayeeAccount
+            );
+            let treasury = &ctx.accounts.treasury;
+            let payout = treasury
+                .lamports()
+                .saturating_sub(Rent::get()?.minimum_balance(0));
+            if payout > 0 && can_hold(payee, treasury.key(), payout)? {
+                let treasury_bump = ctx.accounts.config.treasury_bump;
+                let signer_seeds: &[&[&[u8]]] = &[&[TREASURY_SEED, &[treasury_bump]]];
+                transfer(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.system_program.key(),
+                        Transfer {
+                            from: treasury.to_account_info(),
+                            to: payee.to_account_info(),
+                        },
+                        signer_seeds,
+                    ),
+                    payout,
+                )?;
+                let config = &mut ctx.accounts.config;
+                config.bmm_paid_total = config
+                    .bmm_paid_total
+                    .checked_add(payout)
+                    .ok_or(BridgeError::AmountOverflow)?;
+                msg!(
+                    "eCash height {} pays {} lamports to {}",
+                    height,
+                    payout,
+                    payee.key()
+                );
+            } else {
+                msg!("eCash height {} pays nothing to {}", height, payee.key());
+            }
+        }
+
+        let config = &mut ctx.accounts.config;
+        config.bmm_next_height = height.checked_add(1).ok_or(BridgeError::AmountOverflow)?;
         Ok(())
     }
 
@@ -134,6 +209,57 @@ pub mod bridge {
     }
 }
 
+/// The answer of the local enforcer to the first top-level `settle_bmm` of the
+/// tx.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BmmAnswer {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub commitment: Option<[u8; 32]>,
+}
+
+impl BmmAnswer {
+    pub fn read(account: &UncheckedAccount) -> Result<Self> {
+        let data = account.try_borrow_data()?;
+        Self::decode(&data).ok_or_else(|| error!(BridgeError::NoAnswer))
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() != BMM_ANSWER_LEN {
+            return None;
+        }
+        let height = u64::from_le_bytes(data[..8].try_into().ok()?);
+        let block_hash: [u8; 32] = data[8..40].try_into().ok()?;
+        let commitment: [u8; 32] = data[41..].try_into().ok()?;
+        match data[40] {
+            0 => Some(Self {
+                height,
+                block_hash,
+                commitment: None,
+            }),
+            1 => Some(Self {
+                height,
+                block_hash,
+                commitment: Some(commitment),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// True when the payee can take the payout. A settle that failed here would
+/// stop every later height, so a payee that cannot take it gets nothing, and
+/// the fees go to the next winner.
+fn can_hold(payee: &UncheckedAccount, treasury: Pubkey, payout: u64) -> Result<bool> {
+    if !payee.is_writable || payee.executable || payee.key() == treasury {
+        return Ok(false);
+    }
+    let Some(after) = payee.lamports().checked_add(payout) else {
+        return Ok(false);
+    };
+    Ok(Rent::get()?.is_exempt(after, payee.data_len()))
+}
+
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(
@@ -146,8 +272,27 @@ pub struct Initialize<'info> {
     pub config: Account<'info, Config>,
     #[account(seeds = [VAULT_SEED], bump)]
     pub vault: SystemAccount<'info>,
+    #[account(seeds = [TREASURY_SEED], bump)]
+    pub treasury: SystemAccount<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SettleBmm<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, seeds = [TREASURY_SEED], bump = config.treasury_bump)]
+    pub treasury: SystemAccount<'info>,
+    /// CHECK: the program compares this key with the commitment in the answer,
+    /// and it pays only an account that the runtime lets it write. A `mut`
+    /// constraint would fail the tx for a payee that the runtime demotes, for
+    /// example a program, and that would stop every later height.
+    pub payee: UncheckedAccount<'info>,
+    /// CHECK: the address fixes the account, and the validator builds its data.
+    #[account(address = BMM_ANSWER_ID)]
+    pub bmm_answer: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -210,8 +355,13 @@ pub struct Config {
     pub deposit_high_water: u64,
     pub pegged_lamports: u64,
     pub withdrawal_count: u64,
+    /// The lowest eCash height that `settle_bmm` has not settled.
+    pub bmm_next_height: u64,
+    /// Every lamport that `settle_bmm` paid to a winner.
+    pub bmm_paid_total: u64,
     pub bump: u8,
     pub vault_bump: u8,
+    pub treasury_bump: u8,
 }
 
 #[account]
@@ -249,4 +399,12 @@ pub enum BridgeError {
     AmountAbovePeggedTotal,
     #[msg("The amount overflows a u64.")]
     AmountOverflow,
+    #[msg("Only the next eCash height can settle.")]
+    HeightOutOfOrder,
+    #[msg("The tx holds no BMM answer.")]
+    NoAnswer,
+    #[msg("The BMM answer is for another eCash height or block.")]
+    AnswerForAnotherQuestion,
+    #[msg("The payee account is not the payee in the BMM commitment.")]
+    WrongPayeeAccount,
 }
