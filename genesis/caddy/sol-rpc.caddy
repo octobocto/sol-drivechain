@@ -25,3 +25,15 @@
 	handle_path /sol-regtest-ws/* {
 		reverse_proxy 127.0.0.1:8800
 	}
+	# The Bitcoin node of the regtest chain, read only. The proxy adds the
+	# login of the `reader` user, and bitcoind allows it no wallet call and
+	# no write.
+	handle_path /sol-regtest-btc/* {
+		@sol_regtest_btc method POST OPTIONS
+		handle @sol_regtest_btc {
+			reverse_proxy 127.0.0.1:19543 {
+				header_up Authorization "Basic cmVhZGVyOnJlYWRlcg=="
+			}
+		}
+		respond "method not allowed" 405
+	}

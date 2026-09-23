@@ -65,6 +65,17 @@ EOF
   if [ "$ACCEPT_NONSTD" = "1" ]; then
     echo "acceptnonstdtxn=1" >> "$NODE_DIR/bitcoin.conf"
   fi
+  # A read-only login, so an operator can put the node behind a proxy and let
+  # a builder read blocks. The whitelist holds no wallet call and no write.
+  if [ -n "${READER_RPC_AUTH:-}" ]; then
+    {
+      echo "rpcauth=$READER_RPC_AUTH"
+      echo "rpcwhitelist=reader:getbestblockhash,getblock,getblockchaininfo,\
+getblockcount,getblockhash,getblockheader,getrawtransaction,gettxout,\
+gettxoutproof,getmempoolinfo,getnetworkinfo"
+      echo "rpcwhitelistdefault=0"
+    } >> "$NODE_DIR/bitcoin.conf"
+  fi
   if cli getblockcount >/dev/null 2>&1; then
     echo "bitcoind already runs at height $(cli getblockcount)"
     return 0
