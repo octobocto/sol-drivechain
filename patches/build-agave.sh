@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the two Agave binaries that no CLI release carries, with the one
+# Builds the three Agave binaries that no CLI release carries, with the one
 # patch that this chain needs.
 #
 # Only the peg may change the money supply:
@@ -58,8 +58,9 @@ if ! git apply "$PATCH"; then
 fi
 echo "the patch applies to $AGAVE_TAG"
 
-cargo build --release --bin solana-genesis --bin agave-validator
+cargo build --release --bin solana-genesis --bin agave-validator --bin solana-faucet
 
 echo
 echo "solana-genesis   $AGAVE_DIR/target/release/solana-genesis"
 echo "agave-validator  $AGAVE_DIR/target/release/agave-validator"
+echo "solana-faucet    $AGAVE_DIR/target/release/solana-faucet"

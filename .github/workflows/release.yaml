@@ -68,7 +68,7 @@ jobs:
             ~/.cargo/git
           key: agave-${{ env.AGAVE_TAG }}-${{ hashFiles('patches/agave-sol-drivechain.patch') }}
 
-      - name: Build the patched solana-genesis and agave-validator
+      - name: Build the patched Agave binaries
         run: bash patches/build-agave.sh
 
       - name: Pack the tarball
@@ -83,6 +83,7 @@ jobs:
           cp target/deploy/sol_drivechain_bridge.so "$stage/"
           cp "$HOME/src/agave/target/release/agave-validator" "$stage/"
           cp "$HOME/src/agave/target/release/solana-genesis" "$stage/"
+          cp "$HOME/src/agave/target/release/solana-faucet" "$stage/"
           cp README.md LICENSE "$stage/" 2>/dev/null || true
           tar -czf "$name" -C "$(dirname "$stage")" "sol-drivechain-${version}"
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -99,7 +100,8 @@ jobs:
           files: ${{ steps.pack.outputs.name }}
           body: |
             The tarball holds the daemon, the bridge program, and the two
-            patched Agave binaries: `agave-validator` and `solana-genesis`.
+            patched Agave binaries: `agave-validator`, `solana-genesis`, and
+            `solana-faucet`.
 
             BIP300 sidechain declaration for slot 8:
 
