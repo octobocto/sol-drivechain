@@ -1,0 +1,29 @@
+[Unit]
+Description=sol-drivechain standing regtest chain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Environment=HOME=/root
+Environment=PATH=/root/.cargo/bin:/root/.local/share/solana/install/active_release/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=ROOT=/root/sol-regtest
+Environment=MINE_INTERVAL=60
+# Builders reach this chain, so the RPC answers from outside.
+Environment=SOLANA_RPC_BIND_ADDRESS=0.0.0.0
+Environment=BITCOIND=/root/.local/share/bitwindow/assets/bin/betanet/bitcoind
+Environment=BITCOIN_CLI=/root/.local/share/bitwindow/assets/bin/betanet/bitcoin-cli
+Environment=ENFORCER=/root/.local/share/bitwindow/assets/bin/bip300301-enforcer
+Environment=SOLANA_GENESIS=/root/src/agave/target/release/solana-genesis
+Environment=AGAVE_VALIDATOR=/root/src/agave/target/release/agave-validator
+Environment=SOLANA_FAUCET=/root/src/agave/target/release/solana-faucet
+WorkingDirectory=/root/src/sol-drivechain
+ExecStart=/usr/bin/bash scripts/regtest-chain.sh up
+ExecStop=/usr/bin/bash scripts/regtest-chain.sh down
+LimitNOFILE=1000000
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

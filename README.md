@@ -170,7 +170,7 @@ same number, because the damage is not the same.
 
 | | Depth | Why |
 |---|---|---|
-| Deposit | D = 100 on eCash, about 17 hours | A reorg that drops a credited deposit mints lamports that no Bitcoin backs. Only a restart can undo it. |
+| Deposit | D = 6 on alphanet and betanet, 100 on mainnet | A reorg that drops a credited deposit mints lamports that no Bitcoin backs. Only a restart can undo it. A test network takes the smaller wait. |
 | BMM settle | N = 6 | A reorg that drops a settled block costs nobody. Solana keeps the payout, and the miner of the stale block loses its own reward. |
 
 Solana never rolls back by itself. A node runs a settle one time and never
@@ -243,6 +243,7 @@ settle that pays it.
 | `daemon` | The oracle daemon and the enforcer client. |
 | `genesis` | The genesis scripts and the primordial accounts file. |
 | `scripts` | The regtest stack helpers. |
+| `dex` | The CP-Swap client, its tests, and the trade page. |
 | `bip300301_enforcer` | A submodule. Excluded from both workspaces. |
 
 Two Cargo workspaces, because `cargo-build-sbf` carries its own older rustc.
@@ -338,6 +339,63 @@ treasury          3000000 sats
 
 The last two lines are the whole point. 30,000,000 lamports is 3,000,000
 satoshis, and the mainchain treasury holds 3,000,000 satoshis.
+
+## A standing regtest chain
+
+`scripts/regtest-peg.sh` proves the chain one time and takes it down.
+`scripts/regtest-chain.sh` keeps one up: a Bitcoin node, an enforcer, a
+validator, the peg, the BMM loop, and a miner that adds a block every
+minute. The sidechain slot is active there, so bids win and settles pay,
+again and again.
+
+```sh
+bash scripts/regtest-chain.sh up
+bash scripts/regtest-chain.sh status
+bash scripts/regtest-chain.sh mine 5
+bash scripts/regtest-chain.sh down
+```
+
+`genesis/systemd/sol-regtest.service` runs the same chain as a service, so it
+comes back after a restart of the host. One chain of this shape runs today,
+and builders use it while betanet waits for the slot:
+
+```sh
+solana config set --url https://seed.alpha.ecash.eu.com/sol-regtest/
+```
+
+```js
+new Connection("https://seed.alpha.ecash.eu.com/sol-regtest/", {
+  wsEndpoint: "wss://seed.alpha.ecash.eu.com/sol-regtest-ws/",
+});
+```
+
+Its genesis hash is `HNnsusSnk6VAhTwRqM3FpdLdV27y9wkbyYLbkRaeiTgZ`. The chain
+runs a faucet, and the faucet holds pegged BTC from one eCash deposit. A
+wallet takes test coins with the stock airdrop call:
+
+```sh
+solana airdrop 1
+```
+
+One limit of regtest: the eCash node relays the first deposit only. A later
+deposit spends a drivechain output, and the mempool policy of a regtest node
+refuses that spend. The faucet covers every builder until betanet opens.
+
+## The DEX
+
+The regtest chain carries four Solana mainnet programs at their mainnet
+addresses: SPL Token, the associated token account program, Memo, and the
+Raydium CP-Swap AMM. `genesis/fetch-dex-programs.sh` copies each program from
+a mainnet RPC, and it pins the bytes in `genesis/dex-programs.sha256`.
+
+CP-Swap keeps its fees in an `AmmConfig` account that only its admin makes.
+That account is a PDA of the program, so the genesis carries a copy of the
+mainnet account at the same address. The genesis also carries the wrapped SOL
+mint and the token account that takes the pool creation fee.
+
+A trade page runs on those pools at `https://seed.alpha.ecash.eu.com/dex/`.
+The page lives in the `sol-dex` repository. This repository serves the built
+files from `/var/www/sol-dex`, and it holds no page code.
 
 ## Two hosts on one regtest chain
 

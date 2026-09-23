@@ -258,10 +258,26 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         max_ancestors: u32,
     },
+    /// Prints the balance of the enforcer wallet, in satoshis.
+    WalletBalance {
+        #[command(flatten)]
+        enforcer: EnforcerArgs,
+    },
     /// Prints the height and the hash of the eCash tip.
     EcashTip {
         #[command(flatten)]
         enforcer: EnforcerArgs,
+    },
+    /// Sends one BIP301 bid for the next eCash block. The payee takes the
+    /// treasury if the bid wins. An operator or a test uses it.
+    BidBmm {
+        #[command(flatten)]
+        enforcer: EnforcerArgs,
+        /// The pubkey that takes the payout. It is the whole h*.
+        #[arg(long)]
+        payee: String,
+        #[arg(long)]
+        sats: u64,
     },
     /// Settles one eCash height by hand. A test or an operator uses it.
     SettleBmm {
@@ -732,9 +748,11 @@ fn main() -> Result<(), CliError> {
         }
         Command::Derive { program_id } => {
             let program_id = parse_pubkey(&program_id)?;
-            println!("program {program_id}");
-            println!("config  {}", bridge::config_pda(&program_id).0);
-            println!("vault   {}", bridge::vault_pda(&program_id).0);
+            println!("program  {program_id}");
+            println!("config   {}", bridge::config_pda(&program_id).0);
+            println!("vault    {}", bridge::vault_pda(&program_id).0);
+            println!("treasury {}", bridge::treasury_pda(&program_id).0);
+            println!("bmm answer {}", bridge::BMM_ANSWER_ID);
             Ok(())
         }
         Command::Address { slot, pubkey } => {
@@ -821,10 +839,32 @@ fn main() -> Result<(), CliError> {
             println!("commitments {commitments}");
             Ok(())
         }),
+        Command::WalletBalance { enforcer } => runtime.block_on(async {
+            let mut enforcer = enforcer.open().await?;
+            let (confirmed, pending) = enforcer.wallet_balance().await?;
+            println!("confirmed {confirmed}");
+            println!("pending   {pending}");
+            Ok(())
+        }),
         Command::EcashTip { enforcer } => runtime.block_on(async {
             let mut enforcer = enforcer.open().await?;
             let (hash, height) = enforcer.tip().await?;
             println!("{height} {hash}");
+            Ok(())
+        }),
+        Command::BidBmm {
+            enforcer,
+            payee,
+            sats,
+        } => runtime.block_on(async {
+            let payee = parse_pubkey(&payee)?;
+            let mut enforcer = enforcer.open().await?;
+            let tip = enforcer.tip().await?;
+            let txid = enforcer
+                .create_bmm_request(sats, tip, &payee.to_bytes())
+                .await?;
+            println!("bid {sats} sats for eCash height {} as {txid}", tip.1 + 1);
+            println!("the payee is {payee}");
             Ok(())
         }),
         Command::SettleBmm {

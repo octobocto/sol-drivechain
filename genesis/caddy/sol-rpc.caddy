@@ -13,3 +13,36 @@
 	handle_path /sol-ws/* {
 		reverse_proxy 127.0.0.1:8900
 	}
+	# The standing regtest chain of scripts/regtest-chain.sh. It carries no
+	# value, and builders use it while betanet waits for the slot.
+	handle_path /sol-regtest/* {
+		@sol_regtest_rpc method POST OPTIONS
+		handle @sol_regtest_rpc {
+			reverse_proxy 127.0.0.1:8799
+		}
+		respond "method not allowed" 405
+	}
+	handle_path /sol-regtest-ws/* {
+		reverse_proxy 127.0.0.1:8800
+	}
+	# The Bitcoin node of the regtest chain, read only. The proxy adds the
+	# login of the `reader` user, and bitcoind allows it no wallet call and
+	# no write.
+	handle_path /sol-regtest-btc/* {
+		@sol_regtest_btc method POST OPTIONS
+		handle @sol_regtest_btc {
+			reverse_proxy 127.0.0.1:19543 {
+				header_up Authorization "Basic cmVhZGVyOnJlYWRlcg=="
+			}
+		}
+		respond "method not allowed" 405
+	}
+	# The DEX page. `npm run build` in dex/ writes these files, and the
+	# operator copies them here. The page reads config.json, so one build
+	# serves any chain.
+	handle_path /dex/* {
+		root * /var/www/sol-dex
+		try_files {path} /index.html
+		file_server
+	}
+	redir /dex /dex/ 301
