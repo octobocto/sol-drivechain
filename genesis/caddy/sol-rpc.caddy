@@ -37,3 +37,12 @@
 		}
 		respond "method not allowed" 405
 	}
+	# The DEX page. `npm run build` in dex/ writes these files, and the
+	# operator copies them here. The page reads config.json, so one build
+	# serves any chain.
+	handle_path /dex/* {
+		root * /var/www/sol-dex
+		try_files {path} /index.html
+		file_server
+	}
+	redir /dex /dex/ 301
