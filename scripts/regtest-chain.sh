@@ -35,6 +35,13 @@ export ACCEPT_NONSTD="${ACCEPT_NONSTD:-1}"
 # `reader`, because the chain carries no value.
 export READER_RPC_AUTH="${READER_RPC_AUTH:-reader:9fe79e638922d8bd07832bd3f910c43d\$f8d68fb8dc25a6b1d198e512f8c9b31e7c3bd42394d8ce4bf282cce8a618be12}"
 
+# The faucet of the chain. The RPC passes an airdrop call to it, so a browser
+# asks the chain itself for test money. The faucet holds pegged BTC.
+FAUCET_PORT="${FAUCET_PORT:-9900}"
+FAUCET_BTC="${FAUCET_BTC:-500}"
+FAUCET_REQUEST_CAP="${FAUCET_REQUEST_CAP:-2}"
+FAUCET_TIME_CAP="${FAUCET_TIME_CAP:-200}"
+
 # The Solana side.
 SOLANA_RPC_PORT="${SOLANA_RPC_PORT:-8799}"
 SOLANA_GOSSIP_PORT="${SOLANA_GOSSIP_PORT:-8201}"
@@ -50,6 +57,7 @@ E="--network regtest --enforcer-url $ENFORCER_URL --slot $SLOT"
 D="${D:-$REPO/daemon/target/release/sol-drivechain-daemon}"
 SOLANA="${SOLANA:-$(command -v solana || true)}"
 SOLANA_KEYGEN="${SOLANA_KEYGEN:-$(command -v solana-keygen || true)}"
+SOLANA_FAUCET="${SOLANA_FAUCET:-$(command -v solana-faucet || true)}"
 export SOLANA_GENESIS="${SOLANA_GENESIS:-$HOME/src/agave/target/release/solana-genesis}"
 export AGAVE_VALIDATOR="${AGAVE_VALIDATOR:-$HOME/src/agave/target/release/agave-validator}"
 
@@ -141,6 +149,29 @@ fund_wallet() {
   sleep 3
 }
 
+# Pegs BTC into the faucet key. The faucet then pays out coins that a deposit
+# on eCash backs, exactly like every other coin of the chain.
+fund_faucet() {
+  local pubkey balance want
+  pubkey="$("$SOLANA_KEYGEN" pubkey "$ROOT/keys/faucet.json")"
+  want=$((FAUCET_BTC * 100000000))
+  balance="$("$SOLANA" -u "$SOLANA_URL" balance "$pubkey" --lamports 2>/dev/null | awk '{print $1}')"
+  if [ "${balance:-0}" -gt $((want * 10 / 2)) ]; then
+    echo "the faucet holds $balance lamports"
+    return 0
+  fi
+  echo "pegging $FAUCET_BTC BTC into the faucet $pubkey"
+  "$D" deposit $E --pubkey "$pubkey" --sats "$want" >/dev/null
+  "$D" mine $E --blocks 2 --address "$(new_address)" >/dev/null
+  for _ in $(seq 1 40); do
+    balance="$("$SOLANA" -u "$SOLANA_URL" balance "$pubkey" --lamports 2>/dev/null | awk '{print $1}')"
+    [ "${balance:-0}" -ge $((want * 10)) ] && break
+    sleep 3
+  done
+  [ "${balance:-0}" -ge $((want * 10)) ] || fail "the faucet holds ${balance:-0} lamports, and the peg in asked for $((want * 10))"
+  echo "the faucet holds $balance lamports of pegged BTC"
+}
+
 mine_loop() {
   while true; do
     "$D" mine $E --blocks 1 --address "$(new_address)" >/dev/null 2>&1 || true
@@ -171,6 +202,7 @@ up() {
     GOSSIP_PORT="$SOLANA_GOSSIP_PORT" DYNAMIC_PORT_RANGE="$DYNAMIC_PORT_RANGE" \
     XDP=0 RPC_BIND_ADDRESS="$SOLANA_RPC_BIND_ADDRESS" \
     ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
+    FAUCET_ADDRESS="127.0.0.1:$FAUCET_PORT" \
     BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" AGAVE_VALIDATOR="$AGAVE_VALIDATOR" \
     bash "$REPO/genesis/run-validator.sh"
   wait_for_solana
@@ -193,10 +225,20 @@ up() {
     --identity "$ROOT/keys/validator-identity.json" \
     --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --interval-secs 2
   start_process miner bash "$0" mine-loop
+
+  echo "== the faucet"
+  fund_faucet
+  if [ -n "$SOLANA_FAUCET" ]; then
+    start_process faucet "$SOLANA_FAUCET" --keypair "$ROOT/keys/faucet.json" \
+      --per-request-cap "$FAUCET_REQUEST_CAP" --per-time-cap "$FAUCET_TIME_CAP"
+  else
+    echo "solana-faucet is missing, so the chain gives no airdrop"
+  fi
   status
 }
 
 down() {
+  stop_process faucet
   stop_process miner
   stop_process bmm
   stop_process peg
@@ -207,7 +249,7 @@ down() {
 status() {
   echo
   echo "root          $ROOT"
-  for name in validator peg bmm miner; do
+  for name in validator peg bmm miner faucet; do
     if is_running "$name"; then
       echo "$name        runs"
     else
@@ -227,6 +269,7 @@ status() {
   echo
   echo "rpc           $SOLANA_URL (bound on $SOLANA_RPC_BIND_ADDRESS)"
   echo "enforcer      $ENFORCER_URL"
+  echo "faucet        127.0.0.1:$FAUCET_PORT"
 }
 
 case "${1:-status}" in
