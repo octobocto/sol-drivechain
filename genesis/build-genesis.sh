@@ -29,6 +29,15 @@ LOADER="${LOADER:-BPFLoader2111111111111111111111111111111111}"
 
 VAULT_SOL="${VAULT_SOL:-21000000}"
 
+# The token programs and the DEX program come from Solana mainnet. Set DEX=0 to
+# build a chain with the bridge alone.
+DEX="${DEX:-1}"
+DEX_PROGRAMS="${PROGRAMS:-$REPO/genesis/programs}"
+TOKEN_ID=TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+ATA_ID=ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
+MEMO_ID=MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr
+CPMM_ID=CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C
+
 # SIMD-0357 burns a Validator Admission Ticket from every staked vote account
 # at each epoch. That destroys money outside the peg, so the genesis switches
 # it off. It only runs when `alpenglow` is also active, and that stays off too.
@@ -95,6 +104,18 @@ TREASURY_LAMPORTS=$(((128 + 0) * LAMPORTS_PER_BYTE_YEAR * 2))
   --treasury-lamports "$TREASURY_LAMPORTS" \
   --out "$REPO/genesis/primordial.yaml"
 
+DEX_FLAGS=()
+if [ "$DEX" = "1" ]; then
+  PROGRAMS="$DEX_PROGRAMS" bash "$REPO/genesis/fetch-dex-programs.sh"
+  cat "$REPO/genesis/dex-accounts.yaml" >> "$REPO/genesis/primordial.yaml"
+  DEX_FLAGS=(
+    --bpf-program "$TOKEN_ID" "$LOADER" "$DEX_PROGRAMS/token.so"
+    --bpf-program "$ATA_ID" "$LOADER" "$DEX_PROGRAMS/ata.so"
+    --bpf-program "$MEMO_ID" "$LOADER" "$DEX_PROGRAMS/memo.so"
+    --bpf-program "$CPMM_ID" "$LOADER" "$DEX_PROGRAMS/cpmm.so"
+  )
+fi
+
 rm -rf "$LEDGER"
 mkdir -p "$LEDGER"
 
@@ -116,7 +137,8 @@ mkdir -p "$LEDGER"
   --target-lamports-per-signature "$LAMPORTS_PER_SIGNATURE" \
   --deactivate-feature "$VAT_FEATURE" \
   --primordial-accounts-file "$REPO/genesis/primordial.yaml" \
-  --bpf-program "$PROGRAM_ID" "$LOADER" "$PROGRAM_SO"
+  --bpf-program "$PROGRAM_ID" "$LOADER" "$PROGRAM_SO" \
+  ${DEX_FLAGS[@]+"${DEX_FLAGS[@]}"}
 
 echo
 echo "the ledger is at $LEDGER"
