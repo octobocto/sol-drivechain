@@ -4,6 +4,7 @@ use tonic::transport::Channel;
 use crate::network::PegNetwork;
 use crate::proto::mainchain::{
     block_producer_service_client::BlockProducerServiceClient,
+    get_bmm_h_star_commitment_response::Result as CommitmentResult,
     get_ctip_response,
     mining_service_client::MiningServiceClient,
     sidechain_declaration::{SidechainDeclaration as DeclarationKind, V0},
@@ -11,13 +12,14 @@ use crate::proto::mainchain::{
     validator_service_client::ValidatorServiceClient,
     wallet_service_client::WalletServiceClient,
     withdrawal_bundle_event::event::Event as BundleEventKind,
-    AckAllProposalsPolicy, CreateDepositTransactionRequest, CreateNewAddressRequest,
-    GenerateToAddressRequest, GetBalanceRequest, GetChainInfoRequest, GetChainTipRequest,
-    GetCtipRequest, GetSidechainProposalsRequest, GetSidechainsRequest,
-    GetWithdrawalBundleProposalsRequest, Network as ProtoNetwork, ProposeWithdrawalBundleRequest,
-    SetAckAllProposalsRequest, SetSidechainAckRequest, SetWithdrawalBundlePolicyRequest,
-    SidechainDeclaration, SubmitSidechainProposalRequest, SubscribeEventsRequest,
-    SubscribeEventsResponse, WithdrawalBundlePolicy,
+    AckAllProposalsPolicy, CreateBmmCriticalDataTransactionRequest,
+    CreateDepositTransactionRequest, CreateNewAddressRequest, GenerateToAddressRequest,
+    GetBalanceRequest, GetBlockHeaderInfoRequest, GetBmmHStarCommitmentRequest,
+    GetChainInfoRequest, GetChainTipRequest, GetCtipRequest, GetSidechainProposalsRequest,
+    GetSidechainsRequest, GetWithdrawalBundleProposalsRequest, Network as ProtoNetwork,
+    ProposeWithdrawalBundleRequest, SetAckAllProposalsRequest, SetSidechainAckRequest,
+    SetWithdrawalBundlePolicyRequest, SidechainDeclaration, SubmitSidechainProposalRequest,
+    SubscribeEventsRequest, SubscribeEventsResponse, WithdrawalBundlePolicy,
 };
 
 pub type Result<T> = std::result::Result<T, EnforcerError>;
@@ -42,6 +44,12 @@ pub enum EnforcerError {
     NotATransaction(Txid),
     #[error("the enforcer runs on `{found}`, but the daemon runs on `{want}`")]
     WrongNetwork { want: &'static str, found: String },
+    #[error("the enforcer holds no block at height {0} on the active chain")]
+    NoBlockAtHeight(u32),
+    #[error("the enforcer does not know block {0}")]
+    BlockNotFound(BlockHash),
+    #[error("the enforcer sent a commitment of {0} bytes, not 32")]
+    BadCommitmentLength(usize),
 }
 
 /// One deposit that the mainchain confirmed.
@@ -536,6 +544,169 @@ impl Enforcer {
             .block_header_info
             .ok_or(EnforcerError::MissingField("block_header_info"))?;
         decode_reverse_hash(header.block_hash.and_then(|hash| hash.hex), "block_hash")
+    }
+
+    /// Reads the hash and the height of the mainchain tip.
+    pub async fn tip(&mut self) -> Result<(BlockHash, u32)> {
+        let response = self
+            .validator
+            .get_chain_tip(GetChainTipRequest {})
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "GetChainTip",
+                source,
+            })?
+            .into_inner();
+        let header = response
+            .block_header_info
+            .ok_or(EnforcerError::MissingField("block_header_info"))?;
+        let hash = decode_reverse_hash(header.block_hash.and_then(|hash| hash.hex), "block_hash")?;
+        Ok((hash, header.height))
+    }
+
+    /// Reads the headers and the BMM commitments of `block_hash` and up to
+    /// `max_ancestors` of its ancestors, newest first. A test uses it to see
+    /// how many the enforcer gives.
+    pub async fn headers_and_commitments(
+        &mut self,
+        block_hash: &BlockHash,
+        max_ancestors: u32,
+    ) -> Result<(usize, usize)> {
+        let headers = self
+            .validator
+            .get_block_header_info(GetBlockHeaderInfoRequest {
+                block_hash: Some(crate::proto::common::ReverseHex {
+                    hex: Some(block_hash.to_string()),
+                }),
+                max_ancestors: Some(max_ancestors),
+            })
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "GetBlockHeaderInfo",
+                source,
+            })?
+            .into_inner()
+            .header_infos;
+        let response = self
+            .validator
+            .get_bmm_h_star_commitment(GetBmmHStarCommitmentRequest {
+                block_hash: Some(crate::proto::common::ReverseHex {
+                    hex: Some(block_hash.to_string()),
+                }),
+                sidechain_id: Some(self.sidechain_id),
+                max_ancestors: Some(max_ancestors),
+            })
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "GetBmmHStarCommitment",
+                source,
+            })?
+            .into_inner();
+        let commitments = match response.result {
+            Some(CommitmentResult::Commitment(found)) => found.ancestor_commitments.len() + 1,
+            _ => 0,
+        };
+        Ok((headers.len(), commitments))
+    }
+
+    /// Reads the active block at `height` below `tip`, and the BMM
+    /// commitment that its coinbase holds for this sidechain.
+    pub async fn active_block(
+        &mut self,
+        tip: (BlockHash, u32),
+        height: u32,
+    ) -> Result<(BlockHash, Option<[u8; 32]>)> {
+        let depth = tip
+            .1
+            .checked_sub(height)
+            .ok_or(EnforcerError::NoBlockAtHeight(height))?;
+        let headers = self
+            .validator
+            .get_block_header_info(GetBlockHeaderInfoRequest {
+                block_hash: Some(crate::proto::common::ReverseHex {
+                    hex: Some(tip.0.to_string()),
+                }),
+                max_ancestors: Some(depth),
+            })
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "GetBlockHeaderInfo",
+                source,
+            })?
+            .into_inner()
+            .header_infos;
+        let header = headers
+            .into_iter()
+            .find(|header| header.height == height)
+            .ok_or(EnforcerError::NoBlockAtHeight(height))?;
+        let block_hash =
+            decode_reverse_hash(header.block_hash.and_then(|hash| hash.hex), "block_hash")?;
+
+        let response = self
+            .validator
+            .get_bmm_h_star_commitment(GetBmmHStarCommitmentRequest {
+                block_hash: Some(crate::proto::common::ReverseHex {
+                    hex: Some(block_hash.to_string()),
+                }),
+                sidechain_id: Some(self.sidechain_id),
+                max_ancestors: Some(0),
+            })
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "GetBmmHStarCommitment",
+                source,
+            })?
+            .into_inner();
+        let commitment = match response.result {
+            Some(CommitmentResult::Commitment(found)) => match found.commitment.and_then(|c| c.hex)
+            {
+                Some(hex) => {
+                    let bytes = decode_hex(&hex, "commitment")?;
+                    let length = bytes.len();
+                    Some(
+                        bytes
+                            .try_into()
+                            .map_err(|_| EnforcerError::BadCommitmentLength(length))?,
+                    )
+                }
+                None => None,
+            },
+            Some(CommitmentResult::BlockNotFound(_)) => {
+                return Err(EnforcerError::BlockNotFound(block_hash))
+            }
+            None => return Err(EnforcerError::MissingField("result")),
+        };
+        Ok((block_hash, commitment))
+    }
+
+    /// Sends a BIP301 BMM request. It pays `bid_sats` to the miner of the
+    /// block after `tip`, and only if that coinbase holds `h_star`.
+    pub async fn create_bmm_request(
+        &mut self,
+        bid_sats: u64,
+        tip: (BlockHash, u32),
+        h_star: &[u8; 32],
+    ) -> Result<Txid> {
+        let response = self
+            .wallet
+            .create_bmm_critical_data_transaction(CreateBmmCriticalDataTransactionRequest {
+                sidechain_id: Some(self.sidechain_id),
+                value_sats: Some(bid_sats),
+                height: Some(tip.1),
+                critical_hash: Some(crate::proto::common::ConsensusHex {
+                    hex: Some(crate::hex::encode(h_star)),
+                }),
+                prev_bytes: Some(crate::proto::common::ReverseHex {
+                    hex: Some(tip.0.to_string()),
+                }),
+            })
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "CreateBmmCriticalDataTransaction",
+                source,
+            })?
+            .into_inner();
+        decode_reverse_txid(response.txid.and_then(|hex| hex.hex), "txid")
     }
 
     pub async fn ctip(&mut self) -> Result<Option<Ctip>> {

@@ -103,10 +103,15 @@ impl PegNetwork {
     }
 
     /// How many confirmations a deposit waits before the daemon credits it.
+    ///
+    /// This depth D is much deeper than the BMM depth N. A reorg that drops a
+    /// credited deposit mints lamports that no Bitcoin backs, and only a
+    /// coordinated restart can undo it. A reorg that drops a settled BMM block
+    /// costs nobody, so N stays small.
     pub fn default_confirmations(self) -> u32 {
         match self {
-            Self::Alphanet | Self::Betanet | Self::Mainnet => 6,
-            Self::Testnet | Self::Signet => 3,
+            Self::Alphanet | Self::Betanet | Self::Mainnet => 100,
+            Self::Testnet | Self::Signet => 20,
             Self::Regtest => 1,
         }
     }
@@ -299,8 +304,12 @@ mod tests {
 
     #[test]
     fn mainnet_waits_the_longest_for_a_deposit() {
-        assert_eq!(PegNetwork::Mainnet.default_confirmations(), 6);
+        assert_eq!(PegNetwork::Mainnet.default_confirmations(), 100);
+        assert_eq!(PegNetwork::Betanet.default_confirmations(), 100);
         assert_eq!(PegNetwork::Regtest.default_confirmations(), 1);
+        // A deposit waits much longer than a BMM settle, because only a
+        // restart can undo a deposit that a reorg drops.
+        assert!(PegNetwork::Betanet.default_confirmations() > 6);
     }
 
     #[test]

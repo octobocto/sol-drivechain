@@ -13,6 +13,12 @@ pub const LAMPORTS_PER_SAT: u64 = 10;
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";
+pub const TREASURY_SEED: &[u8] = b"treasury";
+
+/// The account that the patched validator builds for each settle. It must
+/// match `BMM_ANSWER_ID` in the Agave patch and the bridge program.
+pub const BMM_ANSWER_ID: Pubkey =
+    Pubkey::from_str_const("BmmAnswer1111111111111111111111111111111111");
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -45,6 +51,10 @@ pub fn withdrawal_pda(program_id: &Pubkey, index: u64) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[WITHDRAWAL_SEED, &index.to_le_bytes()], program_id)
 }
 
+pub fn treasury_pda(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[TREASURY_SEED], program_id)
+}
+
 /// Anchor names an instruction or an account by the first eight bytes of
 /// `sha256("<namespace>:<name>")`.
 pub fn discriminator(namespace: &str, name: &str) -> [u8; 8] {
@@ -60,12 +70,15 @@ pub struct Config {
     pub deposit_high_water: u64,
     pub pegged_lamports: u64,
     pub withdrawal_count: u64,
+    pub bmm_next_height: u64,
+    pub bmm_paid_total: u64,
     pub bump: u8,
     pub vault_bump: u8,
+    pub treasury_bump: u8,
 }
 
 impl Config {
-    pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 1 + 1;
+    pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 1;
 
     pub fn decode(data: &[u8]) -> Result<Self, BridgeError> {
         if data.len() < Self::LEN {
@@ -88,8 +101,11 @@ impl Config {
             deposit_high_water: reader.u64().ok_or_else(|| cut("deposit_high_water"))?,
             pegged_lamports: reader.u64().ok_or_else(|| cut("pegged_lamports"))?,
             withdrawal_count: reader.u64().ok_or_else(|| cut("withdrawal_count"))?,
+            bmm_next_height: reader.u64().ok_or_else(|| cut("bmm_next_height"))?,
+            bmm_paid_total: reader.u64().ok_or_else(|| cut("bmm_paid_total"))?,
             bump: reader.u8().ok_or_else(|| cut("bump"))?,
             vault_bump: reader.u8().ok_or_else(|| cut("vault_bump"))?,
+            treasury_bump: reader.u8().ok_or_else(|| cut("treasury_bump"))?,
         })
     }
 }
@@ -146,14 +162,21 @@ impl WithdrawalRecord {
     }
 }
 
-pub fn initialize_ix(program_id: &Pubkey, payer: &Pubkey, oracle: &Pubkey) -> Instruction {
+pub fn initialize_ix(
+    program_id: &Pubkey,
+    payer: &Pubkey,
+    oracle: &Pubkey,
+    bmm_start_height: u64,
+) -> Instruction {
     let mut data = discriminator("global", "initialize").to_vec();
     data.extend_from_slice(oracle.as_ref());
+    data.extend_from_slice(&bmm_start_height.to_le_bytes());
     Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(config_pda(program_id).0, false),
             AccountMeta::new_readonly(vault_pda(program_id).0, false),
+            AccountMeta::new_readonly(treasury_pda(program_id).0, false),
             AccountMeta::new(*payer, true),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ],
@@ -225,6 +248,31 @@ pub fn mark_paid_ix(
             AccountMeta::new(withdrawal_pda(program_id, index).0, false),
             AccountMeta::new(*owner, false),
             AccountMeta::new_readonly(*oracle, true),
+        ],
+        data,
+    }
+}
+
+/// Settles eCash height `height`, which `block_hash` holds on the active
+/// chain. `payee` must be the key in its BMM commitment, or any account when
+/// the coinbase holds none. `block_hash` is in the internal byte order.
+pub fn settle_bmm_ix(
+    program_id: &Pubkey,
+    height: u64,
+    block_hash: &[u8; 32],
+    payee: &Pubkey,
+) -> Instruction {
+    let mut data = discriminator("global", "settle_bmm").to_vec();
+    data.extend_from_slice(&height.to_le_bytes());
+    data.extend_from_slice(block_hash);
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(config_pda(program_id).0, false),
+            AccountMeta::new(treasury_pda(program_id).0, false),
+            AccountMeta::new(*payee, false),
+            AccountMeta::new_readonly(BMM_ANSWER_ID, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ],
         data,
     }
@@ -302,7 +350,13 @@ mod tests {
 
     #[test]
     fn each_instruction_carries_its_own_discriminator() {
-        let names = ["initialize", "deposit", "withdraw", "mark_paid"];
+        let names = [
+            "initialize",
+            "deposit",
+            "withdraw",
+            "mark_paid",
+            "settle_bmm",
+        ];
         let mut seen: Vec<[u8; 8]> = names
             .iter()
             .map(|name| discriminator("global", name))
@@ -318,8 +372,11 @@ mod tests {
             deposit_high_water: 12,
             pegged_lamports: 30_000_000,
             withdrawal_count: 2,
+            bmm_next_height: 900,
+            bmm_paid_total: 7_000,
             bump: 254,
             vault_bump: 253,
+            treasury_bump: 252,
         }
     }
 
@@ -329,8 +386,11 @@ mod tests {
         data.extend_from_slice(&config.deposit_high_water.to_le_bytes());
         data.extend_from_slice(&config.pegged_lamports.to_le_bytes());
         data.extend_from_slice(&config.withdrawal_count.to_le_bytes());
+        data.extend_from_slice(&config.bmm_next_height.to_le_bytes());
+        data.extend_from_slice(&config.bmm_paid_total.to_le_bytes());
         data.push(config.bump);
         data.push(config.vault_bump);
+        data.push(config.treasury_bump);
         data
     }
 
@@ -366,8 +426,11 @@ mod tests {
             deposit_high_water: 42,
             pegged_lamports: 1_000_000,
             withdrawal_count: 7,
+            bmm_next_height: 12_345,
+            bmm_paid_total: 99,
             bump: 254,
             vault_bump: 253,
+            treasury_bump: 252,
         };
         assert_eq!(Config::decode(&a_config_account(&config)).unwrap(), config);
     }
@@ -511,6 +574,32 @@ mod tests {
         assert_eq!(&ix.data[16..24], &500u64.to_le_bytes());
         assert_eq!(&ix.data[24..28], &3u32.to_le_bytes());
         assert_eq!(&ix.data[28..], &script);
+    }
+
+    #[test]
+    fn the_settle_instruction_carries_the_height_and_the_block_hash() {
+        let program_id = a_program_id();
+        let payee = Pubkey::new_from_array([8u8; 32]);
+        let ix = settle_bmm_ix(&program_id, 77, &[5u8; 32], &payee);
+        assert_eq!(&ix.data[..8], discriminator("global", "settle_bmm"));
+        assert_eq!(&ix.data[8..16], &77u64.to_le_bytes());
+        assert_eq!(&ix.data[16..], &[5u8; 32]);
+        assert_eq!(ix.accounts[2].pubkey, payee);
+        assert!(ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, BMM_ANSWER_ID);
+        assert!(!ix.accounts[3].is_writable);
+    }
+
+    #[test]
+    fn the_answer_address_is_the_one_the_validator_builds() {
+        assert_eq!(
+            BMM_ANSWER_ID.to_string(),
+            "BmmAnswer1111111111111111111111111111111111"
+        );
+        assert_ne!(
+            treasury_pda(&a_program_id()).0,
+            vault_pda(&a_program_id()).0
+        );
     }
 
     #[test]
