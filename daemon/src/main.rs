@@ -737,9 +737,11 @@ fn main() -> Result<(), CliError> {
         }
         Command::Derive { program_id } => {
             let program_id = parse_pubkey(&program_id)?;
-            println!("program {program_id}");
-            println!("config  {}", bridge::config_pda(&program_id).0);
-            println!("vault   {}", bridge::vault_pda(&program_id).0);
+            println!("program  {program_id}");
+            println!("config   {}", bridge::config_pda(&program_id).0);
+            println!("vault    {}", bridge::vault_pda(&program_id).0);
+            println!("treasury {}", bridge::treasury_pda(&program_id).0);
+            println!("bmm answer {}", bridge::BMM_ANSWER_ID);
             Ok(())
         }
         Command::Address { slot, pubkey } => {
