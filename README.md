@@ -170,7 +170,7 @@ same number, because the damage is not the same.
 
 | | Depth | Why |
 |---|---|---|
-| Deposit | D = 100 on eCash, about 17 hours | A reorg that drops a credited deposit mints lamports that no Bitcoin backs. Only a restart can undo it. |
+| Deposit | D = 6 on alphanet and betanet, 100 on mainnet | A reorg that drops a credited deposit mints lamports that no Bitcoin backs. Only a restart can undo it. A test network takes the smaller wait. |
 | BMM settle | N = 6 | A reorg that drops a settled block costs nobody. Solana keeps the payout, and the miner of the stale block loses its own reward. |
 
 Solana never rolls back by itself. A node runs a settle one time and never
