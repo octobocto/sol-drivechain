@@ -37,8 +37,32 @@ export function need(name: string, value: string | undefined): string {
   return value;
 }
 
-/** Waits for the faucet to pay, because a fresh chain answers slowly at first. */
+/**
+ * Asks the faucet until the owner holds `lamports`. A faucet caps one request,
+ * so a big target takes several drips, and a refused drip gets smaller.
+ */
 export async function fundFromFaucet(connection: Connection, owner: PublicKey, lamports: number): Promise<void> {
-  const signature = await connection.requestAirdrop(owner, lamports);
-  await connection.confirmTransaction(signature, "confirmed");
+  let drip = lamports;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if ((await connection.getBalance(owner)) >= lamports) return;
+    try {
+      const signature = await connection.requestAirdrop(owner, drip);
+      await connection.confirmTransaction(signature, "confirmed");
+    } catch (error) {
+      drip = Math.floor(drip / 2);
+      if (drip < 100_000_000) throw new Error(`the faucet refused a drip: ${fullMessage(error)}`);
+    }
+  }
+  throw new Error(`the faucet did not pay ${lamports} lamports to ${owner.toBase58()}`);
+}
+
+/** The message of an error and of every cause under it. */
+export function fullMessage(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  while (current instanceof Error) {
+    parts.push(current.message);
+    current = (current as Error & { cause?: unknown }).cause;
+  }
+  return parts.join(" <- ");
 }

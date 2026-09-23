@@ -31,7 +31,22 @@ await build({
   format: "esm",
   target: ["node20"],
   outExtension: { ".js": ".mjs" },
-  banner: { js: "import { createRequire } from 'node:module';const require = createRequire(import.meta.url);" },
+  // The `module` field of web3.js points at its browser build, and that build
+  // carries a fetch that fails under node. These two lines keep the node build.
+  mainFields: ["main"],
+  conditions: ["node", "require"],
+  // A node library in the bundle reads `require`, `__filename`, and
+  // `__dirname`. An ESM file carries none of them, so the banner makes them.
+  banner: {
+    js: [
+      "import { createRequire } from 'node:module';",
+      "import { fileURLToPath as __toPath } from 'node:url';",
+      "import { dirname as __toDir } from 'node:path';",
+      "const require = createRequire(import.meta.url);",
+      "const __filename = __toPath(import.meta.url);",
+      "const __dirname = __toDir(__filename);",
+    ].join(""),
+  },
 });
 
 for (const name of ["index.html", "style.css"]) {

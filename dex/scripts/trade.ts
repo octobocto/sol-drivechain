@@ -10,7 +10,7 @@ import { Keypair, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { WSOL_MINT, minimumOut, quoteSwapBaseIn } from "../src/cpmm.js";
 import { buildNewPool, buildNewToken, buildSwap } from "../src/actions.js";
 import { loadPool, loadPools, reservesFor } from "../src/pools.js";
-import { connect, fundFromFaucet, need, readKeypair, sendTransaction, tokenBalance } from "./common.js";
+import { fullMessage, connect, fundFromFaucet, need, readKeypair, sendTransaction, tokenBalance } from "./common.js";
 
 function check(claim: boolean, message: string): void {
   if (!claim) throw new Error(message);
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
   console.log("the DEX works");
 }
 
-main().catch((error: Error) => {
-  console.error(`the trade proof failed: ${error.message}`);
+main().catch((error: unknown) => {
+  console.error(`the trade proof failed: ${fullMessage(error)}`);
   process.exit(1);
 });

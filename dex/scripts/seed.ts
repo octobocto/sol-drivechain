@@ -9,7 +9,7 @@ import { LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { WSOL_MINT } from "../src/cpmm.js";
 import { buildNewPool, buildNewToken } from "../src/actions.js";
 import { loadPool } from "../src/pools.js";
-import { connect, need, readKeypair, sendTransaction } from "./common.js";
+import { fullMessage, connect, need, readKeypair, sendTransaction } from "./common.js";
 
 interface Plan {
   symbol: string;
@@ -79,7 +79,7 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: Error) => {
-  console.error(`the seed failed: ${error.message}`);
+main().catch((error: unknown) => {
+  console.error(`the seed failed: ${fullMessage(error)}`);
   process.exit(1);
 });
