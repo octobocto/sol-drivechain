@@ -106,7 +106,11 @@ TREASURY_LAMPORTS=$(((128 + 0) * LAMPORTS_PER_BYTE_YEAR * 2))
 
 DEX_FLAGS=()
 if [ "$DEX" = "1" ]; then
-  PROGRAMS="$DEX_PROGRAMS" bash "$REPO/genesis/fetch-dex-programs.sh"
+  # A token account takes 165 bytes, and this rent schedule makes it exempt.
+  PROGRAMS="$DEX_PROGRAMS" \
+    FEE_OWNER="$("$SOLANA_KEYGEN" pubkey "$KEYS/faucet.json")" \
+    FEE_LAMPORTS=$(((128 + 165) * LAMPORTS_PER_BYTE_YEAR * 2)) \
+    bash "$REPO/genesis/fetch-dex-programs.sh"
   cat "$REPO/genesis/dex-accounts.yaml" >> "$REPO/genesis/primordial.yaml"
   DEX_FLAGS=(
     --bpf-program "$TOKEN_ID" "$LOADER" "$DEX_PROGRAMS/token.so"

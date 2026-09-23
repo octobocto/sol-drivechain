@@ -30,6 +30,10 @@ CPMM_FEE_ID=DNXgeM9EiiaAbaWvwjHj9fQQLAX5ZsfHyvmYUNRAdNC8
 # The wrapped SOL mint. CP-Swap trades tokens, so a trade of the native coin
 # goes through a wrapped account. The mint must exist from the first block.
 WSOL_ID=So11111111111111111111111111111111111111112
+# The mainnet mint account holds 1845 SOL. A copy of that balance would make
+# coins that no deposit backs, so the account starts with its rent alone. The
+# data is the part that matters.
+WSOL_LAMPORTS="${WSOL_LAMPORTS:-10000}"
 
 fail() { echo "error: $1" >&2; exit 1; }
 command -v solana >/dev/null || fail "solana is not on the PATH"
@@ -78,6 +82,46 @@ field() {
     "$PROGRAMS/$1.json" "$2"
 }
 
+# CP-Swap takes the pool creation fee in wrapped BTC, and it pays it to one
+# fixed address. That address must hold a token account, so the genesis builds
+# an empty one. FEE_OWNER takes the fees, and the chain gives them to the
+# faucet, which hands them back to the users.
+fee_account_data() {
+  python3 - "$WSOL_ID" "$FEE_OWNER" "$FEE_LAMPORTS" <<'PYTHON'
+import base64, sys
+
+ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def decode(text):
+    number = 0
+    for character in text:
+        number = number * 58 + ALPHABET.index(character)
+    body = number.to_bytes(32, "big")
+    return body
+
+
+mint, owner, reserve = sys.argv[1], sys.argv[2], int(sys.argv[3])
+account = bytearray()
+account += decode(mint)
+account += decode(owner)
+account += (0).to_bytes(8, "little")          # amount
+account += (0).to_bytes(4, "little") + bytes(32)   # no delegate
+account += (1).to_bytes(1, "little")          # initialized
+account += (1).to_bytes(4, "little")          # native
+account += reserve.to_bytes(8, "little")      # the rent that the account keeps
+account += (0).to_bytes(8, "little")          # no delegated amount
+account += (0).to_bytes(4, "little") + bytes(32)   # no close authority
+assert len(account) == 165, len(account)
+print(base64.b64encode(bytes(account)).decode())
+PYTHON
+}
+
+[ -n "${FEE_OWNER:-}" ] || fail "set FEE_OWNER to the key that takes the pool fees"
+FEE_LAMPORTS="${FEE_LAMPORTS:-2344}"
+FEE_DATA="$(fee_account_data)" || fail "the fee account data did not build"
+[ "$(printf %s "$FEE_DATA" | base64 -d | wc -c)" = "165" ] || fail "the fee account is not 165 bytes"
+
 dump_account cpmm-config "$CPMM_CONFIG_ID"
 dump_account wsol-mint "$WSOL_ID"
 [ -n "$(field cpmm-config data)" ] || fail "the CP-Swap config account holds no data"
@@ -90,14 +134,14 @@ $CPMM_CONFIG_ID:
   data: "$(field cpmm-config data)"
   executable: false
 $WSOL_ID:
-  balance: $(field wsol-mint lamports)
+  balance: $WSOL_LAMPORTS
   owner: $TOKEN_ID
   data: "$(field wsol-mint data)"
   executable: false
 $CPMM_FEE_ID:
-  balance: 1024
-  owner: 11111111111111111111111111111111
-  data: ""
+  balance: $FEE_LAMPORTS
+  owner: $TOKEN_ID
+  data: "$FEE_DATA"
   executable: false
 YAML
 
