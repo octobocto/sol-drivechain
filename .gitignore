@@ -9,9 +9,6 @@ node_modules/
 keys/*.json
 target/deploy/*-keypair.json
 
-# The DEX client
-dex/node_modules/
-dex/dist/
 # The mainnet programs that the genesis loads. The manifest pins their bytes.
 genesis/programs/
 genesis/dex-accounts.yaml
