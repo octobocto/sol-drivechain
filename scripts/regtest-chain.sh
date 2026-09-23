@@ -30,6 +30,10 @@ export ENFORCER_RPC_PORT="${ENFORCER_RPC_PORT:-19652}"
 # The eCash builds keep an OP_DRIVECHAIN deposit out of the regtest mempool
 # under the standard policy.
 export ACCEPT_NONSTD="${ACCEPT_NONSTD:-1}"
+# The read-only login of the Bitcoin node. A proxy can hand a builder these
+# calls, and the login reaches no wallet and no write. The password is
+# `reader`, because the chain carries no value.
+export READER_RPC_AUTH="${READER_RPC_AUTH:-reader:9fe79e638922d8bd07832bd3f910c43d\$f8d68fb8dc25a6b1d198e512f8c9b31e7c3bd42394d8ce4bf282cce8a618be12}"
 
 # The Solana side.
 SOLANA_RPC_PORT="${SOLANA_RPC_PORT:-8799}"
