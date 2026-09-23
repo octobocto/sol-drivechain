@@ -10,7 +10,9 @@ User=root
 Environment=HOME=/root
 Environment=PATH=/root/.cargo/bin:/root/.local/share/solana/install/active_release/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=ROOT=/root/sol-regtest
-Environment=MINE_INTERVAL=30
+Environment=MINE_INTERVAL=60
+# Builders reach this chain, so the RPC answers from outside.
+Environment=SOLANA_RPC_BIND_ADDRESS=0.0.0.0
 Environment=BITCOIND=/root/.local/share/bitwindow/assets/bin/betanet/bitcoind
 Environment=BITCOIN_CLI=/root/.local/share/bitwindow/assets/bin/betanet/bitcoin-cli
 Environment=ENFORCER=/root/.local/share/bitwindow/assets/bin/bip300301-enforcer

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs a standing BIP300 regtest chain: a Bitcoin node, an enforcer, a Solana
-# validator, the peg, and the BMM loop. A miner adds a block every few
-# seconds, so bids win and settles pay, again and again.
+# validator, the peg, and the BMM loop. A miner adds a block every minute, so
+# bids win and settles pay, again and again.
 #
 # `scripts/regtest-peg.sh` proves the chain one time and takes it down. This
 # script keeps it up, so an operator can watch it and send transactions to it.
@@ -17,7 +17,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 
 ROOT="${ROOT:-$HOME/sol-regtest}"
 SLOT="${SLOT:-8}"
-MINE_INTERVAL="${MINE_INTERVAL:-30}"
+MINE_INTERVAL="${MINE_INTERVAL:-60}"
 BMM_CONFIRMATIONS="${BMM_CONFIRMATIONS:-6}"
 
 # The Bitcoin side. Every port sits away from the one-shot test and from any
@@ -34,6 +34,9 @@ export ACCEPT_NONSTD="${ACCEPT_NONSTD:-1}"
 # The Solana side.
 SOLANA_RPC_PORT="${SOLANA_RPC_PORT:-8799}"
 SOLANA_GOSSIP_PORT="${SOLANA_GOSSIP_PORT:-8201}"
+# The RPC stays on loopback. An operator who wants builders on the chain binds
+# 0.0.0.0 here.
+SOLANA_RPC_BIND_ADDRESS="${SOLANA_RPC_BIND_ADDRESS:-127.0.0.1}"
 DYNAMIC_PORT_RANGE="${DYNAMIC_PORT_RANGE:-8200-8230}"
 
 ENFORCER_URL="http://127.0.0.1:$GRPC_PORT"
@@ -162,7 +165,8 @@ up() {
   start_process validator env \
     LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
     GOSSIP_PORT="$SOLANA_GOSSIP_PORT" DYNAMIC_PORT_RANGE="$DYNAMIC_PORT_RANGE" \
-    XDP=0 ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
+    XDP=0 RPC_BIND_ADDRESS="$SOLANA_RPC_BIND_ADDRESS" \
+    ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
     BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" AGAVE_VALIDATOR="$AGAVE_VALIDATOR" \
     bash "$REPO/genesis/run-validator.sh"
   wait_for_solana
@@ -217,7 +221,7 @@ status() {
     grep 'settled its own win' "$ROOT/bmm.log" | tail -1 || true
   fi
   echo
-  echo "rpc           $SOLANA_URL"
+  echo "rpc           $SOLANA_URL (bound on $SOLANA_RPC_BIND_ADDRESS)"
   echo "enforcer      $ENFORCER_URL"
 }
 
