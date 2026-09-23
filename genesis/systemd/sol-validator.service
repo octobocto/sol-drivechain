@@ -8,6 +8,14 @@ Type=simple
 User=root
 Environment=HOME=/root
 Environment=AGAVE_VALIDATOR=/root/src/agave/target/release/agave-validator
+Environment=ENFORCER_URL=http://127.0.0.1:50051
+Environment=SIDECHAIN_SLOT=8
+Environment=BMM_CONFIRMATIONS=6
+# The address that a joiner reaches. A first validator cannot learn it, so it
+# binds it.
+Environment=BIND_ADDRESS=204.168.254.113
+# A joiner reads the genesis and a snapshot from this RPC.
+Environment=RPC_BIND_ADDRESS=0.0.0.0
 Environment=PATH=/root/.local/share/solana/install/active_release/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WorkingDirectory=/root/src/sol-drivechain
 ExecStart=/usr/bin/bash /root/src/sol-drivechain/genesis/run-validator.sh

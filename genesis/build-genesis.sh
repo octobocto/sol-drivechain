@@ -85,8 +85,14 @@ for name in validator-identity validator-vote validator-stake oracle faucet; do
 done
 
 PROGRAM_ID="$(cat "$KEYS/bridge-program.pubkey")"
+# Every fee goes to the treasury, and the runtime burns a fee that would leave
+# it below the rent reserve. So the treasury starts at exactly the reserve of an
+# empty account, which no peg-out can reach.
+TREASURY_LAMPORTS=$(((128 + 0) * LAMPORTS_PER_BYTE_YEAR * 2))
+
 "$DAEMON" genesis --program-id "$PROGRAM_ID" --vault-sol "$VAULT_SOL" \
   --oracle "$("$SOLANA_KEYGEN" pubkey "$KEYS/oracle.json")" --oracle-sol "$ORACLE_SOL" \
+  --treasury-lamports "$TREASURY_LAMPORTS" \
   --out "$REPO/genesis/primordial.yaml"
 
 rm -rf "$LEDGER"

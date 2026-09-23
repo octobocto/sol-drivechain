@@ -1,6 +1,6 @@
-	# The SOL drivechain JSON-RPC. The validator binds 127.0.0.1 only, and
-	# genesis/close-validator-ports.sh drops outside traffic to its other
-	# ports, so this proxy is the one way in.
+	# The SOL drivechain JSON-RPC. The validator binds 127.0.0.1 only, so
+	# this proxy is the one way to the RPC. The gossip ports stay open, so
+	# any user can join the chain with a validator of its own.
 	handle_path /sol/* {
 		@sol_rpc method POST OPTIONS
 		handle @sol_rpc {

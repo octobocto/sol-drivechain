@@ -1,0 +1,24 @@
+[Unit]
+Description=sol-drivechain BMM bidder, settler, and claimer
+After=network-online.target sol-validator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=PEG_SLOT=8
+Environment=ENFORCER_URL=http://127.0.0.1:50051
+Environment=SOLANA_RPC_URL=http://127.0.0.1:8899
+WorkingDirectory=/root/src/sol-drivechain
+ExecStart=/usr/bin/bash -c '/root/src/sol-drivechain/daemon/target/release/sol-drivechain-daemon bmm \
+  --enforcer-url "$ENFORCER_URL" \
+  --solana-rpc-url "$SOLANA_RPC_URL" \
+  --slot "$PEG_SLOT" \
+  --program-id "$(cat /root/src/sol-drivechain/keys/bridge-program.pubkey)" \
+  --identity /root/src/sol-drivechain/keys/validator-identity.json'
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
