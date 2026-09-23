@@ -3,9 +3,9 @@
 A BIP300 drivechain on eCash. The execution layer is a stock Solana network.
 The money on the chain is pegged Bitcoin.
 
-eCash is Bitcoin with drivechain enabled, so it carries BIP300 today. The chain
-does not use BIP301 blind merged mining yet. Until then the operator mines the
-mainchain blocks.
+eCash is Bitcoin with drivechain enabled, so it carries BIP300 and BIP301
+today. Every Solana fee goes to a treasury, and validators win it back through
+BIP301 blind merged mining. So the fees go to eCash miners.
 
 ## Why BIP300
 
@@ -30,16 +30,16 @@ vault. A withdrawal moves them back. The total supply never changes.
 
 ## Only the peg changes the money supply
 
-The peg is the one thing that may create or destroy value. That asks for one
+The peg is the one thing that may create or destroy value. That asks for a
 patch to Agave, plus one genesis flag.
 
 | What | Where | Why |
 |---|---|---|
-| Fee burn to 0 | `patches/agave-no-fee-burn.patch` | Upstream hard-codes a 50 percent burn of every transaction fee. A burnt fee destroys pegged Bitcoin. No flag and no feature gate turns it off. |
+| Fee burn to 0 | `patches/agave-sol-drivechain.patch` | Upstream hard-codes a 50 percent burn of every transaction fee. A burnt fee destroys pegged Bitcoin. No flag and no feature gate turns it off. |
 | VAT burn off | `--deactivate-feature VAT9…ANJ` | SIMD-0357 burns 1.6 SOL from each staked vote account at every epoch. |
 
-Run `bash patches/build-agave.sh` to build the two binaries with the patch.
-The patch is one line, so a move to a later Agave is one line to re-apply.
+The same patch holds the BMM changes. [BMM](#bmm) lists them. Run
+`bash patches/build-agave.sh` to build the two binaries with the patch.
 
 Nothing else is a fork.
 
@@ -56,7 +56,7 @@ Nothing else is a fork.
 
 `--target-lamports-per-signature` and `--fee-burn-percentage` do **not** apply.
 The genesis stores them and the bank ignores them. The base fee stays 5000
-lamports per signature, and the patch above sends all of it to the leader.
+lamports per signature, and the patch sends all of it to the treasury.
 
 The genesis still holds about 162 SOL that no Bitcoin backs. Of that, 160 SOL
 is a hard-coded Validator Admission Ticket reserve on the vote account, and
@@ -110,11 +110,130 @@ Only regtest is tested end to end.
 5. A bundle that expires leaves its records open, and the next bundle carries
    them again. No money disappears.
 
+## BMM
+
+Validators get fees only when they win a BIP301 bid on eCash. The commitment
+on eCash is the payee pubkey, and that is the whole h*. Each validator reads
+eCash from its own enforcer.
+
+1. **Fees.** The patched runtime sends every fee to the treasury PDA.
+2. **Bid.** For each new eCash tip T, a validator sends one BMM request with
+   its payee pubkey and a bid in sats. The bid is at most the fee income of
+   one block interval, from the growth of `treasury + bmm_paid_total`.
+3. **Win.** The miner of block H = T + 1 takes the top bid. It puts that
+   pubkey in the coinbase, and the request pays the bid. A losing request is
+   invalid, so it costs nothing.
+4. **Settle.** When block H + N + 1 arrives, any node sends
+   `settle_bmm(H, hash(H))`. The winner does not need to be the sender. The
+   program pays the whole treasury above its rent reserve to the pubkey in
+   the coinbase, and it adds that amount to `bmm_paid_total`. A height with
+   no commitment pays nobody, and its fees go to the next winner.
+
+Heights settle one at a time, in order. Each winner gets the fees between the
+settle of H − 1 and the settle of H, about one block interval.
+
+The Agave patch adds these parts:
+
+| Part | What it does |
+|---|---|
+| Treasury | Every fee goes to the treasury, not to the leader. |
+| Vote fee | A simple vote pays no signature fee. The genesis keeps Alpenglow off, so votes are txs. |
+| `sol-drivechain-bmm` | A view of the active eCash chain, filled from the local enforcer. |
+| Pre-check | For each tx with a top-level `settle_bmm(H, M)`, the check asks the view. It passes only when M is the active block at H. A leader needs N + 1 blocks on top, and replay needs N. |
+| `BmmAnswer` | The runtime builds this account for the tx, the same way as the instructions sysvar. It holds the height, the block hash, and the commitment. The bridge reads it. |
+| Flags | `--bmm-enforcer-url`, `--bmm-sidechain-slot`, and `--bmm-confirmations`. |
+
+A "not ready" settle waits in the leader queue and goes into a later block.
+On replay, the check waits up to 30 seconds for the local enforcer, and then
+the block is dead. A leader needs one more block than replay, so a healthy
+node never waits.
+
+A settle names its eCash block, and the check takes only the active chain. So
+a settle for a block on another branch never lands, however long that branch
+is. Solana runs a settle one time and never asks again, so a later eCash
+reorg changes no Solana state.
+
+A payee that cannot take the payout gets nothing, and the fees go to the next
+winner. The settle still lands. That holds for an account below its rent
+reserve, for an executable account, and for an account that the runtime
+demotes to read only. A settle that failed for such a payee would stop every
+later height, so a bid with a bad payee would stop the whole chain.
+
+This plan carries no checkpoint of Solana state on eCash. To add one later,
+make the commitment `hash(payee, slot, slot hash)` and add a claim
+instruction.
+
+## Two depths: D for a deposit, N for a BMM settle
+
+A deposit waits D confirmations, and a BMM settle waits N. They are not the
+same number, because the damage is not the same.
+
+| | Depth | Why |
+|---|---|---|
+| Deposit | D = 100 on eCash, about 17 hours | A reorg that drops a credited deposit mints lamports that no Bitcoin backs. Only a restart can undo it. |
+| BMM settle | N = 6 | A reorg that drops a settled block costs nobody. Solana keeps the payout, and the miner of the stale block loses its own reward. |
+
+Solana never rolls back by itself. A node runs a settle one time and never
+asks again, so a later eCash reorg changes no Solana state.
+
+## The disaster restart
+
+A reorg deeper than D can remove a credited deposit from eCash. No consensus
+rule handles that. The cluster then does a coordinated restart, the same way
+Solana restarts after an outage.
+
+1. Find the last slot whose eCash parts survive. Every credited deposit and
+   every settled block must be on the new eCash branch.
+2. Start every validator from a snapshot at or before that slot, with
+   `--hard-fork <slot>` and `--wait-for-supermajority <slot>`.
+3. Let the daemon replay the peg from eCash. It does that at every start. A
+   peg-out that eCash paid stays paid.
+4. Bidders bid again from the `bmm next height` of the restarted chain.
+
+`run-validator.sh` keeps ten full snapshots, 25000 slots apart, which covers
+about 28 hours. So step 2 always finds a snapshot inside the D window.
+
+## Join the chain
+
+Anyone can run a validator. The genesis deactivates SIMD-0357, so no vote
+account holds an admission ticket, and a validator can stake any amount.
+
+1. Take `agave-validator` and `solana-genesis` from a release, or build them
+   with `bash patches/build-agave.sh`. A stock Agave forks off at the first
+   fee, so the patched binaries are necessary.
+2. Run an eCash node and an enforcer beside the validator. A validator without
+   an enforcer cannot check a block that holds a BMM settle.
+3. Start the node. It takes the genesis and a snapshot from the RPC of the
+   entrypoint, and then it follows the chain.
+
+```sh
+mkdir -p ~/sol-drivechain/ledger
+LEDGER=~/sol-drivechain/ledger KEYS=~/sol-drivechain/keys \
+ENFORCER_URL=http://127.0.0.1:50051 SIDECHAIN_SLOT=8 \
+ENTRYPOINT=204.168.254.113:8001 \
+KNOWN_VALIDATOR=AYJy9KVJtgSnMSknAcFqhXtLhtSyBNFZJ5W1zDEWDeVg \
+EXPECTED_GENESIS_HASH=2EfKjqtXSu7YZaLiBLUE1xx3Tt1XMmjzKwQ967KzneUx \
+bash genesis/run-validator.sh
+```
+
+4. To vote, create a vote account, peg in Bitcoin, and delegate stake to it.
+   The stake activates at the next epoch. Stake is pegged Bitcoin, so the
+   security of the chain is the Bitcoin that validators stake.
+
+Read the genesis hash from the chain: `solana -u <rpc> genesis-hash`.
+
+A validator advertises the address that it binds. The first validator of a
+chain has no entrypoint, so it cannot learn its own address. Its operator sets
+`BIND_ADDRESS` to the address that the world sees, or no joiner reaches it.
+
 ## The trust model
 
 The mainchain releases the Bitcoin, not a key. The oracle key only credits
 lamports for a deposit that the mainchain already confirmed, and the bridge
 counts `pegged_lamports` so the validator's genesis lamports can never peg out.
+
+No key controls BMM. The coinbase names the payee, and any user can send the
+settle that pays it.
 
 ## Layout
 
@@ -164,10 +283,9 @@ $D watch $E                        # the deposit event names the account
 
 ## Reach the chain from a wallet
 
-The validator binds `127.0.0.1` for its RPC, and
-`genesis/close-validator-ports.sh` drops outside traffic to ports 8000 to 8020.
-So the only way in is a reverse proxy. `genesis/caddy/sol-rpc.caddy` holds the
-block, and it takes POST only.
+The validator binds `127.0.0.1` for its RPC, so the only way in is a reverse
+proxy. `genesis/caddy/sol-rpc.caddy` holds the block, and it takes POST only.
+The gossip ports stay open, because any user may join the chain.
 
 ```sh
 solana config set --url https://seed.alpha.ecash.eu.com/sol/
@@ -183,15 +301,23 @@ Pass `wsEndpoint`, because a wallet guesses the websocket address from the
 http one, and a path proxy breaks that guess.
 
 The genesis hash names the cluster:
-`CW6Q1sLumxtmhLBz9DnDWaSidP6A5a8CEKiH18EKQH4i`.
+`2EfKjqtXSu7YZaLiBLUE1xx3Tt1XMmjzKwQ967KzneUx`.
 
 Every wallet prints the unit as SOL. One SOL is one BTC here.
 
 ## Prove the whole peg
 
 `scripts/regtest-peg.sh` builds its own Bitcoin node, its own enforcer, and its
-own Solana chain, then it claims a slot, pegs in, and pegs out. It never
-touches a chain that already runs on the host.
+own Solana chain, then it claims a slot, pegs in, and pegs out. Last, a second
+validator joins, and a BMM loop bids until a win settles and pays the
+treasury. Four more stages prove the hard cases:
+
+- A settle for a block that is not N + 1 deep never lands.
+- A settle for a block that a reorg dropped never lands.
+- The loop settles the new block at that height after the reorg.
+- Both validators run after a reorg deeper than N.
+
+It never touches a chain that already runs on the host.
 
 ```sh
 BITCOIND=<a drivechain-patched bitcoind> \
@@ -248,11 +374,14 @@ Agave CLI. Use the Linux release, or build both from an agave checkout.
 
 ```sh
 bash genesis/build-genesis.sh
-bash genesis/run-validator.sh
+ENFORCER_URL=http://127.0.0.1:50051 SIDECHAIN_SLOT=8 bash genesis/run-validator.sh
 daemon/target/debug/sol-drivechain-daemon run \
   --network regtest --slot 8 \
   --program-id "$(cat keys/bridge-program.pubkey)" \
   --oracle keys/oracle.json
+daemon/target/debug/sol-drivechain-daemon bmm \
+  --slot 8 --program-id "$(cat keys/bridge-program.pubkey)" \
+  --identity keys/validator-identity.json
 ```
 
 ## One seed for every sidechain
@@ -292,9 +421,13 @@ with mode 600.
 | `seed-pubkey` | Prints the addresses of a BIP39 seed phrase. |
 | `seed-keypair` | Writes a Solana keypair file from that phrase. |
 | `withdraw` | Burns lamports and asks the mainchain to pay an address. |
-| `bridge-state` | Prints the bridge config and the vault balance. |
+| `bridge-state` | Prints the bridge config, the vault, the treasury, and the BMM totals. |
 | `initialize` | Creates the bridge config account. |
 | `run` | Runs the peg. |
+| `bmm` | Bids for eCash blocks, and settles each eCash height. |
+| `settle-bmm` | Settles one eCash height by hand. |
+| `ecash-tip` | Prints the height and the hash of the eCash tip. |
+| `ecash-walk` | Prints how far the enforcer walks back in one call. |
 
 ## Still open
 
