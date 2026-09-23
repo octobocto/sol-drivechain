@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use sol_drivechain_daemon::enforcer::{Declaration, Enforcer};
 use sol_drivechain_daemon::network::PegNetwork;
 use sol_drivechain_daemon::proto::mainchain::AckAllProposalsPolicy;
-use sol_drivechain_daemon::{address, bridge, peg, seed};
+use sol_drivechain_daemon::{address, bmm, bridge, peg, seed};
 use solana_sdk::{pubkey::Pubkey, signature::read_keypair_file, signer::Signer as _};
 
 /// The lamport count of one SOL.
@@ -161,6 +161,9 @@ enum Command {
         /// The keypair whose pubkey credits every deposit.
         #[arg(long)]
         oracle: PathBuf,
+        /// The first eCash height that BMM settles, normally the current tip.
+        #[arg(long)]
+        bmm_start_height: u64,
     },
     /// Burns lamports and asks the mainchain to pay a Bitcoin address.
     Withdraw {
@@ -240,8 +243,68 @@ enum Command {
         oracle: Option<String>,
         #[arg(long, default_value_t = 10)]
         oracle_sol: u64,
+        /// The rent reserve of the empty treasury account. Every fee goes to
+        /// the treasury, so it must exist from the genesis on.
+        #[arg(long)]
+        treasury_lamports: u64,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Prints how many headers and BMM commitments the enforcer gives for
+    /// one call. A test uses it.
+    EcashWalk {
+        #[command(flatten)]
+        enforcer: EnforcerArgs,
+        #[arg(long, default_value_t = 1000)]
+        max_ancestors: u32,
+    },
+    /// Prints the height and the hash of the eCash tip.
+    EcashTip {
+        #[command(flatten)]
+        enforcer: EnforcerArgs,
+    },
+    /// Settles one eCash height by hand. A test or an operator uses it.
+    SettleBmm {
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+        #[arg(long)]
+        program_id: String,
+        /// The keypair that signs and pays the fee.
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        height: u64,
+        /// The block hash in the hex that the explorers show.
+        #[arg(long)]
+        block_hash: String,
+        /// The payee in the BMM commitment. It defaults to the signer.
+        #[arg(long)]
+        payee: Option<String>,
+    },
+    /// Bids for eCash blocks, and settles each eCash height on Solana.
+    Bmm {
+        #[arg(long, default_value = "http://127.0.0.1:50051")]
+        enforcer_url: String,
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+        #[arg(long)]
+        slot: u8,
+        #[arg(long)]
+        program_id: String,
+        /// The keypair that signs, and whose pubkey is the BMM commitment and
+        /// the payee. Normally the validator identity.
+        #[arg(long)]
+        identity: PathBuf,
+        /// N. It must match `--bmm-confirmations` on the validators.
+        #[arg(long, default_value_t = 6)]
+        confirmations: u64,
+        /// The part of the fee income of one block that one bid offers.
+        #[arg(long, default_value_t = 90)]
+        bid_percent: u64,
+        #[arg(long, default_value_t = 1_000)]
+        min_bid_sats: u64,
+        #[arg(long, default_value_t = 2)]
+        interval_secs: u64,
     },
     /// Runs the peg. It credits deposits and it proposes withdrawal bundles.
     Run {
@@ -281,6 +344,8 @@ enum CliError {
     BitcoinAddress(#[from] sol_drivechain_daemon::network::AddressError),
     #[error("the daemon cannot read the oracle keypair at `{path}`")]
     NoOracleKey { path: PathBuf },
+    #[error("the daemon cannot read the identity keypair at `{path}`")]
+    NoIdentityKey { path: PathBuf },
     #[error("the daemon cannot read `{path}`")]
     Read {
         path: PathBuf,
@@ -313,6 +378,8 @@ enum CliError {
     Address(#[from] address::AddressError),
     #[error(transparent)]
     Peg(#[from] peg::PegError),
+    #[error(transparent)]
+    Bmm(#[from] bmm::BmmError),
 }
 
 fn main() -> Result<(), CliError> {
@@ -530,6 +597,7 @@ fn main() -> Result<(), CliError> {
             program_id,
             payer,
             oracle,
+            bmm_start_height,
         } => {
             let program_id = parse_pubkey(&program_id)?;
             let payer_key = read_keypair_file(&payer).map_err(|_| CliError::NoOracleKey {
@@ -539,10 +607,15 @@ fn main() -> Result<(), CliError> {
                 path: oracle.clone(),
             })?;
             let rpc = blocking_rpc(&solana_rpc_url);
-            let instruction =
-                bridge::initialize_ix(&program_id, &payer_key.pubkey(), &oracle_key.pubkey());
+            let instruction = bridge::initialize_ix(
+                &program_id,
+                &payer_key.pubkey(),
+                &oracle_key.pubkey(),
+                bmm_start_height,
+            );
             send_one(&rpc, &payer_key, instruction, "initialize")?;
             println!("the bridge config holds oracle {}", oracle_key.pubkey());
+            println!("BMM settles from eCash height {bmm_start_height}");
             println!("config {}", bridge::config_pda(&program_id).0);
             Ok(())
         }
@@ -607,11 +680,20 @@ fn main() -> Result<(), CliError> {
                     call: "getBalance(vault)",
                     source,
                 })?;
+            let treasury = rpc
+                .get_balance(&bridge::treasury_pda(&program_id).0)
+                .map_err(|source| CliError::Rpc {
+                    call: "getBalance(treasury)",
+                    source,
+                })?;
             println!("oracle            {}", config.oracle);
             println!("deposit high water {}", config.deposit_high_water);
             println!("pegged lamports   {}", config.pegged_lamports);
             println!("withdrawals       {}", config.withdrawal_count);
             println!("vault lamports    {vault}");
+            println!("treasury lamports {treasury}");
+            println!("bmm next height   {}", config.bmm_next_height);
+            println!("bmm paid total    {}", config.bmm_paid_total);
             Ok(())
         }
         Command::SeedPubkey {
@@ -669,6 +751,7 @@ fn main() -> Result<(), CliError> {
             vault_sol,
             oracle,
             oracle_sol,
+            treasury_lamports,
             out,
         } => {
             let program_id = parse_pubkey(&program_id)?;
@@ -677,6 +760,9 @@ fn main() -> Result<(), CliError> {
                 .ok_or(CliError::VaultTooLarge(vault_sol))?;
             let vault = bridge::vault_pda(&program_id).0;
             let mut body = primordial_yaml(&vault, lamports);
+            let treasury = bridge::treasury_pda(&program_id).0;
+            body.push_str(&primordial_yaml(&treasury, treasury_lamports));
+            println!("treasury {treasury} holds {treasury_lamports} lamports");
             if let Some(oracle) = oracle {
                 let oracle = parse_pubkey(&oracle)?;
                 let oracle_lamports = oracle_sol
@@ -719,6 +805,80 @@ fn main() -> Result<(), CliError> {
                 bundle_interval: Duration::from_secs(bundle_interval_secs.max(1)),
             };
             runtime.block_on(peg::run(settings, keypair))?;
+            Ok(())
+        }
+        Command::EcashWalk {
+            enforcer,
+            max_ancestors,
+        } => runtime.block_on(async {
+            let mut enforcer = enforcer.open().await?;
+            let (hash, height) = enforcer.tip().await?;
+            let (headers, commitments) = enforcer
+                .headers_and_commitments(&hash, max_ancestors)
+                .await?;
+            println!("tip height {height}");
+            println!("headers    {headers}");
+            println!("commitments {commitments}");
+            Ok(())
+        }),
+        Command::EcashTip { enforcer } => runtime.block_on(async {
+            let mut enforcer = enforcer.open().await?;
+            let (hash, height) = enforcer.tip().await?;
+            println!("{height} {hash}");
+            Ok(())
+        }),
+        Command::SettleBmm {
+            solana_rpc_url,
+            program_id,
+            identity,
+            height,
+            block_hash,
+            payee,
+        } => {
+            let program_id = parse_pubkey(&program_id)?;
+            let signer = read_keypair_file(&identity).map_err(|_| CliError::NoIdentityKey {
+                path: identity.clone(),
+            })?;
+            let hash = fixed_hash::<32>(&block_hash, "block_hash")?;
+            // The hex of an explorer is the reverse of the internal bytes.
+            let mut internal = hash;
+            internal.reverse();
+            let payee = match payee {
+                Some(payee) => parse_pubkey(&payee)?,
+                None => signer.pubkey(),
+            };
+            let rpc = blocking_rpc(&solana_rpc_url);
+            let instruction = bridge::settle_bmm_ix(&program_id, height, &internal, &payee);
+            send_one(&rpc, &signer, instruction, "settle_bmm")?;
+            println!("eCash height {height} settled, and the payee is {payee}");
+            Ok(())
+        }
+        Command::Bmm {
+            enforcer_url,
+            solana_rpc_url,
+            slot,
+            program_id,
+            identity,
+            confirmations,
+            bid_percent,
+            min_bid_sats,
+            interval_secs,
+        } => {
+            let program_id = parse_pubkey(&program_id)?;
+            let keypair = read_keypair_file(&identity).map_err(|_| CliError::NoIdentityKey {
+                path: identity.clone(),
+            })?;
+            let settings = bmm::Settings {
+                enforcer_url,
+                solana_rpc_url,
+                sidechain_id: slot,
+                program_id,
+                confirmations,
+                bid_percent,
+                min_bid_sats,
+                interval: Duration::from_secs(interval_secs.max(1)),
+            };
+            runtime.block_on(bmm::run(settings, keypair))?;
             Ok(())
         }
     }
