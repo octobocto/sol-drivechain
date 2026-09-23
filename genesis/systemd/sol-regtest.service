@@ -18,9 +18,11 @@ Environment=BITCOIN_CLI=/root/.local/share/bitwindow/assets/bin/betanet/bitcoin-
 Environment=ENFORCER=/root/.local/share/bitwindow/assets/bin/bip300301-enforcer
 Environment=SOLANA_GENESIS=/root/src/agave/target/release/solana-genesis
 Environment=AGAVE_VALIDATOR=/root/src/agave/target/release/agave-validator
+Environment=SOLANA_FAUCET=/root/src/agave/target/release/solana-faucet
 WorkingDirectory=/root/src/sol-drivechain
 ExecStart=/usr/bin/bash scripts/regtest-chain.sh up
 ExecStop=/usr/bin/bash scripts/regtest-chain.sh down
+LimitNOFILE=1000000
 TimeoutStartSec=900
 
 [Install]
