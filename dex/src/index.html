@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SOL drivechain DEX</title>
+    <meta name="description" content="Trade on a Solana sidechain of eCash. The coin is pegged Bitcoin." />
+    <link rel="stylesheet" href="style.css" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>&#9889;</text></svg>" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <h1>SOL drivechain DEX</h1>
+        <p class="sub">A Solana sidechain of eCash. Every coin here is pegged BTC.</p>
+      </div>
+      <div class="chain" id="chain-status">the page reads the chain…</div>
+    </header>
+
+    <main>
+      <section class="card" id="wallet-card">
+        <h2>Your wallet</h2>
+        <p class="hint">The page makes a key in this browser. Nobody else holds it.</p>
+        <div class="row">
+          <code id="wallet-address">…</code>
+          <button id="copy-address" class="ghost">copy</button>
+        </div>
+        <div class="row balance"><span id="wallet-balance">0</span> <span class="unit">BTC</span></div>
+        <div class="row">
+          <button id="airdrop" class="primary">Get test BTC</button>
+          <button id="show-key" class="ghost">show key</button>
+          <button id="import-key" class="ghost">use another key</button>
+        </div>
+        <p class="status" id="wallet-status"></p>
+      </section>
+
+      <section class="card" id="swap-card">
+        <h2>Swap</h2>
+        <div class="field">
+          <label for="swap-from">You pay</label>
+          <div class="row">
+            <input id="swap-amount" inputmode="decimal" placeholder="0.0" />
+            <select id="swap-from"></select>
+          </div>
+          <p class="hint" id="swap-from-balance"></p>
+        </div>
+        <div class="field">
+          <label for="swap-to">You get</label>
+          <div class="row">
+            <output id="swap-out">0</output>
+            <select id="swap-to"></select>
+          </div>
+          <p class="hint" id="swap-detail"></p>
+        </div>
+        <div class="field row">
+          <label for="swap-slippage">Slippage</label>
+          <select id="swap-slippage">
+            <option value="0.5">0.5%</option>
+            <option value="1" selected>1%</option>
+            <option value="5">5%</option>
+          </select>
+        </div>
+        <button id="swap" class="primary wide">Swap</button>
+        <p class="status" id="swap-status"></p>
+      </section>
+
+      <section class="card wide-card">
+        <h2>Pools</h2>
+        <table id="pool-table">
+          <thead>
+            <tr><th>Pair</th><th>Liquidity</th><th>Price</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <p class="status" id="pool-status"></p>
+      </section>
+
+      <section class="card">
+        <h2>Make a token</h2>
+        <div class="field row">
+          <input id="token-symbol" maxlength="10" placeholder="SYMBOL" />
+          <input id="token-supply" inputmode="decimal" placeholder="1000000" />
+          <select id="token-decimals">
+            <option value="6" selected>6 decimals</option>
+            <option value="9">9 decimals</option>
+            <option value="0">0 decimals</option>
+          </select>
+        </div>
+        <button id="make-token" class="primary wide">Make it</button>
+        <p class="status" id="token-status"></p>
+      </section>
+
+      <section class="card">
+        <h2>Make a pool</h2>
+        <p class="hint">A pool sets its own price: the ratio of the two amounts.</p>
+        <div class="field row">
+          <input id="pool-amount-a" inputmode="decimal" placeholder="0.0" />
+          <select id="pool-mint-a"></select>
+        </div>
+        <div class="field row">
+          <input id="pool-amount-b" inputmode="decimal" placeholder="0.0" />
+          <select id="pool-mint-b"></select>
+        </div>
+        <button id="make-pool" class="primary wide">Make it</button>
+        <p class="status" id="pool-make-status"></p>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        The DEX program is Raydium CP-Swap at its mainnet address. The chain is a
+        BIP300 drivechain of eCash, and it runs on regtest.
+      </p>
+      <p id="endpoints"></p>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>

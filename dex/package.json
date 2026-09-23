@@ -1,0 +1,28 @@
+{
+  "name": "sol-drivechain-dex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A web page that trades on the CP-Swap pools of the SOL drivechain.",
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "test": "vitest run",
+    "check": "tsc --noEmit",
+    "seed": "node --experimental-strip-types scripts/seed.ts",
+    "trade": "node --experimental-strip-types scripts/trade.ts"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.13",
+    "@solana/web3.js": "^1.98.0",
+    "bs58": "^6.0.0",
+    "buffer": "^6.0.3"
+  },
+  "devDependencies": {
+    "@raydium-io/raydium-sdk-v2": "0.2.73-alpha",
+    "@types/bn.js": "^5.2.0",
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.4"
+  }
+}
