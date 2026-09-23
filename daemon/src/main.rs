@@ -258,6 +258,11 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         max_ancestors: u32,
     },
+    /// Prints the balance of the enforcer wallet, in satoshis.
+    WalletBalance {
+        #[command(flatten)]
+        enforcer: EnforcerArgs,
+    },
     /// Prints the height and the hash of the eCash tip.
     EcashTip {
         #[command(flatten)]
@@ -819,6 +824,13 @@ fn main() -> Result<(), CliError> {
             println!("tip height {height}");
             println!("headers    {headers}");
             println!("commitments {commitments}");
+            Ok(())
+        }),
+        Command::WalletBalance { enforcer } => runtime.block_on(async {
+            let mut enforcer = enforcer.open().await?;
+            let (confirmed, pending) = enforcer.wallet_balance().await?;
+            println!("confirmed {confirmed}");
+            println!("pending   {pending}");
             Ok(())
         }),
         Command::EcashTip { enforcer } => runtime.block_on(async {
