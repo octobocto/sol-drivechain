@@ -17,6 +17,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   TARGET: x86_64-unknown-linux-gnu
+  AGAVE_TAG: v4.2.2
 
 jobs:
   release:
@@ -37,7 +38,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq protobuf-compiler libudev-dev \
-            clang libclang-dev cmake
+            clang libclang-dev cmake unzip jq
 
       - name: Install the Agave CLI
         run: |
@@ -56,6 +57,20 @@ jobs:
       - name: Build the daemon
         run: cargo build --release --manifest-path daemon/Cargo.toml
 
+      # A joiner takes the two patched binaries from the release, so it starts
+      # in minutes and never builds Agave itself.
+      - name: Cache the patched Agave build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/src/agave/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: agave-${{ env.AGAVE_TAG }}-${{ hashFiles('patches/agave-sol-drivechain.patch') }}
+
+      - name: Build the patched solana-genesis and agave-validator
+        run: bash patches/build-agave.sh
+
       - name: Pack the tarball
         id: pack
         run: |
@@ -66,6 +81,8 @@ jobs:
           mkdir -p "$stage"
           cp daemon/target/release/sol-drivechain-daemon "$stage/"
           cp target/deploy/sol_drivechain_bridge.so "$stage/"
+          cp "$HOME/src/agave/target/release/agave-validator" "$stage/"
+          cp "$HOME/src/agave/target/release/solana-genesis" "$stage/"
           cp README.md LICENSE "$stage/" 2>/dev/null || true
           tar -czf "$name" -C "$(dirname "$stage")" "sol-drivechain-${version}"
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -81,6 +98,9 @@ jobs:
         with:
           files: ${{ steps.pack.outputs.name }}
           body: |
+            The tarball holds the daemon, the bridge program, and the two
+            patched Agave binaries: `agave-validator` and `solana-genesis`.
+
             BIP300 sidechain declaration for slot 8:
 
             - hashid1, the release tarball: `${{ steps.pack.outputs.sha256 }}`
