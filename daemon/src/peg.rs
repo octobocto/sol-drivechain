@@ -133,6 +133,11 @@ pub async fn run(settings: Settings, oracle: Keypair) -> Result<(), PegError> {
     )
     .await?;
     enforcer.check_network(settings.network).await?;
+    tracing::info!(
+        network = settings.network.name(),
+        confirmations = settings.confirmations,
+        "the peg credits a deposit after this many mainchain confirmations"
+    );
     enforcer
         .set_withdrawal_bundle_policy(WithdrawalBundlePolicy::Known)
         .await?;
