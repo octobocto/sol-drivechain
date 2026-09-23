@@ -92,3 +92,98 @@ jobs:
             echo "== $log =="
             tail -60 "$log" 2>/dev/null || echo "(absent)"
           done
+
+  dex:
+    name: Trade on the DEX on regtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install the Agave CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dex/package-lock.json
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler libudev-dev unzip jq \
+            clang libclang-dev cmake
+
+      - name: Cache the patched Agave build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/src/agave/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: agave-${{ env.AGAVE_TAG }}-${{ hashFiles('patches/agave-sol-drivechain.patch') }}
+
+      - name: Build the patched solana-genesis and agave-validator
+        run: bash patches/build-agave.sh
+
+      - name: Cache the enforcer build
+        uses: actions/cache@v4
+        with:
+          path: bip300301_enforcer/target
+          key: enforcer-${{ hashFiles('.gitmodules') }}-${{ github.event.pull_request.base.sha || github.sha }}
+          restore-keys: enforcer-${{ hashFiles('.gitmodules') }}-
+
+      - name: Build the enforcer
+        run: cargo build --release --manifest-path bip300301_enforcer/Cargo.toml --bin bip300301_enforcer
+
+      - name: Fetch the eCash Bitcoin build
+        run: |
+          ./bip300301_enforcer/scripts/fetch_ecash_bitcoin.sh \
+            "$ECASH_CHANNEL" x86_64-unknown-linux-gnu "$RUNNER_TEMP/bitcoin-bins"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build the bridge program
+        run: cargo-build-sbf --manifest-path programs/bridge/Cargo.toml --sbf-out-dir target/deploy
+
+      - name: Build the daemon
+        run: cargo build --release --manifest-path daemon/Cargo.toml
+
+      - name: Test and build the DEX client
+        run: |
+          cd dex
+          npm ci
+          npm run check
+          npm test
+          npm run build
+
+      - name: Start the chain and trade on it
+        run: |
+          sudo prlimit --pid $$ --nofile=1000000:1000000
+          bash scripts/regtest-chain.sh up
+          bash scripts/regtest-dex.sh
+          bash scripts/regtest-chain.sh down
+        env:
+          BITCOIND: ${{ runner.temp }}/bitcoin-bins/bitcoind
+          BITCOIN_CLI: ${{ runner.temp }}/bitcoin-bins/bitcoin-cli
+          ENFORCER: ${{ github.workspace }}/bip300301_enforcer/target/release/bip300301_enforcer
+          MINE_INTERVAL: 10
+          FAUCET_BTC: 200
+
+      - name: Show the logs on a failure
+        if: failure()
+        run: |
+          for log in "$HOME/sol-regtest/validator.log" "$HOME/sol-regtest/peg.log" \
+                     "$HOME/sol-regtest/faucet.log" \
+                     "$HOME/sol-regtest/bitcoin-stack/enforcer/enforcer.log"; do
+            echo "== $log =="
+            tail -60 "$log" 2>/dev/null || echo "(absent)"
+          done
