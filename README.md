@@ -343,8 +343,8 @@ satoshis, and the mainchain treasury holds 3,000,000 satoshis.
 
 `scripts/regtest-peg.sh` proves the chain one time and takes it down.
 `scripts/regtest-chain.sh` keeps one up: a Bitcoin node, an enforcer, a
-validator, the peg, the BMM loop, and a miner that adds a block every 30
-seconds. The sidechain slot is active there, so bids win and settles pay,
+validator, the peg, the BMM loop, and a miner that adds a block every
+minute. The sidechain slot is active there, so bids win and settles pay,
 again and again.
 
 ```sh
