@@ -13,3 +13,15 @@
 	handle_path /sol-ws/* {
 		reverse_proxy 127.0.0.1:8900
 	}
+	# The standing regtest chain of scripts/regtest-chain.sh. It carries no
+	# value, and builders use it while betanet waits for the slot.
+	handle_path /sol-regtest/* {
+		@sol_regtest_rpc method POST OPTIONS
+		handle @sol_regtest_rpc {
+			reverse_proxy 127.0.0.1:8799
+		}
+		respond "method not allowed" 405
+	}
+	handle_path /sol-regtest-ws/* {
+		reverse_proxy 127.0.0.1:8800
+	}

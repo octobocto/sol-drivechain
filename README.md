@@ -355,7 +355,22 @@ bash scripts/regtest-chain.sh down
 ```
 
 `genesis/systemd/sol-regtest.service` runs the same chain as a service, so it
-comes back after a restart of the host.
+comes back after a restart of the host. One chain of this shape runs today,
+and builders use it while betanet waits for the slot:
+
+```sh
+solana config set --url https://seed.alpha.ecash.eu.com/sol-regtest/
+```
+
+```js
+new Connection("https://seed.alpha.ecash.eu.com/sol-regtest/", {
+  wsEndpoint: "wss://seed.alpha.ecash.eu.com/sol-regtest-ws/",
+});
+```
+
+Its genesis hash is `Cwk5fda5voCtEkh5NCPcSxHKcXH3i6RdwqWXkFUYEACJ`. The chain
+has no faucet, because every lamport comes from a Bitcoin deposit. The
+operator pegs coins in for a builder.
 
 ## Two hosts on one regtest chain
 
