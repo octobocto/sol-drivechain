@@ -171,21 +171,27 @@ async function refreshQuote(): Promise<void> {
 }
 
 async function refreshChain(): Promise<void> {
+  const known = mergeTokens([NATIVE], config.tokens, readSavedTokens(store));
+  el("chain-status").textContent = "the page reads the pools…";
   const [slot, pooled] = await Promise.all([connection.getSlot(), loadPools(connection)]);
   pools = pooled;
-  tokens = mergeTokens(
-    [NATIVE],
-    config.tokens,
-    readSavedTokens(store),
-    await tokensOfPools(connection, pools, mergeTokens([NATIVE], config.tokens, readSavedTokens(store))),
-  );
+  el("chain-status").textContent = "the page reads the tokens…";
+  tokens = mergeTokens(known, await tokensOfPools(connection, pools, known));
+  el("chain-status").textContent = "the page reads your balances…";
   await readBalances();
   el("chain-status").textContent = `slot ${slot} · ${pools.length} pools · ${tokens.length} tokens`;
   for (const id of ["swap-from", "swap-to", "pool-mint-a", "pool-mint-b"]) {
     fillSelect(el<HTMLSelectElement>(id));
   }
-  if (el<HTMLSelectElement>("swap-to").value === el<HTMLSelectElement>("swap-from").value && tokens.length > 1) {
-    el<HTMLSelectElement>("swap-to").value = tokens[1].mint;
+  for (const pair of [
+    ["swap-from", "swap-to"],
+    ["pool-mint-a", "pool-mint-b"],
+  ]) {
+    const first = el<HTMLSelectElement>(pair[0]);
+    const second = el<HTMLSelectElement>(pair[1]);
+    if (first.value === second.value && tokens.length > 1) {
+      second.value = tokens.find((token) => token.mint !== first.value)?.mint ?? second.value;
+    }
   }
   renderWallet();
   renderPools();
