@@ -112,11 +112,12 @@ if [ -n "${NO_VOTE:-}" ]; then
   VOTE_ARGS=(--no-voting)
 fi
 
-# The default filter drops every message of the BMM crates.
-export RUST_LOG="${RUST_LOG:-solana=info,sol_drivechain_bmm=debug,solana_runtime::bank::bmm=debug}"
+export RUST_LOG="${RUST_LOG:-solana=warn,sol_drivechain_bmm=info,solana_runtime::bank::bmm=info}"
 
 exec "$AGAVE_VALIDATOR" \
   --ledger "$LEDGER" \
+  --limit-ledger-size "${LEDGER_SHREDS:-50000000}" \
+  --disable-banking-trace \
   --identity "$KEYS/validator-identity.json" \
   "${VOTE_ARGS[@]}" \
   "${SNAPSHOT_ARGS[@]}" \

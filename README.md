@@ -384,6 +384,41 @@ daemon/target/debug/sol-drivechain-daemon bmm \
   --identity keys/validator-identity.json
 ```
 
+## External data on the alphanet host
+
+The storage drop-ins use `/mnt/HC_Volume_106659003/sol-drivechain`.
+The validator uses `betanet/ledger`; the regtest stack uses `regtest`.
+Both services stop before startup if the volume has no mount.
+The regtest drop-in applies to an existing `sol-regtest.service`.
+
+1. Stop the validator, peg, BMM, and regtest services before the data transfer.
+2. Move the ledger into `betanet/ledger` and the complete regtest tree into `regtest` on the volume.
+3. Keep the keys, genesis, and snapshots with their existing data.
+4. Install the files below after the data transfer.
+
+If the host uses `scripts/regtest-chain.sh`, change its `start_process` log redirection from `>` to `>>`.
+Append mode prevents sparse log files after log rotation.
+
+```sh
+sudo install -d /etc/systemd/system/sol-validator.service.d /etc/systemd/system/sol-regtest.service.d
+sudo install -m 644 genesis/systemd/sol-validator.service.d/storage.conf /etc/systemd/system/sol-validator.service.d/
+sudo install -m 644 genesis/systemd/sol-regtest.service.d/storage.conf /etc/systemd/system/sol-regtest.service.d/
+sudo install -m 644 genesis/systemd/sol-logrotate.service genesis/systemd/sol-logrotate.timer /etc/systemd/system/
+sudo install -m 644 genesis/logrotate/sol-drivechain.conf /etc/logrotate-sol-drivechain.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now sol-logrotate.timer
+```
+
+Start the services after you check the data paths.
+`LEDGER_SHREDS` sets the retention target for rooted shreds, with a default of 50,000,000, the Agave minimum.
+The validator disables the bank trace and keeps the existing snapshot limits.
+`RUST_LOG` sets the log filter; the default keeps Solana warnings and errors plus BMM information.
+
+The services write logs on the volume.
+The timer checks log sizes each hour and rotates files above 100 MiB.
+It keeps five archives per file.
+The active log can grow between checks.
+
 ## One seed for every sidechain
 
 BitWindow keeps one BIP39 seed phrase, and every sidechain derives its keys

@@ -12,6 +12,18 @@ env:
   AGAVE_VERSION: stable
 
 jobs:
+  storage:
+    name: Storage scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the storage tools
+        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck logrotate
+      - name: Check the shell script
+        run: shellcheck genesis/run-validator.sh scripts/regtest.sh
+      - name: Test the storage setup
+        run: python3 -m unittest discover -s tests -v
+
   check-lint-test:
     name: Check, Lint, Test
     runs-on: ubuntu-latest

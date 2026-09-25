@@ -101,7 +101,7 @@ start_enforcer() {
     --wallet-auto-create \
     --wallet-sync-source=disabled \
     --log-level=info \
-    > "$ENFORCER_DIR/enforcer.log" 2>&1 &
+    >> "$ENFORCER_DIR/enforcer.log" 2>&1 &
   for _ in $(seq 1 60); do
     if nc -z 127.0.0.1 "$GRPC_PORT" 2>/dev/null; then
       echo "the enforcer serves grpc on 127.0.0.1:$GRPC_PORT"

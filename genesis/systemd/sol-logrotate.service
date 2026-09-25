@@ -1,0 +1,8 @@
+[Unit]
+Description=Rotate Solana logs
+RequiresMountsFor=/mnt/HC_Volume_106659003
+AssertPathIsMountPoint=/mnt/HC_Volume_106659003
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate --state /mnt/HC_Volume_106659003/sol-drivechain/logrotate.status /etc/logrotate-sol-drivechain.conf
