@@ -420,7 +420,7 @@ impl Enforcer {
     /// Sends a deposit to this sidechain slot.
     ///
     /// The enforcer writes `address` into the OP_RETURN with no change, so
-    /// pass the full `s<slot>_<address>_<checksum>` form.
+    /// pass the bare base58 pubkey.
     pub async fn create_deposit(
         &mut self,
         address: &str,
