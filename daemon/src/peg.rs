@@ -210,7 +210,7 @@ async fn credit_deposit(
             return Ok(());
         }
     };
-    let recipient = match address::parse_deposit_address(settings.sidechain_id, text) {
+    let recipient = match address::parse_deposit_recipient(text) {
         Ok(recipient) => recipient,
         Err(error) => {
             tracing::warn!(

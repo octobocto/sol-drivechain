@@ -532,17 +532,12 @@ fn main() -> Result<(), CliError> {
             fee_sats,
         } => {
             let pubkey = parse_pubkey(&pubkey)?;
-            let slot = enforcer.slot;
             runtime.block_on(async {
                 let mut enforcer = enforcer.open().await?;
-                // The enforcer writes this string into the OP_RETURN with no
-                // change, so the caller adds the slot and the checksum.
-                let deposit_address = address::format_deposit_address(slot, &pubkey);
-                let txid = enforcer
-                    .create_deposit(&deposit_address, sats, fee_sats)
-                    .await?;
+                let recipient = pubkey.to_string();
+                let txid = enforcer.create_deposit(&recipient, sats, fee_sats).await?;
                 println!("txid {txid}");
-                println!("the mainchain carries {deposit_address}");
+                println!("the mainchain carries {recipient}");
                 Ok(())
             })
         }
@@ -573,7 +568,7 @@ fn main() -> Result<(), CliError> {
                         } => {
                             for deposit in deposits {
                                 let text = String::from_utf8_lossy(&deposit.address);
-                                let parsed = address::parse_deposit_address(slot, &text);
+                                let parsed = address::parse_deposit_recipient(&text);
                                 println!(
                                     "block {height} deposit seq {} value {} sats address {text}",
                                     deposit.sequence_number, deposit.value_sats

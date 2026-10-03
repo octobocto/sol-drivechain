@@ -91,8 +91,9 @@ Only regtest is tested end to end.
 1. A user asks for the deposit address of a Solana pubkey. The form is
    `s<slot>_<base58 pubkey>_<checksum>`, where the checksum is the first three
    bytes of the SHA-256 of the part before it, in hex.
-2. The user pays that address through `CreateDepositTransaction`. The enforcer
-   writes the string into the OP_RETURN with no change.
+2. The wallet removes the slot and the checksum, and pays through
+   `CreateDepositTransaction`. The OP_RETURN carries only the bare base58
+   pubkey, the same as Thunder.
 3. The mainchain sends a deposit event with a gapless sequence number.
 4. After enough confirmations the daemon credits `value_sats * 10` lamports.
    The sequence number is the replay guard, on chain.
