@@ -213,7 +213,7 @@ LEDGER=~/sol-drivechain/ledger KEYS=~/sol-drivechain/keys \
 ENFORCER_URL=http://127.0.0.1:50051 SIDECHAIN_SLOT=8 \
 ENTRYPOINT=204.168.254.113:8001 \
 KNOWN_VALIDATOR=AYJy9KVJtgSnMSknAcFqhXtLhtSyBNFZJ5W1zDEWDeVg \
-EXPECTED_GENESIS_HASH=2EfKjqtXSu7YZaLiBLUE1xx3Tt1XMmjzKwQ967KzneUx \
+EXPECTED_GENESIS_HASH=8NTWVHTE4g91yyKffovVujcoUhZta9jhmrhPv35H44HU \
 bash genesis/run-validator.sh
 ```
 
@@ -303,7 +303,7 @@ Pass `wsEndpoint`, because a wallet guesses the websocket address from the
 http one, and a path proxy breaks that guess.
 
 The genesis hash names the cluster:
-`2EfKjqtXSu7YZaLiBLUE1xx3Tt1XMmjzKwQ967KzneUx`.
+`8NTWVHTE4g91yyKffovVujcoUhZta9jhmrhPv35H44HU`.
 
 Every wallet prints the unit as SOL. One SOL is one BTC here.
 
