@@ -23,6 +23,11 @@
 #    move the root. A branch that splits behind the root and holds more
 #    checkpoints stops the validator with exit code 75, and the next start
 #    loads an older snapshot.
+# 8. A commitment h* counts only when a pair (bank hash, payee) with
+#    SHA-256(bank hash ‖ payee) = h* is known. The RPC method `bmmPublishPairs`
+#    takes the pairs, and the validator sends them to every peer. The runtime
+#    writes a block record, and a settle pays only a block in the record of
+#    its own fork.
 #
 # To move to a later Agave, raise AGAVE_TAG and run this again.
 set -euo pipefail
