@@ -86,6 +86,9 @@ SNAPSHOT_ARGS=(
   --full-snapshot-interval-slots "${FULL_SNAPSHOT_INTERVAL_SLOTS:-25000}"
   --maximum-full-snapshots-to-retain "${FULL_SNAPSHOTS_TO_RETAIN:-10}"
 )
+if [ -n "${INCREMENTAL_SNAPSHOT_INTERVAL_SLOTS:-}" ]; then
+  SNAPSHOT_ARGS+=(--snapshot-interval-slots "$INCREMENTAL_SNAPSHOT_INTERVAL_SLOTS")
+fi
 
 # Gossip between nodes on one host uses loopback, which the validator takes
 # only with this flag.
@@ -118,8 +121,9 @@ if [ -n "${NO_VOTE:-}" ]; then
   VOTE_ARGS=(--no-voting)
 fi
 
-# The default filter drops every message of the BMM crates.
-export RUST_LOG="${RUST_LOG:-solana=info,sol_drivechain_bmm=debug,solana_runtime::bank::bmm=debug}"
+# The default filter drops every message of the BMM crates, the root moves,
+# and the BMM restart.
+export RUST_LOG="${RUST_LOG:-solana=info,agave_validator=info,agave_votor=info,sol_drivechain_bmm=debug,solana_runtime::bank::bmm=debug}"
 
 exec "$AGAVE_VALIDATOR" \
   --ledger "$LEDGER" \
@@ -136,6 +140,8 @@ exec "$AGAVE_VALIDATOR" \
   --bmm-enforcer-url "$ENFORCER_URL" \
   --bmm-sidechain-slot "$SIDECHAIN_SLOT" \
   --bmm-confirmations "${BMM_CONFIRMATIONS:-6}" \
+  --bmm-root-depth "${BMM_ROOT_DEPTH:-2}" \
+  --bmm-fallback-blocks "${BMM_FALLBACK_BLOCKS:-6}" \
   --no-os-network-limits-test \
   --full-rpc-api \
   --bind-address "$BIND_ADDRESS" \
