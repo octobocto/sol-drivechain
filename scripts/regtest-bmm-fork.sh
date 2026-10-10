@@ -7,8 +7,8 @@
 # between M and H to split the chain, and the host network stays as it is. The
 # script makes namespaces, so it must run as root.
 #
-# The commitment format is not built yet. The test bidder puts a Solana bank
-# hash directly into h*, and it reads the bank hash from the validator log.
+# Each bid commits h* = SHA-256(bank hash ‖ payee) for the newest block in the
+# block record of one node, and the daemon publishes the pair to that node.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,6 +18,8 @@ ROOT="${ROOT:-$HOME/bmm-fork-regtest}"
 SLOT="${SLOT:-8}"
 K="${BMM_ROOT_DEPTH:-2}"
 L="${BMM_FALLBACK_BLOCKS:-6}"
+# N, the eCash blocks on top of a commitment before its settle.
+N="${BMM_CONFIRMATIONS:-$K}"
 MEMORY_MAX="${MEMORY_MAX:-3G}"
 NS_E="${NS_PREFIX:-bmm}E"
 NS_M="${NS_PREFIX:-bmm}M"
@@ -42,6 +44,11 @@ E_FOR_H=10.77.2.1
 H_FOR_E=10.77.2.2
 
 D="${D:-$REPO/daemon/target/release/sol-drivechain-daemon}"
+PROGRAM_SO="${PROGRAM_SO:-$REPO/target/deploy/sol_drivechain_bridge.so}"
+PROGRAM_ID="$(cat "$REPO/keys/bridge-program.pubkey")"
+LOADER=BPFLoader2111111111111111111111111111111111
+# The rent reserve of an empty account under the default rent.
+TREASURY_LAMPORTS=890880
 SOLANA="${SOLANA:-$(command -v solana)}"
 SOLANA_KEYGEN="${SOLANA_KEYGEN:-$(command -v solana-keygen)}"
 SOLANA_GENESIS="${SOLANA_GENESIS:-$HOME/src/agave/target/release/solana-genesis}"
@@ -64,13 +71,33 @@ tip() { btc getblockcount; }
 
 ns_of() { if [ "$1" = M ]; then echo "$NS_M"; else echo "$NS_H"; fi; }
 ip_of() { if [ "$1" = M ]; then echo "$M_IP"; else echo "$H_IP"; fi; }
+enforcer_of() { if [ "$1" = M ]; then echo "$E_FOR_M"; else echo "$E_FOR_H"; fi; }
 log_of() { if [ "$1" = M ]; then echo "$ROOT/m.log"; else echo "$ROOT/h.log"; fi; }
+url_of() { echo "http://$(ip_of "$1"):$SOLANA_RPC_PORT"; }
 sol() {
   local node=$1
   shift
-  in_ns "$(ns_of "$node")" "$SOLANA" -u "http://$(ip_of "$node"):$SOLANA_RPC_PORT" "$@"
+  in_ns "$(ns_of "$node")" "$SOLANA" -u "$(url_of "$node")" "$@"
 }
+# The daemon in the namespace of a node, with the eCash enforcer on its link.
+dn() {
+  local node=$1 command=$2
+  shift 2
+  in_ns "$(ns_of "$node")" "$D" "$command" --network regtest \
+    --enforcer-url "http://$(enforcer_of "$node"):$GRPC_PORT" --slot "$SLOT" "$@"
+}
+dn_solana() {
+  local node=$1 command=$2
+  shift 2
+  in_ns "$(ns_of "$node")" "$D" "$command" --solana-rpc-url "$(url_of "$node")" "$@"
+}
+bridge_value() {
+  dn_solana M bridge-state --program-id "$PROGRAM_ID" | awk -v key="$1" '$0 ~ "^"key {print $NF}'
+}
+lamports() { sol M balance "$1" --lamports | awk '{print $1}'; }
 lines() { wc -l < "$(log_of "$1")"; }
+# The log lines of a node after a line number.
+log_since() { tail -n +"$(($2 + 1))" "$(log_of "$1")"; }
 
 # Waits until the log of a node holds a line that matches a pattern, after a
 # line number. Prints the line.
@@ -106,11 +133,70 @@ confirmed_frozen() {
   echo "$slot $(frozen_hash "$1" "$slot")"
 }
 
-# Puts a bank hash into the next eCash block as h*, and prints its height.
+# The slot and the bank hash of the newest block in the block record of a
+# node.
+recorded() {
+  dn_solana "$1" bmm-block | grep -E '^[0-9]+ [1-9A-HJ-NP-Za-km-z]+$'
+}
+
+# Waits until the block record of a node holds a block above a slot. A node
+# records the last block of each 32 slots when it makes a block in a later
+# stride, so a minority node takes a while.
+wait_recorded_above() {
+  local node=$1 slot=$2
+  for _ in $(seq 1 240); do
+    [ "$(recorded "$node" | awk '{print $1}')" -gt "$slot" ] && return 0
+    sleep 0.5
+  done
+  fail "the block record of node $node holds no block above slot $slot"
+}
+
+# Bids for the newest block in the block record of a node, and publishes the
+# pair to that node. The bid waits for a new record entry, so the block is a
+# few slots old and above the stake root. Prints the slot and the bank hash.
+# More arguments go to `bid-bmm`.
+bid() {
+  local node=$1 first out
+  shift
+  first="$(recorded "$node" | awk '{print $1}')"
+  for _ in $(seq 1 120); do
+    [ "$(recorded "$node" | awk '{print $1}')" != "$first" ] && break
+    sleep 0.5
+  done
+  out="$(dn "$node" bid-bmm --solana-rpc-url "$(url_of "$node")" --payee "$PAYEE" \
+    --sats 1000 "$@")"
+  if [[ " $* " != *" --withhold "* ]]; then
+    echo "$out" | grep -qE '^pair new$' || fail "node $node did not take the pair: $out"
+  fi
+  echo "$(echo "$out" | awk '/^slot /{print $2}') $(echo "$out" | awk '/^block /{print $2}')"
+}
+
+# A bid that the next eCash block takes. Prints the eCash height, the slot,
+# and the bank hash.
 checkpoint() {
-  d bid-bmm "${E[@]}" --payee "$1" --sats 1000 >/dev/null
+  local bid_out
+  bid_out="$(bid "$@")"
   mine 1
-  tip
+  echo "$(tip) $bid_out"
+}
+
+# The newest root that a node logged.
+last_root() {
+  grep -aE 'new root [0-9]+' "$(log_of "$1")" | tail -1 | sed -E 's/.*new root ([0-9]+).*/\1/'
+}
+
+# Sends fee-paying transfers, so the treasury grows.
+pay_fees() {
+  for _ in $(seq 1 "$1"); do
+    sol M transfer --keypair "$ROOT/faucet.json" "$H_ID" 0.001 >/dev/null
+  done
+}
+
+settle() {
+  local height=$1 block=$2
+  dn_solana M settle-bmm --program-id "$PROGRAM_ID" \
+    --identity "$ROOT/keys-m/validator-identity.json" --height "$height" \
+    --block-hash "$(btc getblockhash "$height")" --solana-block "$block" --payee "$PAYEE"
 }
 
 partition() { ip -n "$NS_M" link set vm0 down; }
@@ -198,7 +284,7 @@ start_validator() {
       LEDGER="$ledger" KEYS="$keys" RPC_PORT="$SOLANA_RPC_PORT" GOSSIP_PORT=8001 \
       XDP=0 BIND_ADDRESS="$ip" RPC_BIND_ADDRESS="$ip" ALLOW_PRIVATE_ADDR=1 NO_SNAPSHOT_FETCH=1 \
       ENFORCER_URL="http://$enforcer:$GRPC_PORT" SIDECHAIN_SLOT="$SLOT" \
-      BMM_ROOT_DEPTH="$K" BMM_FALLBACK_BLOCKS="$L" \
+      BMM_ROOT_DEPTH="$K" BMM_FALLBACK_BLOCKS="$L" BMM_CONFIRMATIONS="$N" \
       FULL_SNAPSHOT_INTERVAL_SLOTS=100 INCREMENTAL_SNAPSHOT_INTERVAL_SLOTS=50 \
       FULL_SNAPSHOTS_TO_RETAIN=100 \
       AGAVE_VALIDATOR="$AGAVE_VALIDATOR" SOLANA_KEYGEN="$SOLANA_KEYGEN" \
@@ -229,6 +315,7 @@ wait_rpc() {
 for binary in "$D" "$SOLANA" "$SOLANA_KEYGEN" "$SOLANA_GENESIS" "$AGAVE_VALIDATOR"; do
   [ -x "$binary" ] || fail "$binary is missing"
 done
+[ -f "$PROGRAM_SO" ] || fail "the bridge program is not at $PROGRAM_SO"
 [ "$(id -u)" = 0 ] || fail "the network namespaces need root"
 
 trap cleanup EXIT
@@ -259,8 +346,14 @@ for name in identity vote stake; do
   "$SOLANA_KEYGEN" new --no-bip39-passphrase --silent -o "$ROOT/keys-h/validator-$name.json"
 done
 "$SOLANA_KEYGEN" new --no-bip39-passphrase --silent -o "$ROOT/faucet.json"
+"$SOLANA_KEYGEN" new --no-bip39-passphrase --silent -o "$ROOT/oracle.json"
 M_ID="$("$SOLANA_KEYGEN" pubkey "$ROOT/keys-m/validator-identity.json")"
 H_ID="$("$SOLANA_KEYGEN" pubkey "$ROOT/keys-h/validator-identity.json")"
+PAYEE="$M_ID"
+"$D" genesis --program-id "$PROGRAM_ID" \
+  --oracle "$("$SOLANA_KEYGEN" pubkey "$ROOT/oracle.json")" \
+  --treasury-lamports "$TREASURY_LAMPORTS" --out "$ROOT/primordial.yaml" >/dev/null
+TREASURY="$("$D" derive --program-id "$PROGRAM_ID" | awk '/^treasury/ {print $2}')"
 cat > "$ROOT/validators.yaml" <<EOF
 validator_accounts:
   - balance_lamports: 1000000000000
@@ -277,7 +370,9 @@ EOF
   --bootstrap-validator-stake-lamports 300000000000 \
   --validator-accounts-file "$ROOT/validators.yaml" \
   --faucet-pubkey "$("$SOLANA_KEYGEN" pubkey "$ROOT/faucet.json")" \
-  --faucet-lamports 1000000000000 --hashes-per-tick sleep >/dev/null
+  --faucet-lamports 1000000000000 --hashes-per-tick sleep \
+  --primordial-accounts-file "$ROOT/primordial.yaml" \
+  --bpf-program "$PROGRAM_ID" "$LOADER" "$PROGRAM_SO" >/dev/null
 cp -R "$ROOT/ledger-m" "$ROOT/ledger-h"
 
 step "M and H start and vote"
@@ -294,13 +389,14 @@ for _ in $(seq 1 120); do
 done
 [ $((M_SLOT - H_SLOT)) -lt 10 ] || fail "H did not catch up: M at $M_SLOT, H at $H_SLOT"
 sol M validators | grep -E "$M_ID|$H_ID" || fail "the validators are not active"
-pass "M at slot $M_SLOT and H at slot $H_SLOT"
+dn_solana M initialize --program-id "$PROGRAM_ID" --payer "$ROOT/oracle.json" \
+  --oracle "$ROOT/oracle.json" --bmm-start-height "$(tip)" >/dev/null
+pass "M at slot $M_SLOT and H at slot $H_SLOT; the bridge settles from eCash height $(bridge_value "bmm next height")"
 
 # ---------------------------------------------------------------------------
 step "1. normal: a checkpoint anchors, and the root follows it after K blocks"
-read -r S1 S1_HASH < <(confirmed_frozen M)
 MARK_M=$(lines M) MARK_H=$(lines H)
-H1="$(checkpoint "$S1_HASH")"
+read -r H1 S1 S1_HASH < <(checkpoint M)
 echo "eCash height $H1 commits slot $S1 ($S1_HASH)"
 wait_log M "head Some\($S1\)" "$MARK_M" >/dev/null
 wait_log H "head Some\($S1\)" "$MARK_H" >/dev/null
@@ -311,7 +407,7 @@ CONFIRMED_BEFORE="$(sol M slot --commitment confirmed)"
 sleep 20
 CONFIRMED_AFTER="$(sol M slot --commitment confirmed)"
 [ "$CONFIRMED_AFTER" -gt "$CONFIRMED_BEFORE" ] || fail "confirmed stayed at $CONFIRMED_BEFORE"
-LAST_ROOT_M="$(grep -aE 'new root [0-9]+' "$(log_of M)" | tail -1 | sed -E 's/.*new root ([0-9]+).*/\1/')"
+LAST_ROOT_M="$(last_root M)"
 [ "$LAST_ROOT_M" = "$S1" ] || fail "M rooted slot $LAST_ROOT_M after the anchor $S1"
 pass "both roots moved to anchor $S1; confirmed went from $CONFIRMED_BEFORE to $CONFIRMED_AFTER; the stake votes rooted nothing"
 
@@ -321,14 +417,16 @@ partition
 SPLIT="$(sol M slot)"
 echo "the link is down at slot $SPLIT"
 sleep 20
-read -r A2 A2_HASH < <(newest_frozen M)
-read -r B2 B2_HASH < <(newest_frozen H)
-[ "$B2" -gt "$SPLIT" ] || fail "H made no block after the split"
+read -r A2 _ < <(newest_frozen M)
+wait_recorded_above H "$SPLIT"
+read -r B2 B2_HASH < <(bid H)
+[ "$B2" -gt "$SPLIT" ] || fail "the bid names slot $B2, which is not after the split"
 heal
-echo "the link is up; H made slot $B2 ($B2_HASH) on its own branch"
+echo "the link is up; H bid for slot $B2 ($B2_HASH) on its own branch"
 sleep 20
 MARK_M=$(lines M) MARK_H=$(lines H)
-H2="$(checkpoint "$B2_HASH")"
+mine 1
+H2="$(tip)"
 echo "eCash height $H2 commits slot $B2"
 wait_log H "head Some\($B2\)" "$MARK_H" >/dev/null
 wait_log M "head Some\($B2\)" "$MARK_M" 240 >/dev/null
@@ -345,11 +443,13 @@ pass "M left branch A (slot $A2) for branch B at slot $B2, reset its tower, and 
 # ---------------------------------------------------------------------------
 step "3. pending: a checkpoint for an absent block counts when the block arrives"
 partition
+SPLIT3="$(sol H slot)"
 sleep 20
-read -r B3 B3_HASH < <(newest_frozen H)
+wait_recorded_above H "$SPLIT3"
 MARK_M=$(lines M) MARK_H=$(lines H)
-H3="$(checkpoint "$B3_HASH")"
-echo "eCash height $H3 commits slot $B3, which only H holds"
+read -r H3 B3 _ < <(checkpoint H)
+[ "$B3" -gt "$SPLIT3" ] || fail "the bid names slot $B3, which is not after the split"
+echo "eCash height $H3 commits slot $B3, which only H holds, and only H has the pair"
 wait_log H "head Some\($B3\)" "$MARK_H" >/dev/null
 sleep 10
 if tail -n +"$((MARK_M + 1))" "$(log_of M)" | grep -aqE "head Some\($B3\)"; then
@@ -367,12 +467,14 @@ pass "the checkpoint for slot $B3 stayed pending on M, and it counted when M rep
 # ---------------------------------------------------------------------------
 step "4. tie: equal counts select the lower bank hash"
 partition
+SPLIT4="$(sol M slot)"
 sleep 20
-read -r A4 A4_HASH < <(newest_frozen M)
-read -r B4 B4_HASH < <(newest_frozen H)
+wait_recorded_above M "$SPLIT4"
+wait_recorded_above H "$SPLIT4"
 MARK_M=$(lines M) MARK_H=$(lines H)
-checkpoint "$A4_HASH" >/dev/null
-checkpoint "$B4_HASH" >/dev/null
+read -r _ A4 A4_HASH < <(checkpoint M)
+read -r _ B4 B4_HASH < <(checkpoint H)
+[ "$A4" -gt "$SPLIT4" ] && [ "$B4" -gt "$SPLIT4" ] || fail "a bid names a slot before the split"
 if lower_hash "$A4_HASH" "$B4_HASH"; then
   WINNER=$A4
 else
@@ -397,15 +499,16 @@ mine "$L"
 wait_log M "fallback true" "$MARK_M" 60
 wait_log H "fallback true" "$MARK_H" 60
 for _ in $(seq 1 120); do
-  ROOT_M="$(grep -aE 'new root [0-9]+' "$(log_of M)" | tail -1 | sed -E 's/.*new root ([0-9]+).*/\1/')"
+  ROOT_M="$(last_root M)"
   [ "$ROOT_M" -gt "$SPLIT5" ] && break
   sleep 1
 done
 [ "$ROOT_M" -gt "$SPLIT5" ] || fail "the stake votes did not root branch A on M"
 echo "in the fallback, the stake votes rooted slot $ROOT_M on M, past the split at $SPLIT5"
-read -r B5 B5_HASH < <(newest_frozen H)
+wait_recorded_above H "$SPLIT5"
 MARK_M=$(lines M) MARK_H=$(lines H)
-checkpoint "$B5_HASH" >/dev/null
+read -r _ B5 _ < <(checkpoint H)
+[ "$B5" -gt "$SPLIT5" ] || fail "the bid names slot $B5, which is not after the split"
 mine "$K"
 heal
 wait_log M "select a branch that splits behind root" "$MARK_M" 60
@@ -434,13 +537,78 @@ wait_log M "BMM fork choice is on" "$MARK_M" 60
 if tail -n +"$((MARK_M + 1))" "$(log_of M)" | grep -aq "found new cluster confirmed root"; then
   fail "M took a root from the stake votes at start"
 fi
-read -r S6 S6_HASH < <(confirmed_frozen H)
 MARK_M=$(lines M) MARK_H=$(lines H)
-checkpoint "$S6_HASH" >/dev/null
+read -r _ S6 _ < <(checkpoint H)
 mine "$K"
 wait_log M "moves the root from [0-9]+ to anchor $S6\$" "$MARK_M" 240
 wait_log H "moves the root from [0-9]+ to anchor $S6\$" "$MARK_H"
 pass "M started from its own ledger with no stake root, and it rooted anchor $S6 with H"
 
+# ---------------------------------------------------------------------------
+step "7. a commitment without a pair stops no root and causes no restart"
+MARK_M=$(lines M) MARK_H=$(lines H)
+mine "$L"
+wait_log M "fallback true" "$MARK_M" 60
+wait_log H "fallback true" "$MARK_H" 60
+sleep 5
+ROOT7="$(last_root M)"
+MARK_M=$(lines M) MARK_H=$(lines H)
+FAKE="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+d bid-bmm "${E[@]}" --commitment "$FAKE" --sats 1000 >/dev/null
+mine 1
+H7="$(tip)"
+mine "$K"
+wait_log M "the commitment at eCash height $H7 has no published pair" "$MARK_M" 60
+wait_log H "the commitment at eCash height $H7 has no published pair" "$MARK_H" 60
+sleep 20
+for node in "M $MARK_M" "H $MARK_H"; do
+  # shellcheck disable=SC2086
+  set -- $node
+  if log_since "$1" "$2" | grep -aE "fallback false|splits behind root|stopped with exit code"; then
+    fail "the commitment without a pair changed the fork choice on node $1"
+  fi
+done
+[ "$(last_root M)" -gt "$ROOT7" ] || fail "the stake votes stopped at root $ROOT7"
+pass "the fake commitment at eCash height $H7 left the fallback on; the root went from $ROOT7 to $(last_root M)"
+
+# ---------------------------------------------------------------------------
+step "8. a withheld pair stays pending, and the next checkpoint takes its fees"
+pay_fees 3
+MARK_M=$(lines M) MARK_H=$(lines H)
+read -r HW SW SW_HASH < <(checkpoint M --withhold)
+TREASURY_W="$(lamports "$TREASURY")"
+echo "eCash height $HW commits slot $SW, and the bidder keeps the pair; the treasury holds $TREASURY_W"
+wait_log M "the commitment at eCash height $HW has no published pair" "$MARK_M" 60 >/dev/null
+wait_log H "the commitment at eCash height $HW has no published pair" "$MARK_H" 60 >/dev/null
+sleep 10
+for node in "M $MARK_M" "H $MARK_H"; do
+  # shellcheck disable=SC2086
+  set -- $node
+  if log_since "$1" "$2" | grep -aE "head Some\($SW\)|fallback false"; then
+    fail "node $1 counted the commitment without a pair"
+  fi
+done
+pay_fees 2
+read -r HN SN SN_HASH < <(checkpoint M)
+wait_log M "head Some\($SN\)" "$MARK_M" 60 >/dev/null
+wait_log H "head Some\($SN\)" "$MARK_H" 60 >/dev/null
+mine $((N + 1))
+sleep 3
+PAID_BEFORE="$(bridge_value "bmm paid total")"
+for _ in $(seq 1 20); do
+  settle "$HN" "$SN_HASH" > "$ROOT/settle-next.log" 2>&1 && break
+  sleep 3
+done
+grep -q "settled" "$ROOT/settle-next.log" || { cat "$ROOT/settle-next.log" >&2; fail "the next checkpoint did not settle"; }
+PAID=$(( $(bridge_value "bmm paid total") - PAID_BEFORE ))
+[ "$PAID" -ge $((TREASURY_W - TREASURY_LAMPORTS)) ] || fail "the payee got $PAID, less than the fees before the withheld height"
+[ "$(bridge_value "bmm next height")" = $((HN + 1)) ] || fail "the cursor is not past eCash height $HN"
+echo "eCash height $HN paid $PAID lamports; the fees before the withheld height $HW were $((TREASURY_W - TREASURY_LAMPORTS))"
+if settle "$HW" "$SW_HASH" > "$ROOT/settle-late.log" 2>&1; then
+  fail "the withheld height settled after the cursor passed it"
+fi
+[ "$(bridge_value "bmm next height")" = $((HN + 1)) ] || fail "the late settle moved the cursor"
+pass "the withheld pair stayed pending, the settle of height $HN took the rolled-over fees, and height $HW cannot settle later"
+
 echo
-echo "PASS: BMM checkpoints select the fork and move the root in all six cases."
+echo "PASS: BMM checkpoints select the fork and move the root in all eight cases."

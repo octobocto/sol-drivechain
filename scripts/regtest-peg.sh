@@ -76,11 +76,12 @@ for binary in "$D" "$SOLANA" "$SOLANA_KEYGEN" "$SOLANA_GENESIS" "$AGAVE_VALIDATO
   [ -x "$binary" ] || fail "$binary is missing"
 done
 
+# The script stops only the processes that it started.
+PIDS=()
 cleanup() {
-  pkill -f "agave-validator --ledger $ROOT/ledger" 2>/dev/null || true
-  pkill -f "sol-drivechain-daemon run --network regtest" 2>/dev/null || true
-  pkill -f "sol-drivechain-daemon bmm --enforcer-url $ENFORCER_URL" 2>/dev/null || true
-  pkill -f "agave-validator --ledger $ROOT/ledger2" 2>/dev/null || true
+  for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+    kill "$pid" 2>/dev/null || true
+  done
   ROOT="$ROOT/bitcoin-stack" bash "$HERE/regtest.sh" stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -107,6 +108,7 @@ LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
   BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" ALLOW_PRIVATE_ADDR=1 \
   nohup bash "$REPO/genesis/run-validator.sh" > "$ROOT/validator.log" 2>&1 &
 VALIDATOR_PID=$!
+PIDS+=("$VALIDATOR_PID")
 # The RPC answers before the node is healthy, and an early transaction fails
 # with "Node is unhealthy".
 HEALTHY=no
@@ -167,6 +169,7 @@ start_peg() {
     --oracle "$ROOT/keys/oracle.json" --confirmations 1 --bundle-interval-secs 10 \
     >> "$ROOT/peg.log" 2>&1 &
   PEG_PID=$!
+  PIDS+=("$PEG_PID")
   sleep 5
 }
 
@@ -268,7 +271,7 @@ VAULT_WANT=$((21000000 * 1000000000 - PEGGED))
 [ "$VAULT" = "$VAULT_WANT" ] || fail "the vault holds $VAULT lamports, not $VAULT_WANT"
 echo "PASS: the vault holds $VAULT lamports, the genesis total less the pegged count"
 
-step "BMM: a bid wins an eCash block, and a settle pays the winner"
+step "BMM: a bid wins an eCash block, and a settle pays the payee of its pair"
 bridge_value() {
   "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
     | awk -v key="$1" '$0 ~ "^"key {print $NF}'
@@ -276,6 +279,16 @@ bridge_value() {
 TREASURY_BEFORE="$(bridge_value "treasury lamports")"
 echo "the treasury holds $TREASURY_BEFORE lamports of fees and reserve"
 [ "$TREASURY_BEFORE" -gt 1024 ] || fail "the treasury got no fees"
+
+# A bid offers a part of the fee income, so the chain must earn fees. Ten
+# transfers pay 100 lamports, which is 10 satoshis.
+ORACLE_PUBKEY="$("$SOLANA_KEYGEN" pubkey "$ROOT/keys/oracle.json")"
+earn_fees() {
+  for _ in $(seq 1 10); do
+    "$SOLANA" -u "$SOLANA_URL" transfer --keypair "$USER_KEY" "$ORACLE_PUBKEY" 0.000001 \
+      --no-wait >/dev/null
+  done
+}
 
 # A second validator with no vote proves the replay side of the pre-check. It
 # marks a block dead if its own enforcer answers another way.
@@ -294,6 +307,7 @@ LEDGER="$ROOT/ledger2" KEYS="$ROOT/keys2" RPC_PORT="$((SOLANA_RPC_PORT + 10))" \
   EXPECTED_GENESIS_HASH="$GENESIS_HASH" \
   nohup bash "$REPO/genesis/run-validator.sh" > "$ROOT/validator2.log" 2>&1 &
 VALIDATOR2_PID=$!
+PIDS+=("$VALIDATOR2_PID")
 SECOND_URL="http://127.0.0.1:$((SOLANA_RPC_PORT + 10))"
 SECOND_UP=no
 for _ in $(seq 1 60); do
@@ -314,13 +328,16 @@ nohup "$D" bmm --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
   --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --interval-secs 1 \
   > "$ROOT/bmm.log" 2>&1 &
 BMM_PID=$!
+PIDS+=("$BMM_PID")
 
-# Each block gives the loop a new tip to bid on. A win settles N + 1 blocks
-# later, so the whole round takes about ten blocks.
+# Each block gives the loop a new tip to bid on, and the loop publishes the
+# pair of each bid. A win settles N + 1 blocks later, so the whole round takes
+# about ten blocks.
 PAID=no
 for _ in $(seq 1 40); do
   kill -0 "$BMM_PID" 2>/dev/null || { tail -30 "$ROOT/bmm.log" >&2; fail "the BMM loop stopped"; }
   sleep 3
+  earn_fees
   "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
   if [ "$(bridge_value "bmm paid total")" -gt 0 ]; then
     PAID=yes
@@ -345,9 +362,10 @@ step "BMM: a settle for a block that is too new never lands"
 TIP_HEIGHT="$(btc getblockcount)"
 TIP_HASH="$(btc getblockhash "$TIP_HEIGHT")"
 NEXT_BEFORE="$(bridge_value "bmm next height")"
+SOLANA_BLOCK="$("$D" bmm-block --solana-rpc-url "$SOLANA_URL" | awk 'END {print $2}')"
 if "$D" settle-bmm --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
     --identity "$ROOT/keys/oracle.json" --height "$TIP_HEIGHT" \
-    --block-hash "$TIP_HASH" > "$ROOT/settle-new.log" 2>&1; then
+    --block-hash "$TIP_HASH" --solana-block "$SOLANA_BLOCK" > "$ROOT/settle-new.log" 2>&1; then
   fail "a settle for the tip landed, and it must wait for N + 1 blocks"
 fi
 grep -qi "restricted" "$ROOT/settle-new.log" || {
@@ -377,7 +395,7 @@ echo "the same height holds $NEW_HASH after the reorg"
 sleep 3
 if "$D" settle-bmm --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
     --identity "$ROOT/keys/oracle.json" --height "$STALE_HEIGHT" \
-    --block-hash "$STALE_HASH" > "$ROOT/settle-stale.log" 2>&1; then
+    --block-hash "$STALE_HASH" --solana-block "$SOLANA_BLOCK" > "$ROOT/settle-stale.log" 2>&1; then
   fail "a settle for a stale block landed"
 fi
 grep -qi "restricted" "$ROOT/settle-stale.log" || {
@@ -386,10 +404,11 @@ grep -qi "restricted" "$ROOT/settle-stale.log" || {
 }
 echo "PASS: a settle for a block outside the active chain never lands"
 
-step "BMM: the loop settles the new block at that height"
+step "BMM: the loop settles a commitment of the new chain past that height"
 SETTLED=no
 for _ in $(seq 1 20); do
   sleep 3
+  earn_fees
   "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
   if [ "$(bridge_value "bmm next height")" -gt "$STALE_HEIGHT" ]; then
     SETTLED=yes
@@ -413,6 +432,7 @@ echo "the chain reorged 9 blocks deep, under N + 1 = $((BMM_CONFIRMATIONS + 1))"
 ALIVE=no
 for _ in $(seq 1 20); do
   sleep 3
+  earn_fees
   "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
   kill -0 "$BMM_PID" 2>/dev/null || { tail -30 "$ROOT/bmm.log" >&2; fail "the BMM loop stopped after the deep reorg"; }
   if [ "$(bridge_value "bmm next height")" -gt "$NEXT_AT_REORG" ]; then
