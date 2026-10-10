@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 96da5bb..ce4bc44 100644
+index 96da5bb..df0527d 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -279,6 +279,7 @@ name = "agave-reserved-account-keys"
@@ -18,7 +18,7 @@ index 96da5bb..ce4bc44 100644
   "solana-account 4.3.1",
   "solana-account-decoder",
   "solana-accounts-db",
-@@ -6978,6 +6980,21 @@ dependencies = [
+@@ -6978,6 +6980,22 @@ dependencies = [
   "sha1",
  ]
  
@@ -26,6 +26,7 @@ index 96da5bb..ce4bc44 100644
 +name = "sol-drivechain-bmm"
 +version = "4.2.2"
 +dependencies = [
++ "bs58",
 + "hex",
 + "log",
 + "prost 0.14.4",
@@ -40,7 +41,7 @@ index 96da5bb..ce4bc44 100644
  [[package]]
  name = "solana-account"
  version = "3.4.0"
-@@ -8074,6 +8091,7 @@ dependencies = [
+@@ -8074,6 +8092,7 @@ dependencies = [
   "shaq",
   "signal-hook",
   "slab",
@@ -48,7 +49,7 @@ index 96da5bb..ce4bc44 100644
   "solana-account 4.3.1",
   "solana-accounts-db",
   "solana-address-lookup-table-interface",
-@@ -8515,7 +8533,12 @@ version = "4.2.2"
+@@ -8515,7 +8534,12 @@ version = "4.2.2"
  dependencies = [
   "agave-feature-set",
   "solana-fee-structure",
@@ -61,7 +62,7 @@ index 96da5bb..ce4bc44 100644
  ]
  
  [[package]]
-@@ -9082,6 +9105,7 @@ dependencies = [
+@@ -9082,6 +9106,7 @@ dependencies = [
   "rocksdb",
   "scopeguard",
   "serde",
@@ -69,7 +70,7 @@ index 96da5bb..ce4bc44 100644
   "solana-account 4.3.1",
   "solana-account-decoder",
   "solana-accounts-db",
-@@ -9999,6 +10023,7 @@ dependencies = [
+@@ -9999,6 +10024,7 @@ dependencies = [
   "serde_json",
   "serial_test",
   "soketto",
@@ -77,7 +78,7 @@ index 96da5bb..ce4bc44 100644
   "solana-account 4.3.1",
   "solana-account-decoder",
   "solana-accounts-db",
-@@ -10266,6 +10291,7 @@ dependencies = [
+@@ -10266,6 +10292,7 @@ dependencies = [
   "crossbeam-channel",
   "crossbeam-utils",
   "dashmap",
@@ -85,7 +86,7 @@ index 96da5bb..ce4bc44 100644
   "imbl",
   "itertools 0.14.0",
   "libc",
-@@ -10287,6 +10313,7 @@ dependencies = [
+@@ -10287,6 +10314,7 @@ dependencies = [
   "serde_with",
   "shuttle",
   "smallvec",
@@ -154,26 +155,31 @@ index 9c1e4e5..c709057 100644
              processed_with_successful_result_count: processed_counts
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..fe9c2d7
+index 0000000..af5d270
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,353 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
-+//! the bank forks and the eCash view, and it keeps the anchors on disk.
++//! the bank forks, the deposit credits of each bank, and the eCash view, and
++//! it keeps the anchors on disk.
 +
 +use {
 +    crate::consensus::{Tower, heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice},
 +    sol_drivechain_bmm::{
-+        checkpoints,
-+        fork_choice::{self, Checkpoint, Choice, ForkBank, Restart, Saved},
-+        pairs::pairs,
++        BlockHash, Credits, checkpoints,
++        fork_choice::{
++            self, BankHash, Checkpoint, Choice, Deposits, ForkBank, Rejection, Restart, Saved,
++        },
++        pairs::{PAIR_WINDOW, pairs},
 +        view,
 +    },
++    solana_account::ReadableAccount,
 +    solana_clock::Slot,
 +    solana_pubkey::Pubkey,
 +    solana_runtime::{bank::Bank, bank_forks::BankForks},
 +    std::{
++        collections::{HashMap, HashSet},
 +        io,
 +        path::{Path, PathBuf},
 +        sync::{Arc, RwLock},
@@ -194,6 +200,10 @@ index 0000000..fe9c2d7
 +    tip_height: u64,
 +    choice: Choice,
 +    missing_archive_height: u64,
++    credits: HashMap<(Slot, BankHash), Option<Credits>>,
++    dropped: HashSet<Slot>,
++    root_dropped: bool,
++    rejected: HashSet<(u64, BankHash)>,
 +}
 +
 +impl BmmForkChoice {
@@ -221,6 +231,10 @@ index 0000000..fe9c2d7
 +            tip_height: 0,
 +            choice: Choice::default(),
 +            missing_archive_height: 0,
++            credits: HashMap::new(),
++            dropped: HashSet::new(),
++            root_dropped: false,
++            rejected: HashSet::new(),
 +        })
 +    }
 +
@@ -259,15 +273,70 @@ index 0000000..fe9c2d7
 +                parent: (bank.slot() != root).then(|| bank.parent_slot()),
 +            })
 +            .collect();
-+        self.checkpoints = checkpoints;
++        let deposits = self.check_deposits(frozen_banks);
++        let screened = fork_choice::screen(&checkpoints, &deposits);
++        for (checkpoint, rejection) in &screened.rejected {
++            if self.rejected.insert((checkpoint.height, checkpoint.bank_hash)) {
++                let block = solana_hash::Hash::new_from_array(checkpoint.bank_hash);
++                match rejection {
++                    Rejection::TooFewCredits(credited) => info!(
++                        "BMM: the checkpoint at eCash height {} fails rule 3: block {block} \
++                         credited deposits only through eCash height {credited}",
++                        checkpoint.height
++                    ),
++                    Rejection::Dropped => info!(
++                        "BMM: the checkpoint at eCash height {} fails rule 3: block {block} \
++                         credited deposits of an eCash block that the active chain dropped",
++                        checkpoint.height
++                    ),
++                }
++            }
++        }
++        self.rejected
++            .retain(|(height, _)| height.saturating_add(PAIR_WINDOW) >= tip_height);
++        let dropped: HashSet<Slot> = self
++            .banks
++            .iter()
++            .filter(|bank| deposits.get(&bank.hash) == Some(&Deposits::Dropped))
++            .map(|bank| bank.slot)
++            .collect();
++        let root_dropped = self
++            .banks
++            .iter()
++            .find(|bank| bank.slot == root)
++            .is_some_and(|bank| deposits.get(&bank.hash) == Some(&Deposits::Dropped));
++        if root_dropped && !self.root_dropped {
++            error!(
++                "BMM: root {root} credits deposits of an eCash block that the active chain \
++                 dropped, so only a restart at an older anchor can leave it"
++            );
++        }
++        self.root_dropped = root_dropped;
++        if dropped != self.dropped {
++            if let Some(lowest) = dropped.iter().min() {
++                warn!(
++                    "BMM: {} banks from slot {lowest} credit deposits of eCash blocks that the \
++                     active chain dropped, so no leader builds on them",
++                    dropped.len()
++                );
++            }
++            self.dropped = dropped;
++        }
++        self.checkpoints = screened.counted;
 +        self.tip_height = tip_height;
-+        let choice = fork_choice::choose(
++        let mut choice = fork_choice::choose(
 +            root,
 +            &self.banks,
 +            &self.checkpoints,
 +            tip_height,
 +            fork_choice::params(),
 +        );
++        choice.fallback = choice.fallback
++            && !fork_choice::pending_stops_fallback(
++                &screened.pending,
++                tip_height,
++                fork_choice::params(),
++            );
 +        if choice.head != self.choice.head || choice.fallback != self.choice.fallback {
 +            info!(
 +                "BMM fork choice: head {:?} with {} checkpoints above root {root}, eCash tip \
@@ -278,23 +347,65 @@ index 0000000..fe9c2d7
 +        self.choice = choice;
 +    }
 +
++    /// The deposit credits of each frozen bank, checked against the active
++    /// eCash chain. A frozen bank never changes, so its credits stay cached.
++    fn check_deposits(&mut self, frozen_banks: &[Arc<Bank>]) -> HashMap<BankHash, Deposits> {
++        let keys: HashSet<(Slot, BankHash)> = frozen_banks
++            .iter()
++            .map(|bank| (bank.slot(), bank.hash().to_bytes()))
++            .collect();
++        self.credits.retain(|key, _| keys.contains(key));
++        let mut active: HashMap<u64, Option<BlockHash>> = HashMap::new();
++        let mut deposits = HashMap::with_capacity(frozen_banks.len());
++        for bank in frozen_banks {
++            let key = (bank.slot(), bank.hash().to_bytes());
++            let credits = *self.credits.entry(key).or_insert_with(|| {
++                bank.get_account(&sol_drivechain_bmm::config())
++                    .and_then(|account| Credits::read(account.data()))
++            });
++            let checked = fork_choice::check_deposits(credits, |height| {
++                *active
++                    .entry(height)
++                    .or_insert_with(|| view().block_at(height).map(|block| block.hash))
++            });
++            deposits.insert(key.1, checked);
++        }
++        deposits
++    }
++
 +    /// True when the stake votes move the root, because no checkpoint came for
 +    /// the fallback span.
 +    pub(crate) fn tower_roots(&self) -> bool {
 +        self.choice.fallback
 +    }
 +
-+    /// The heaviest bank under the BMM head, or `None` when no checkpoint is
-+    /// above the root.
++    /// The bank to build on and vote on, when it is not `stock`: the heaviest
++    /// bank under the BMM head, or `stock` when no checkpoint is above the
++    /// root. Neither may hold credits of a dropped eCash block, so a leader
++    /// builds beside such a bank.
 +    pub(crate) fn heaviest(
 +        &self,
 +        fork_choice: &HeaviestSubtreeForkChoice,
 +        bank_forks: &RwLock<BankForks>,
++        stock: &Bank,
 +    ) -> Option<Arc<Bank>> {
 +        let bank_forks = bank_forks.read().unwrap();
-+        let head = bank_forks.get(self.choice.head?)?;
-+        let (slot, _) = fork_choice.best_slot(&(head.slot(), head.hash()))?;
-+        bank_forks.get(slot)
++        let head = match self.choice.head {
++            Some(head) => Some(bank_forks.get(head)?),
++            None => None,
++        };
++        let candidate = match &head {
++            Some(head) => fork_choice.best_slot(&(head.slot(), head.hash()))?.0,
++            None => stock.slot(),
++        };
++        let root = bank_forks.root();
++        let slot = (!self.root_dropped)
++            .then(|| fork_choice::avoid_dropped(root, &self.banks, &self.dropped, candidate))
++            .flatten()
++            .unwrap_or(candidate);
++        (head.is_some() || slot != stock.slot())
++            .then(|| bank_forks.get(slot))
++            .flatten()
 +    }
 +
 +    /// The anchor that the root must move to. It writes the new anchors to
@@ -318,7 +429,7 @@ index 0000000..fe9c2d7
 +    /// checkpoints. It writes the request to disk. The request waits while no
 +    /// snapshot archive at or below the anchor exists.
 +    pub(crate) fn take_restart(&mut self, root: Slot) -> io::Result<Option<Restart>> {
-+        let Some(restart) = fork_choice::restart(
++        let restart = fork_choice::restart(
 +            root,
 +            &self.banks,
 +            &self.checkpoints,
@@ -327,7 +438,21 @@ index 0000000..fe9c2d7
 +            &self.saved.pruned,
 +            fork_choice::params(),
 +            self.saved.handled_height,
-+        ) else {
++        )
++        .or_else(|| {
++            self.root_dropped
++                .then(|| {
++                    fork_choice::restart_for_dropped_root(
++                        root,
++                        &self.checkpoints,
++                        &self.saved.anchors,
++                        self.tip_height,
++                        self.saved.handled_height,
++                    )
++                })
++                .flatten()
++        });
++        let Some(restart) = restart else {
 +            return Ok(None);
 +        };
 +        let archive = match &self.archives {
@@ -438,7 +563,7 @@ index 5180157..09cd825 100644
  pub mod cluster_info_vote_listener;
  pub mod cluster_slots_service;
 diff --git a/core/src/replay_stage.rs b/core/src/replay_stage.rs
-index c5a5f4d..8526b1c 100644
+index c5a5f4d..0b09771 100644
 --- a/core/src/replay_stage.rs
 +++ b/core/src/replay_stage.rs
 @@ -4,6 +4,7 @@ use {
@@ -463,7 +588,7 @@ index c5a5f4d..8526b1c 100644
              // Thread pool to (maybe) replay multiple threads in parallel
              let replay_mode = if replay_forks_threads.get() == 1 {
                  ForkReplayMode::Serial
-@@ -1255,9 +1263,37 @@ impl ReplayStage {
+@@ -1255,9 +1263,40 @@ impl ReplayStage {
                      compute_slot_stats_time.stop();
  
                      let mut select_forks_time = Measure::start("select_forks_time");
@@ -473,8 +598,11 @@ index c5a5f4d..8526b1c 100644
                          .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
 +                    if let Some(bmm) = bmm_choice.as_mut() {
 +                        bmm.update(forks_root, &frozen_banks);
-+                        let bmm_heaviest =
-+                            bmm.heaviest(&tbft_structs.heaviest_subtree_fork_choice, &bank_forks);
++                        let bmm_heaviest = bmm.heaviest(
++                            &tbft_structs.heaviest_subtree_fork_choice,
++                            &bank_forks,
++                            &heaviest_bank,
++                        );
 +                        if let Some(bmm_heaviest) = &bmm_heaviest
 +                            && bmm_heaviest.slot() != heaviest_bank.slot()
 +                        {
@@ -502,7 +630,7 @@ index c5a5f4d..8526b1c 100644
                      select_forks_time.stop();
  
                      let mut select_vote_and_reset_forks_time =
-@@ -1276,6 +1312,9 @@ impl ReplayStage {
+@@ -1276,6 +1315,9 @@ impl ReplayStage {
                          &latest_validator_votes_for_frozen_banks,
                          &tbft_structs.heaviest_subtree_fork_choice,
                      );
@@ -512,7 +640,7 @@ index c5a5f4d..8526b1c 100644
                      select_vote_and_reset_forks_time.stop();
  
                      if vote_bank.is_none() {
-@@ -1347,8 +1386,33 @@ impl ReplayStage {
+@@ -1347,8 +1389,33 @@ impl ReplayStage {
                              wait_to_vote_slot,
                              migration_status.as_ref(),
                              &mut tbft_structs,
@@ -546,7 +674,7 @@ index c5a5f4d..8526b1c 100644
                      voting_time.stop();
  
                      let mut reset_bank_time = Measure::start("reset_bank");
-@@ -1433,6 +1497,21 @@ impl ReplayStage {
+@@ -1433,6 +1500,21 @@ impl ReplayStage {
                                  last_reset_bank_descendants = vec![];
                              }
  
@@ -568,7 +696,7 @@ index c5a5f4d..8526b1c 100644
                              if let Some(last_voted_slot) = tower.last_voted_slot() {
                                  // If the current heaviest bank is not a descendant of the last voted slot,
                                  // there must be a partition
-@@ -2038,6 +2117,13 @@ impl ReplayStage {
+@@ -2038,6 +2120,13 @@ impl ReplayStage {
          // confirmed, what happens then? Should probably keep track of dumped list and skip things
          // in `duplicate_slots_to_repair` that have already been dumped. Add test.
          duplicate_slots_to_repair.retain(|duplicate_slot, correct_hash| {
@@ -582,7 +710,7 @@ index c5a5f4d..8526b1c 100644
              // Should not dump duplicate slots if there is currently a poh bank building
              // on top of that slot, as BankingStage might still be referencing/touching that state
              // concurrently.
-@@ -2911,7 +2997,11 @@ impl ReplayStage {
+@@ -2911,7 +3000,11 @@ impl ReplayStage {
                  ("leader", next_leader_id.to_string(), String),
              );
  
@@ -595,7 +723,7 @@ index c5a5f4d..8526b1c 100644
                  let latest_unconfirmed_leader_slot = progress_map
                      .get_latest_leader_slot_must_exist(parent_slot)
                      .expect(
-@@ -3047,16 +3137,21 @@ impl ReplayStage {
+@@ -3047,16 +3140,21 @@ impl ReplayStage {
          wait_to_vote_slot: Option<Slot>,
          migration_status: &MigrationStatus,
          tbft_structs: &mut TowerBFTStructures,
@@ -621,7 +749,7 @@ index c5a5f4d..8526b1c 100644
  
          if let Some(new_root) = new_root {
              let highest_super_majority_root = Some(
-@@ -4955,6 +5050,90 @@ impl ReplayStage {
+@@ -4955,6 +5053,90 @@ impl ReplayStage {
          duplicate_confirmed_forks
      }
  
@@ -983,10 +1111,10 @@ index 1432f72..e77c934 100644
      "frozen-abi",
  ] }
 diff --git a/reserved-account-keys/src/lib.rs b/reserved-account-keys/src/lib.rs
-index 0f9cf44..37990b9 100644
+index 0f9cf44..4cd4926 100644
 --- a/reserved-account-keys/src/lib.rs
 +++ b/reserved-account-keys/src/lib.rs
-@@ -181,6 +181,10 @@ static RESERVED_ACCOUNTS: std::sync::LazyLock<Vec<ReservedAccount>> =
+@@ -181,6 +181,11 @@ static RESERVED_ACCOUNTS: std::sync::LazyLock<Vec<ReservedAccount>> =
              // other
              ReservedAccount::new_active(native_loader::id()),
              ReservedAccount::new_active(sysvar::id()),
@@ -994,6 +1122,7 @@ index 0f9cf44..37990b9 100644
 +            // no tx may write it.
 +            ReservedAccount::new_active(sol_drivechain_bmm::BMM_ANSWER_ID),
 +            ReservedAccount::new_active(sol_drivechain_bmm::BMM_BLOCKS_ID),
++            ReservedAccount::new_active(sol_drivechain_bmm::DEPOSIT_ANSWER_ID),
          ]
      });
  
@@ -1157,24 +1286,31 @@ index c8399cb..eee4bbf 100644
          let effective_epoch_of_deployments =
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..587c3c4
+index 0000000..1a5d576
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,119 @@
-+//! sol-drivechain: the settle pre-check.
+@@ -0,0 +1,168 @@
++//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
 +//! height H. Each validator asks its own enforcer before the tx runs. The bank
 +//! adds if Solana block S is in its block record, which holds only blocks of
 +//! its own fork. The answer goes to the bridge in the `BmmAnswer` account.
++//!
++//! `credit_deposits(H, M, first, count)` credits deposits of eCash block M at
++//! height H. Block M must have D confirmations, with D from the bridge config
++//! of the bank. The deposits go to the bridge in the `DepositAnswer` account.
 +
 +use {
 +    super::Bank,
 +    sol_drivechain_bmm::{
-+        BLOCK_RECORD_LEN, BLOCK_RECORD_STRIDE, BMM_ANSWER_ID, BMM_BLOCKS_ID, REPLAY_WAIT,
-+        answer_data, confirmations, is_recorded, record_block, settle_bmm_question, view,
++        BLOCK_RECORD_LEN, BLOCK_RECORD_STRIDE, BMM_ANSWER_ID, BMM_BLOCKS_ID, CreditQuestion,
++        DEPOSIT_ANSWER_ID, Question, REPLAY_WAIT, answer_data, confirmations,
++        credit_deposits_question, deposit_answer_data, deposit_confirmations, is_recorded,
++        record_block, settle_bmm_question, view,
 +    },
 +    solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
++    solana_pubkey::Pubkey,
 +    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
 +    solana_svm::account_loader::TransactionCheckResult,
 +    solana_transaction_error::TransactionError,
@@ -1224,8 +1360,15 @@ index 0000000..587c3c4
 +            .is_some_and(|account| is_recorded(account.data(), bank_hash))
 +    }
 +
-+    /// Answers the first top-level `settle_bmm` of each tx, or fails the tx
-+    /// as "not ready".
++    /// D, the eCash confirmations before a credit, from the bridge config of
++    /// this bank.
++    fn bmm_deposit_confirmations(&self) -> Option<u64> {
++        self.get_account(&sol_drivechain_bmm::config())
++            .and_then(|account| deposit_confirmations(account.data()))
++    }
++
++    /// Answers the first top-level `settle_bmm` or `credit_deposits` of each
++    /// tx, or fails the tx as "not ready".
 +    pub(super) fn check_bmm_settles(
 +        &self,
 +        sanitized_txs: &[impl TransactionWithMeta],
@@ -1240,44 +1383,79 @@ index 0000000..587c3c4
 +                let Some((program_id_index, question)) =
 +                    tx.program_instructions_iter()
 +                        .find_map(|(program_id, instruction)| {
-+                            settle_bmm_question(program_id, instruction.data)
++                            BridgeQuestion::of(program_id, instruction.data)
 +                                .map(|question| (instruction.program_id_index, question))
 +                        })
 +                else {
 +                    return Ok(details);
 +                };
-+                let (height, block_hash) = (question.height, question.block_hash);
-+                let answer = match check {
-+                    BmmCheck::Leader => {
-+                        view().answer(height, &block_hash, confirmations().saturating_add(1))
-+                    }
-+                    BmmCheck::Replay => {
-+                        view().wait_for_answer(height, &block_hash, confirmations(), REPLAY_WAIT)
-+                    }
++                let answer = match question {
++                    BridgeQuestion::Settle(question) => self.settle_answer(&question, check),
++                    BridgeQuestion::Credit(question) => self.credit_answer(&question, check),
 +                };
-+                let Some(commitment) = answer else {
-+                    log::debug!(
-+                        "the BMM view has no answer for eCash height {height}, block {}, as {:?}",
-+                        hex::encode(block_hash),
-+                        check,
-+                    );
++                let Some((key, data)) = answer else {
++                    log::debug!("the BMM view has no answer for {question:?} as {check:?}");
 +                    return Err(TransactionError::ProgramExecutionTemporarilyRestricted {
 +                        account_index: program_id_index,
 +                    });
 +                };
 +                let account = AccountSharedData::from(Account {
-+                    data: answer_data(
-+                        &question,
-+                        commitment,
-+                        self.is_bmm_block_recorded(&question.solana_block),
-+                    )
-+                    .to_vec(),
++                    data,
 +                    owner: solana_sdk_ids::sysvar::id(),
 +                    ..Account::default()
 +                });
-+                Ok(details.with_runtime_account(BMM_ANSWER_ID, account))
++                Ok(details.with_runtime_account(key, account))
 +            })
 +            .collect()
++    }
++
++    fn settle_answer(&self, question: &Question, check: BmmCheck) -> Option<(Pubkey, Vec<u8>)> {
++        let (height, block_hash) = (question.height, question.block_hash);
++        let commitment = match check {
++            BmmCheck::Leader => {
++                view().answer(height, &block_hash, confirmations().saturating_add(1))
++            }
++            BmmCheck::Replay => {
++                view().wait_for_answer(height, &block_hash, confirmations(), REPLAY_WAIT)
++            }
++        }?;
++        let data = answer_data(
++            question,
++            commitment,
++            self.is_bmm_block_recorded(&question.solana_block),
++        );
++        Some((BMM_ANSWER_ID, data.to_vec()))
++    }
++
++    /// A block with D confirmations has D - 1 blocks on top of it.
++    fn credit_answer(
++        &self,
++        question: &CreditQuestion,
++        check: BmmCheck,
++    ) -> Option<(Pubkey, Vec<u8>)> {
++        let on_top = self.bmm_deposit_confirmations()?.saturating_sub(1);
++        let (height, block_hash) = (question.height, question.block_hash);
++        let block = match check {
++            BmmCheck::Leader => view().deep_block(height, &block_hash, on_top.saturating_add(1)),
++            BmmCheck::Replay => {
++                view().wait_for_deep_block(height, &block_hash, on_top, REPLAY_WAIT)
++            }
++        }?;
++        Some((DEPOSIT_ANSWER_ID, deposit_answer_data(question, &block)))
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++enum BridgeQuestion {
++    Settle(Question),
++    Credit(CreditQuestion),
++}
++
++impl BridgeQuestion {
++    fn of(program_id: &Pubkey, data: &[u8]) -> Option<Self> {
++        settle_bmm_question(program_id, data)
++            .map(Self::Settle)
++            .or_else(|| credit_deposits_question(program_id, data).map(Self::Credit))
 +    }
 +}
 diff --git a/runtime/src/bank/fee_distribution.rs b/runtime/src/bank/fee_distribution.rs
@@ -1335,10 +1513,10 @@ index 1a9972d..a4c4975 100644
              Ok(post_balance) => {
 diff --git a/sol-drivechain-bmm/Cargo.toml b/sol-drivechain-bmm/Cargo.toml
 new file mode 100644
-index 0000000..310f584
+index 0000000..77d70b6
 --- /dev/null
 +++ b/sol-drivechain-bmm/Cargo.toml
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,29 @@
 +[package]
 +name = "sol-drivechain-bmm"
 +description = "The eCash view that lets the SOL drivechain settle BMM wins"
@@ -1355,6 +1533,7 @@ index 0000000..310f584
 +poller = ["dep:hex", "dep:log", "dep:prost", "dep:thiserror", "dep:tokio", "dep:tonic", "dep:tonic-prost"]
 +
 +[dependencies]
++bs58 = { workspace = true, features = ["alloc"] }
 +hex = { workspace = true, optional = true }
 +log = { workspace = true, optional = true }
 +prost = { workspace = true, optional = true }
@@ -1369,15 +1548,15 @@ index 0000000..310f584
 +workspace = true
 diff --git a/sol-drivechain-bmm/src/enforcer.rs b/sol-drivechain-bmm/src/enforcer.rs
 new file mode 100644
-index 0000000..4a3af6f
+index 0000000..805c22e
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/enforcer.rs
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,564 @@
 +//! A small gRPC client for the enforcer `ValidatorService`. It holds only the
 +//! messages that the BMM view reads, so Agave needs no proto build step.
 +
 +use {
-+    crate::{BlockHash, Commitment},
++    crate::{BlockHash, Commitment, Deposit},
 +    tonic::{codegen::http::uri::PathAndQuery, transport::Channel},
 +    tonic_prost::ProstCodec,
 +};
@@ -1407,6 +1586,8 @@ index 0000000..4a3af6f
 +    BadCommitment(String),
 +    #[error("the enforcer gave a block hash that is not 32 bytes of hex: {0}")]
 +    BadBlockHash(String),
++    #[error("the enforcer gave a deposit address that is not hex: {0}")]
++    BadDepositAddress(String),
 +}
 +
 +/// google.protobuf.StringValue
@@ -1421,6 +1602,13 @@ index 0000000..4a3af6f
 +pub struct UInt32Value {
 +    #[prost(uint32, tag = "1")]
 +    pub value: u32,
++}
++
++/// google.protobuf.UInt64Value
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct UInt64Value {
++    #[prost(uint64, tag = "1")]
++    pub value: u64,
 +}
 +
 +/// cusf.common.v1.ReverseHex and cusf.common.v1.ConsensusHex share this shape.
@@ -1506,6 +1694,60 @@ index 0000000..4a3af6f
 +pub struct GetBmmHStarCommitmentResponse {
 +    #[prost(oneof = "CommitmentResult", tags = "1, 2")]
 +    pub result: Option<CommitmentResult>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct GetTwoWayPegDataRequest {
++    #[prost(message, optional, tag = "1")]
++    pub sidechain_id: Option<UInt32Value>,
++    #[prost(message, optional, tag = "2")]
++    pub start_block_hash: Option<HexValue>,
++    #[prost(message, optional, tag = "3")]
++    pub end_block_hash: Option<HexValue>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct DepositOutput {
++    #[prost(message, optional, tag = "2")]
++    pub address: Option<HexValue>,
++    #[prost(message, optional, tag = "3")]
++    pub value_sats: Option<UInt64Value>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct DepositMessage {
++    #[prost(message, optional, tag = "1")]
++    pub sequence_number: Option<UInt64Value>,
++    #[prost(message, optional, tag = "3")]
++    pub output: Option<DepositOutput>,
++}
++
++/// One event of a `BlockInfo`. The enforcer sends a oneof, and this reads
++/// only its deposit case.
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct BlockEvent {
++    #[prost(message, optional, tag = "1")]
++    pub deposit: Option<DepositMessage>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct BlockInfo {
++    #[prost(message, repeated, tag = "2")]
++    pub events: Vec<BlockEvent>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct PegDataItem {
++    #[prost(message, optional, tag = "1")]
++    pub block_header_info: Option<BlockHeaderInfo>,
++    #[prost(message, optional, tag = "2")]
++    pub block_info: Option<BlockInfo>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct GetTwoWayPegDataResponse {
++    #[prost(message, repeated, tag = "1")]
++    pub blocks: Vec<PegDataItem>,
 +}
 +
 +/// An eCash block, named by its hash in the reversed hex of the enforcer.
@@ -1655,6 +1897,72 @@ index 0000000..4a3af6f
 +    }
 +}
 +
++impl Enforcer {
++    /// The deposits of each block after `start` (when set) up to `end`, both
++    /// in reversed hex, per block hash. The enforcer leaves out a block
++    /// without an event for the sidechain.
++    pub async fn deposits(
++        &mut self,
++        sidechain_slot: u8,
++        start: Option<&str>,
++        end: &str,
++    ) -> Result<Vec<(BlockHash, Vec<Deposit>)>, EnforcerError> {
++        const CALL: &str = "GetTwoWayPegData";
++        let response: GetTwoWayPegDataResponse = self
++            .unary(
++                CALL,
++                "/cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
++                GetTwoWayPegDataRequest {
++                    sidechain_id: Some(UInt32Value {
++                        value: u32::from(sidechain_slot),
++                    }),
++                    start_block_hash: start.map(hex_value),
++                    end_block_hash: Some(hex_value(end)),
++                },
++            )
++            .await?;
++        response
++            .blocks
++            .into_iter()
++            .map(|item| {
++                let info = item.block_header_info.ok_or(EnforcerError::MissingField {
++                    call: CALL,
++                    field: "block_header_info",
++                })?;
++                let hash = decode_block_hash(&header(info, CALL)?.hash)?;
++                let deposits = item
++                    .block_info
++                    .map(|info| info.events)
++                    .unwrap_or_default()
++                    .into_iter()
++                    .filter_map(|event| event.deposit)
++                    .map(deposit)
++                    .collect::<Result<Vec<_>, _>>()?;
++                Ok((hash, deposits))
++            })
++            .collect()
++    }
++}
++
++fn deposit(message: DepositMessage) -> Result<Deposit, EnforcerError> {
++    const CALL: &str = "GetTwoWayPegData";
++    let missing = |field| EnforcerError::MissingField { call: CALL, field };
++    let output = message.output.ok_or(missing("deposit.output"))?;
++    let text = hex_text(output.address).ok_or(missing("deposit.output.address"))?;
++    let address = hex::decode(&text).map_err(|_| EnforcerError::BadDepositAddress(text))?;
++    Ok(Deposit {
++        sequence_number: message
++            .sequence_number
++            .ok_or(missing("deposit.sequence_number"))?
++            .value,
++        value_sats: output
++            .value_sats
++            .ok_or(missing("deposit.output.value_sats"))?
++            .value,
++        address,
++    })
++}
++
 +fn hex_value(text: &str) -> HexValue {
 +    HexValue {
 +        hex: Some(StringValue {
@@ -1729,6 +2037,62 @@ index 0000000..4a3af6f
 +    }
 +
 +    #[test]
++    fn a_deposit_reads_from_the_wire() {
++        // Field numbers from cusf/mainchain/v1/validator.proto. Event tag 2 is
++        // a withdrawal bundle, which this reader skips.
++        #[derive(Clone, PartialEq, prost::Message)]
++        struct WireEvent {
++            #[prost(message, optional, tag = "1")]
++            deposit: Option<DepositMessage>,
++            #[prost(message, optional, tag = "2")]
++            bundle: Option<StringValue>,
++        }
++        #[derive(Clone, PartialEq, prost::Message)]
++        struct WireInfo {
++            #[prost(message, optional, tag = "1")]
++            bmm_commitment: Option<HexValue>,
++            #[prost(message, repeated, tag = "2")]
++            events: Vec<WireEvent>,
++        }
++        let wire = WireInfo {
++            bmm_commitment: Some(hex_value(&"11".repeat(32))),
++            events: vec![
++                WireEvent {
++                    deposit: None,
++                    bundle: Some(StringValue {
++                        value: "m6".to_owned(),
++                    }),
++                },
++                WireEvent {
++                    deposit: Some(DepositMessage {
++                        sequence_number: Some(UInt64Value { value: 9 }),
++                        output: Some(DepositOutput {
++                            address: Some(hex_value("6162")),
++                            value_sats: Some(UInt64Value { value: 5000 }),
++                        }),
++                    }),
++                    bundle: None,
++                },
++            ],
++        };
++        let info = BlockInfo::decode(wire.encode_to_vec().as_slice()).unwrap();
++        let deposits: Vec<Deposit> = info
++            .events
++            .into_iter()
++            .filter_map(|event| event.deposit)
++            .map(|message| deposit(message).unwrap())
++            .collect();
++        assert_eq!(
++            deposits,
++            vec![Deposit {
++                sequence_number: 9,
++                value_sats: 5000,
++                address: b"ab".to_vec(),
++            }]
++        );
++    }
++
++    #[test]
 +    fn a_short_commitment_fails() {
 +        assert!(decode_commitment(Some(hex_value("abcd"))).is_err());
 +    }
@@ -1754,10 +2118,10 @@ index 0000000..4a3af6f
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..6b9a1f7
+index 0000000..ad4171c
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,1186 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -1770,9 +2134,15 @@ index 0000000..6b9a1f7
 +//! stake votes again. A checkpoint for an absent bank also stops the fallback,
 +//! because its bank can still arrive. A commitment without a pair is not a
 +//! checkpoint.
++//!
++//! A checkpoint at eCash height H counts only when the bridge config of its
++//! bank credited every deposit through H - lag, and the active eCash chain
++//! still holds those credits. While the view cannot check the credits, the
++//! checkpoint stays pending. A bank whose credits the active eCash chain
++//! dropped never counts, and no leader builds on it.
 +
 +use {
-+    crate::BlockHash,
++    crate::{BlockHash, Credits},
 +    std::{
 +        collections::{HashMap, HashSet},
 +        fs,
@@ -2003,6 +2373,125 @@ index 0000000..6b9a1f7
 +    }
 +}
 +
++/// The deposit credits of a bank, checked against the active eCash chain.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Deposits {
++    /// The active eCash chain holds every credit of the bank, through
++    /// `credited_height`.
++    Credited { credited_height: u64, lag: u64 },
++    /// The active eCash chain dropped a block whose deposits the bank
++    /// credited.
++    Dropped,
++    /// The bank holds no bridge config, or the view does not hold the
++    /// credited block.
++    Unknown,
++}
++
++/// Checks the credits of a bank. `active_block` gives the hash of the active
++/// eCash block at a height, when the view holds it.
++pub fn check_deposits(
++    credits: Option<Credits>,
++    mut active_block: impl FnMut(u64) -> Option<BlockHash>,
++) -> Deposits {
++    let Some(credits) = credits else {
++        return Deposits::Unknown;
++    };
++    let credited = Deposits::Credited {
++        credited_height: credits.credited_height,
++        lag: credits.lag,
++    };
++    if credits.credited_block == [0u8; 32] {
++        return credited;
++    }
++    match active_block(credits.credited_height) {
++        Some(hash) if hash == credits.credited_block => credited,
++        Some(_) => Deposits::Dropped,
++        None => Deposits::Unknown,
++    }
++}
++
++/// Why a checkpoint does not count.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Rejection {
++    /// The bank credited the deposits only through this eCash height.
++    TooFewCredits(u64),
++    /// The active eCash chain dropped a block that the bank credited.
++    Dropped,
++}
++
++/// The checkpoints after rules 3 and 4.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct Screened {
++    /// The checkpoints that count, and those whose bank is absent.
++    pub counted: Vec<Checkpoint>,
++    /// The heights of the checkpoints whose credits the view cannot check yet.
++    pub pending: Vec<u64>,
++    pub rejected: Vec<(Checkpoint, Rejection)>,
++}
++
++/// Applies rules 3 and 4 to the checkpoints. `deposits` holds the credits of
++/// each frozen bank. A checkpoint for a bank outside `deposits` stays in
++/// `counted`, because `choose` keeps it pending until its bank freezes.
++pub fn screen(checkpoints: &[Checkpoint], deposits: &HashMap<BankHash, Deposits>) -> Screened {
++    let mut screened = Screened::default();
++    for checkpoint in checkpoints {
++        match deposits.get(&checkpoint.bank_hash) {
++            None => screened.counted.push(*checkpoint),
++            Some(Deposits::Unknown) => screened.pending.push(checkpoint.height),
++            Some(Deposits::Dropped) => screened
++                .rejected
++                .push((*checkpoint, Rejection::Dropped)),
++            Some(Deposits::Credited {
++                credited_height,
++                lag,
++            }) => {
++                if credited_height.saturating_add(*lag) >= checkpoint.height {
++                    screened.counted.push(*checkpoint);
++                } else {
++                    screened
++                        .rejected
++                        .push((*checkpoint, Rejection::TooFewCredits(*credited_height)));
++                }
++            }
++        }
++    }
++    screened
++}
++
++/// True when a pending checkpoint came less than `fallback_blocks` eCash
++/// blocks ago. Such a checkpoint stops the fallback.
++pub fn pending_stops_fallback(pending: &[u64], tip_height: u64, params: Params) -> bool {
++    pending
++        .iter()
++        .any(|height| tip_height.saturating_sub(*height) < params.fallback_blocks)
++}
++
++/// The bank to build on in place of `candidate`, when the path from
++/// `candidate` down to the root holds a bank in `dropped`. It is the highest
++/// bank at or above the parent of the lowest such bank with no bank of
++/// `dropped` on its own path. `None` when the path holds no such bank.
++pub fn avoid_dropped(
++    root: Slot,
++    banks: &[ForkBank],
++    dropped: &HashSet<Slot>,
++    candidate: Slot,
++) -> Option<Slot> {
++    let tree = Tree::new(banks);
++    let lowest = tree
++        .path(candidate, root)
++        .filter(|slot| dropped.contains(slot))
++        .min()?;
++    let base = tree.parent.get(&lowest).copied().flatten()?;
++    banks
++        .iter()
++        .map(|bank| bank.slot)
++        .filter(|slot| {
++            tree.descends(*slot, base)
++                && !tree.path(*slot, base).any(|step| dropped.contains(&step))
++        })
++        .max()
++}
++
 +/// A request to restart from a snapshot at or below `anchor.slot`.
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 +pub struct Restart {
@@ -2066,6 +2555,32 @@ index 0000000..6b9a1f7
 +    (theirs.len() > ours && trigger_height > handled_height).then_some(Restart {
 +        anchor,
 +        trigger_height,
++    })
++}
++
++/// A restart request when the root bank credited deposits of an eCash block
++/// that the active chain dropped. No leader can build beside the root, so the
++/// node restarts at the newest anchor below the root that the active chain
++/// still holds. Its bank came before the dropped credit, because a credit
++/// waits for confirmations and the anchor block is older than the dropped
++/// block. Each eCash tip asks for one restart at most.
++pub fn restart_for_dropped_root(
++    root: Slot,
++    checkpoints: &[Checkpoint],
++    anchors: &[Anchor],
++    tip_height: u64,
++    handled_height: u64,
++) -> Option<Restart> {
++    if tip_height <= handled_height {
++        return None;
++    }
++    let anchor = *anchors
++        .iter()
++        .filter(|anchor| anchor.slot < root && anchor.is_active(checkpoints))
++        .max_by_key(|anchor| anchor.slot)?;
++    Some(Restart {
++        anchor,
++        trigger_height: tip_height,
 +    })
 +}
 +
@@ -2368,6 +2883,152 @@ index 0000000..6b9a1f7
 +        tree(&[(10, 0), (11, 10), (12, 11), (13, 12), (14, 10), (15, 14)])
 +    }
 +
++    fn credited(credited_height: u64) -> Deposits {
++        Deposits::Credited {
++            credited_height,
++            lag: 3,
++        }
++    }
++
++    #[test]
++    fn credits_on_the_active_chain_are_credited() {
++        let credits = Credits {
++            credited_height: 50,
++            credited_block: block(50),
++            lag: 3,
++        };
++        assert_eq!(
++            check_deposits(Some(credits), |height| Some(block(height))),
++            credited(50)
++        );
++    }
++
++    #[test]
++    fn credits_of_a_dropped_block_are_dropped() {
++        let credits = Credits {
++            credited_height: 50,
++            credited_block: block(50),
++            lag: 3,
++        };
++        assert_eq!(
++            check_deposits(Some(credits), |_| Some([0xaa; 32])),
++            Deposits::Dropped
++        );
++    }
++
++    #[test]
++    fn credits_that_the_view_cannot_check_are_unknown() {
++        let credits = Credits {
++            credited_height: 50,
++            credited_block: block(50),
++            lag: 3,
++        };
++        assert_eq!(check_deposits(Some(credits), |_| None), Deposits::Unknown);
++        assert_eq!(check_deposits(None, |height| Some(block(height))), Deposits::Unknown);
++    }
++
++    #[test]
++    fn a_bank_without_a_credit_is_credited_through_the_start_height() {
++        let credits = Credits {
++            credited_height: 50,
++            credited_block: [0; 32],
++            lag: 3,
++        };
++        assert_eq!(check_deposits(Some(credits), |_| None), credited(50));
++    }
++
++    #[test]
++    fn rule_3_holds_at_exactly_h_minus_lag() {
++        let deposits = HashMap::from([(hash(11), credited(97)), (hash(12), credited(96))]);
++        let at_100 = [checkpoint(100, 11), checkpoint(100, 12)];
++        let screened = screen(&at_100, &deposits);
++        assert_eq!(screened.counted, vec![checkpoint(100, 11)]);
++        assert_eq!(
++            screened.rejected,
++            vec![(checkpoint(100, 12), Rejection::TooFewCredits(96))]
++        );
++    }
++
++    #[test]
++    fn a_dropped_credit_rejects_the_checkpoint() {
++        let deposits = HashMap::from([(hash(11), Deposits::Dropped)]);
++        let screened = screen(&[checkpoint(100, 11)], &deposits);
++        assert!(screened.counted.is_empty());
++        assert_eq!(screened.rejected, vec![(checkpoint(100, 11), Rejection::Dropped)]);
++    }
++
++    #[test]
++    fn an_unknown_credit_leaves_the_checkpoint_pending_until_the_view_holds_it() {
++        let before = HashMap::from([(hash(13), Deposits::Unknown)]);
++        let screened = screen(&[checkpoint(100, 13)], &before);
++        assert!(screened.counted.is_empty());
++        assert_eq!(screened.pending, vec![100]);
++        assert!(pending_stops_fallback(&screened.pending, 105, PARAMS));
++        assert!(!pending_stops_fallback(&screened.pending, 106, PARAMS));
++        let after = HashMap::from([(hash(13), credited(98))]);
++        let screened = screen(&[checkpoint(100, 13)], &after);
++        assert_eq!(screened.counted, vec![checkpoint(100, 13)]);
++        assert_eq!(choose(10, &split(), &screened.counted, 100, PARAMS).head, Some(13));
++    }
++
++    #[test]
++    fn a_checkpoint_for_an_absent_bank_passes_the_screen() {
++        let screened = screen(&[unknown(100)], &HashMap::new());
++        assert_eq!(screened.counted, vec![unknown(100)]);
++    }
++
++    #[test]
++    fn a_censoring_branch_with_more_checkpoints_loses() {
++        let deposits = HashMap::from([
++            (hash(12), credited(90)),
++            (hash(13), credited(90)),
++            (hash(15), credited(99)),
++        ]);
++        let checkpoints = [checkpoint(100, 12), checkpoint(101, 13), checkpoint(102, 15)];
++        let screened = screen(&checkpoints, &deposits);
++        let choice = choose(10, &split(), &screened.counted, 102, PARAMS);
++        assert_eq!(choice.head, Some(15));
++        assert_eq!(choice.count, 1);
++    }
++
++    #[test]
++    fn a_leader_builds_beside_a_bank_with_dropped_credits() {
++        // Root 10. Branch A: 11, 12, 13. Branch B: 14, 15 off 10. Branch C: 16 off 11.
++        let banks = tree(&[
++            (10, 0),
++            (11, 10),
++            (12, 11),
++            (13, 12),
++            (14, 10),
++            (15, 14),
++            (16, 11),
++        ]);
++        let dropped = HashSet::from([12, 13]);
++        assert_eq!(avoid_dropped(10, &banks, &dropped, 13), Some(16));
++        assert_eq!(avoid_dropped(10, &banks, &dropped, 15), None);
++        let only_a = tree(&[(10, 0), (11, 10), (12, 11), (13, 12)]);
++        assert_eq!(avoid_dropped(10, &only_a, &dropped, 13), Some(11));
++        assert_eq!(avoid_dropped(10, &only_a, &HashSet::new(), 13), None);
++    }
++
++    #[test]
++    fn a_dropped_root_restarts_at_the_newest_active_anchor_below_it() {
++        let checkpoints = [checkpoint(100, 5), checkpoint(101, 7)];
++        let anchors = [anchor(100, 5), anchor(101, 7), anchor(103, 10)];
++        assert_eq!(
++            restart_for_dropped_root(10, &checkpoints, &anchors, 110, 0),
++            Some(Restart {
++                anchor: anchor(101, 7),
++                trigger_height: 110,
++            })
++        );
++        assert_eq!(
++            restart_for_dropped_root(10, &checkpoints, &anchors, 110, 110),
++            None
++        );
++        assert_eq!(restart_for_dropped_root(10, &[], &anchors, 110, 0), None);
++    }
++
 +    #[test]
 +    fn the_vote_floor_only_goes_up() {
 +        raise_vote_floor(50);
@@ -2649,10 +3310,10 @@ index 0000000..6b9a1f7
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..943ee72
+index 0000000..cc133bb
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,649 @@
+@@ -0,0 +1,969 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -2660,6 +3321,10 @@ index 0000000..943ee72
 +//! active block at height H, deep enough, and which commitment does its
 +//! coinbase hold for the sidechain? The bank adds if Solana block S is in its
 +//! block record. The answer goes into the `BmmAnswer` account of that tx.
++//!
++//! Before a `credit_deposits(H, M, first, count)` runs, the runtime asks this
++//! view for the deposits of block M at height H. The answer goes into the
++//! `DepositAnswer` account of that tx.
 +
 +#[cfg(feature = "poller")]
 +mod enforcer;
@@ -2677,7 +3342,7 @@ index 0000000..943ee72
 +    std::{
 +        collections::BTreeMap,
 +        sync::{
-+            Condvar, Mutex, OnceLock,
++            Arc, Condvar, Mutex, OnceLock,
 +            atomic::{AtomicU64, Ordering},
 +        },
 +        time::{Duration, Instant},
@@ -2706,8 +3371,41 @@ index 0000000..943ee72
 +const BLOCK_RECORD_ENTRY_LEN: usize = 8 + 32;
 +pub const BLOCK_RECORD_LEN: usize = BLOCK_RECORD_ENTRIES * BLOCK_RECORD_ENTRY_LEN;
 +
++/// The account that holds the deposits of one eCash block for one
++/// `credit_deposits`. The runtime builds it for each tx, the same way as the
++/// instructions sysvar.
++pub const DEPOSIT_ANSWER_ID: Pubkey =
++    Pubkey::from_str_const("DepositAnswer111111111111111111111111111111");
++
 +/// The seed of the treasury PDA, which collects every transaction fee.
 +pub const TREASURY_SEED: &[u8] = b"treasury";
++
++/// The seed of the bridge config PDA.
++pub const CONFIG_SEED: &[u8] = b"config";
++
++/// The Anchor discriminator of the bridge `Config` account:
++/// sha256("account:Config")[..8].
++pub const CONFIG_DISCRIMINATOR: [u8; 8] = [155, 12, 170, 224, 30, 250, 204, 130];
++
++/// The offsets of the deposit fields in the bridge `Config` account. The
++/// bridge tests read the account at these offsets.
++const CONFIG_DEPOSIT_CONFIRMATIONS: usize = 80;
++const CONFIG_DEPOSIT_LAG: usize = 88;
++const CONFIG_CREDITED_HEIGHT: usize = 96;
++const CONFIG_CREDITED_BLOCK: usize = 104;
++const CONFIG_CREDITED_BLOCK_END: usize = 136;
++
++/// The Anchor discriminator of `credit_deposits`:
++/// sha256("global:credit_deposits")[..8].
++pub const CREDIT_DEPOSITS_DISCRIMINATOR: [u8; 8] = [81, 116, 1, 140, 214, 108, 237, 178];
++
++/// The head of the `DepositAnswer` data: height, block hash, parent hash,
++/// deposit count of the block, first index, entry count.
++pub const DEPOSIT_ANSWER_HEAD_LEN: usize = 8 + 32 + 32 + 4 + 4 + 1;
++
++/// One `DepositAnswer` entry: sequence number, value in sats, a flag, and the
++/// target pubkey.
++pub const DEPOSIT_ANSWER_ENTRY_LEN: usize = 8 + 8 + 1 + 32;
 +
 +/// The Anchor discriminator of `settle_bmm`: sha256("global:settle_bmm")[..8].
 +pub const SETTLE_BMM_DISCRIMINATOR: [u8; 8] = [223, 214, 151, 212, 138, 42, 77, 15];
@@ -2749,6 +3447,51 @@ index 0000000..943ee72
 +pub fn treasury() -> Pubkey {
 +    static TREASURY: OnceLock<Pubkey> = OnceLock::new();
 +    *TREASURY.get_or_init(|| Pubkey::find_program_address(&[TREASURY_SEED], &BRIDGE_PROGRAM_ID).0)
++}
++
++/// The config PDA of the bridge.
++pub fn config() -> Pubkey {
++    static CONFIG: OnceLock<Pubkey> = OnceLock::new();
++    *CONFIG.get_or_init(|| Pubkey::find_program_address(&[CONFIG_SEED], &BRIDGE_PROGRAM_ID).0)
++}
++
++fn config_u64(data: &[u8], at: usize) -> Option<u64> {
++    if data.get(..8)? != CONFIG_DISCRIMINATOR {
++        return None;
++    }
++    let end = at.checked_add(8)?;
++    Some(u64::from_le_bytes(data.get(at..end)?.try_into().ok()?))
++}
++
++/// D, the eCash confirmations before a credit, from the bridge config data.
++pub fn deposit_confirmations(config_data: &[u8]) -> Option<u64> {
++    config_u64(config_data, CONFIG_DEPOSIT_CONFIRMATIONS)
++}
++
++/// The deposit credits of a bank, from its bridge config data.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Credits {
++    /// The highest eCash height whose deposits the bank credited in full.
++    pub credited_height: u64,
++    /// The eCash block at `credited_height`. Zero before the first credit.
++    pub credited_block: BlockHash,
++    /// A checkpoint at eCash height H counts only with
++    /// `credited_height + lag >= H`.
++    pub lag: u64,
++}
++
++impl Credits {
++    /// Reads the deposit credits from the bridge config data.
++    pub fn read(config_data: &[u8]) -> Option<Self> {
++        Some(Self {
++            credited_height: config_u64(config_data, CONFIG_CREDITED_HEIGHT)?,
++            credited_block: config_data
++                .get(CONFIG_CREDITED_BLOCK..CONFIG_CREDITED_BLOCK_END)?
++                .try_into()
++                .ok()?,
++            lag: config_u64(config_data, CONFIG_DEPOSIT_LAG)?,
++        })
++    }
 +}
 +
 +/// What a `settle_bmm` instruction names: the eCash height, the eCash block,
@@ -2795,6 +3538,93 @@ index 0000000..943ee72
 +    }
 +    data[73..105].copy_from_slice(&question.solana_block);
 +    data[105] = u8::from(recorded);
++    data
++}
++
++/// What a `credit_deposits` instruction names: the eCash height, the eCash
++/// block, the index of the first deposit, and the deposit count.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct CreditQuestion {
++    pub height: u64,
++    pub block_hash: BlockHash,
++    pub first: u32,
++    pub count: u8,
++}
++
++/// The question of a `credit_deposits` instruction, or `None` for any other
++/// instruction.
++pub fn credit_deposits_question(program_id: &Pubkey, data: &[u8]) -> Option<CreditQuestion> {
++    if program_id != &BRIDGE_PROGRAM_ID {
++        return None;
++    }
++    let (discriminator, arguments) = data.split_first_chunk::<8>()?;
++    if discriminator != &CREDIT_DEPOSITS_DISCRIMINATOR {
++        return None;
++    }
++    let (height, rest) = arguments.split_first_chunk::<8>()?;
++    let (block_hash, rest) = rest.split_first_chunk::<32>()?;
++    let (first, rest) = rest.split_first_chunk::<4>()?;
++    let count = rest.first()?;
++    Some(CreditQuestion {
++        height: u64::from_le_bytes(*height),
++        block_hash: *block_hash,
++        first: u32::from_le_bytes(*first),
++        count: *count,
++    })
++}
++
++/// A deposit to the sidechain in an eCash block.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Deposit {
++    pub sequence_number: u64,
++    pub value_sats: u64,
++    /// The OP_RETURN payload of the deposit.
++    pub address: Vec<u8>,
++}
++
++impl Deposit {
++    /// The Solana pubkey that the OP_RETURN names: a bare base58 pubkey. `None`
++    /// when the payload is no such pubkey.
++    pub fn target(&self) -> Option<[u8; 32]> {
++        let text = std::str::from_utf8(&self.address).ok()?;
++        let bytes = bs58::decode(text).into_vec().ok()?;
++        bytes.try_into().ok()
++    }
++}
++
++/// The data of the `DepositAnswer` account: the head, then the deposits from
++/// index `first`, at most `count` of them.
++pub fn deposit_answer_data(question: &CreditQuestion, block: &Block) -> Vec<u8> {
++    let total = u32::try_from(block.deposits.len()).unwrap_or(u32::MAX);
++    let entries: Vec<&Deposit> = block
++        .deposits
++        .iter()
++        .skip(question.first as usize)
++        .take(usize::from(question.count))
++        .collect();
++    let mut data = Vec::with_capacity(
++        DEPOSIT_ANSWER_HEAD_LEN.saturating_add(entries.len().saturating_mul(DEPOSIT_ANSWER_ENTRY_LEN)),
++    );
++    data.extend_from_slice(&question.height.to_le_bytes());
++    data.extend_from_slice(&block.hash);
++    data.extend_from_slice(&block.prev_hash);
++    data.extend_from_slice(&total.to_le_bytes());
++    data.extend_from_slice(&question.first.to_le_bytes());
++    data.push(entries.len() as u8);
++    for deposit in entries {
++        data.extend_from_slice(&deposit.sequence_number.to_le_bytes());
++        data.extend_from_slice(&deposit.value_sats.to_le_bytes());
++        match deposit.target() {
++            Some(target) => {
++                data.push(1);
++                data.extend_from_slice(&target);
++            }
++            None => {
++                data.push(0);
++                data.extend_from_slice(&[0u8; 32]);
++            }
++        }
++    }
 +    data
 +}
 +
@@ -2860,11 +3690,13 @@ index 0000000..943ee72
 +}
 +
 +/// One block of the active eCash chain.
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq)]
 +pub struct Block {
 +    pub hash: BlockHash,
 +    pub prev_hash: BlockHash,
 +    pub commitment: Option<Commitment>,
++    /// The deposits to the sidechain, in block order.
++    pub deposits: Arc<[Deposit]>,
 +}
 +
 +#[derive(Default)]
@@ -2904,8 +3736,8 @@ index 0000000..943ee72
 +        block_hash: &BlockHash,
 +        depth: u64,
 +    ) -> Option<Option<Commitment>> {
-+        let mut state = self.state.lock().unwrap();
-+        Self::answer_locked(&mut state, height, block_hash, depth)
++        self.deep_block(height, block_hash, depth)
++            .map(|block| block.commitment)
 +    }
 +
 +    /// The same as `answer`, but it waits up to `timeout` for the enforcer.
@@ -2916,23 +3748,43 @@ index 0000000..943ee72
 +        depth: u64,
 +        timeout: Duration,
 +    ) -> Option<Option<Commitment>> {
++        self.wait_for_deep_block(height, block_hash, depth, timeout)
++            .map(|block| block.commitment)
++    }
++
++    /// Block `block_hash` if it is the active block at `height` with at least
++    /// `depth` blocks on top of it. `None` means not ready.
++    pub fn deep_block(&self, height: u64, block_hash: &BlockHash, depth: u64) -> Option<Block> {
++        let mut state = self.state.lock().unwrap();
++        Self::deep_block_locked(&mut state, height, block_hash, depth)
++    }
++
++    /// The same as `deep_block`, but it waits up to `timeout` for the
++    /// enforcer.
++    pub fn wait_for_deep_block(
++        &self,
++        height: u64,
++        block_hash: &BlockHash,
++        depth: u64,
++        timeout: Duration,
++    ) -> Option<Block> {
 +        let deadline = Instant::now().checked_add(timeout)?;
 +        let mut state = self.state.lock().unwrap();
 +        loop {
-+            if let Some(answer) = Self::answer_locked(&mut state, height, block_hash, depth) {
-+                return Some(answer);
++            if let Some(block) = Self::deep_block_locked(&mut state, height, block_hash, depth) {
++                return Some(block);
 +            }
 +            let remaining = deadline.checked_duration_since(Instant::now())?;
 +            state = self.changed.wait_timeout(state, remaining).unwrap().0;
 +        }
 +    }
 +
-+    fn answer_locked(
++    fn deep_block_locked(
 +        state: &mut State,
 +        height: u64,
 +        block_hash: &BlockHash,
 +        depth: u64,
-+    ) -> Option<Option<Commitment>> {
++    ) -> Option<Block> {
 +        let lowest = state.active.keys().next().copied();
 +        if lowest.is_some_and(|lowest| height < lowest) {
 +            state.wanted_low = Some(state.wanted_low.map_or(height, |wanted| wanted.min(height)));
@@ -2942,7 +3794,7 @@ index 0000000..943ee72
 +            return None;
 +        }
 +        let block = state.active.get(&height)?;
-+        (&block.hash == block_hash).then_some(block.commitment)
++        (&block.hash == block_hash).then(|| block.clone())
 +    }
 +
 +    /// Replaces the active chain from the lowest height in `blocks` upward.
@@ -2953,7 +3805,7 @@ index 0000000..943ee72
 +        };
 +        let mut state = self.state.lock().unwrap();
 +        state.active.split_off(&lowest);
-+        state.active.extend(blocks.iter().copied());
++        state.active.extend(blocks.iter().cloned());
 +        state.tip_height = Some(tip_height);
 +        if state.wanted_low.is_some_and(|wanted| wanted >= lowest) {
 +            state.wanted_low = None;
@@ -2968,7 +3820,7 @@ index 0000000..943ee72
 +        let lowest = state.active.keys().next().copied();
 +        for (height, block) in blocks {
 +            if lowest.is_none_or(|lowest| *height < lowest) {
-+                state.active.insert(*height, *block);
++                state.active.insert(*height, block.clone());
 +            }
 +        }
 +        let new_lowest = state.active.keys().next().copied();
@@ -2983,7 +3835,7 @@ index 0000000..943ee72
 +
 +    /// The active block at `height`, if the view holds it.
 +    pub fn block_at(&self, height: u64) -> Option<Block> {
-+        self.state.lock().unwrap().active.get(&height).copied()
++        self.state.lock().unwrap().active.get(&height).cloned()
 +    }
 +
 +    /// The height and hash of the active tip.
@@ -3048,6 +3900,7 @@ index 0000000..943ee72
 +                        hash: hash(low.wrapping_add(salt)),
 +                        prev_hash: hash(low.wrapping_sub(1).wrapping_add(salt)),
 +                        commitment: (height % 2 == 0).then_some([low; 32]),
++                        deposits: Arc::from([]),
 +                    },
 +                )
 +            })
@@ -3074,6 +3927,133 @@ index 0000000..943ee72
 +    fn the_discriminator_is_eight_bytes_of_sha256() {
 +        let digest = solana_sha256_hasher::hash(b"global:settle_bmm").to_bytes();
 +        assert_eq!(SETTLE_BMM_DISCRIMINATOR, digest[..8]);
++        let digest = solana_sha256_hasher::hash(b"global:credit_deposits").to_bytes();
++        assert_eq!(CREDIT_DEPOSITS_DISCRIMINATOR, digest[..8]);
++        let digest = solana_sha256_hasher::hash(b"account:Config").to_bytes();
++        assert_eq!(CONFIG_DISCRIMINATOR, digest[..8]);
++    }
++
++    fn credit_data(height: u64, block_hash: &BlockHash, first: u32, count: u8) -> Vec<u8> {
++        let mut data = CREDIT_DEPOSITS_DISCRIMINATOR.to_vec();
++        data.extend_from_slice(&height.to_le_bytes());
++        data.extend_from_slice(block_hash);
++        data.extend_from_slice(&first.to_le_bytes());
++        data.push(count);
++        data
++    }
++
++    fn deposit(sequence_number: u64, address: &[u8]) -> Deposit {
++        Deposit {
++            sequence_number,
++            value_sats: sequence_number.saturating_mul(1000),
++            address: address.to_vec(),
++        }
++    }
++
++    #[test]
++    fn a_credit_instruction_gives_its_question() {
++        assert_eq!(
++            credit_deposits_question(&BRIDGE_PROGRAM_ID, &credit_data(42, &hash(7), 3, 2)),
++            Some(CreditQuestion {
++                height: 42,
++                block_hash: hash(7),
++                first: 3,
++                count: 2,
++            })
++        );
++        assert_eq!(
++            settle_bmm_question(&BRIDGE_PROGRAM_ID, &credit_data(42, &hash(7), 3, 2)),
++            None
++        );
++        let data = credit_data(42, &hash(7), 3, 2);
++        assert_eq!(
++            credit_deposits_question(&BRIDGE_PROGRAM_ID, &data[..data.len() - 1]),
++            None
++        );
++        let other = Pubkey::new_from_array([9; 32]);
++        assert_eq!(credit_deposits_question(&other, &data), None);
++    }
++
++    #[test]
++    fn a_deposit_names_a_base58_pubkey_or_nothing() {
++        let key = Pubkey::new_from_array([7; 32]);
++        assert_eq!(deposit(1, key.to_string().as_bytes()).target(), Some([7; 32]));
++        assert_eq!(deposit(1, b"s8_abc_000000").target(), None);
++        assert_eq!(deposit(1, &[0xff, 0xfe]).target(), None);
++        let short = bs58::encode([1u8; 16]).into_string();
++        assert_eq!(deposit(1, short.as_bytes()).target(), None);
++    }
++
++    #[test]
++    fn the_deposit_answer_holds_the_part_that_the_question_names() {
++        let key = Pubkey::new_from_array([7; 32]);
++        let block = Block {
++            hash: hash(50),
++            prev_hash: hash(49),
++            commitment: None,
++            deposits: Arc::from([
++                deposit(4, key.to_string().as_bytes()),
++                deposit(5, b"junk"),
++                deposit(6, key.to_string().as_bytes()),
++            ]),
++        };
++        let question = CreditQuestion {
++            height: 50,
++            block_hash: hash(50),
++            first: 1,
++            count: 5,
++        };
++        let data = deposit_answer_data(&question, &block);
++        assert_eq!(data.len(), DEPOSIT_ANSWER_HEAD_LEN + 2 * DEPOSIT_ANSWER_ENTRY_LEN);
++        assert_eq!(&data[..8], &50u64.to_le_bytes());
++        assert_eq!(&data[8..40], &hash(50));
++        assert_eq!(&data[40..72], &hash(49));
++        assert_eq!(&data[72..76], &3u32.to_le_bytes());
++        assert_eq!(&data[76..80], &1u32.to_le_bytes());
++        assert_eq!(data[80], 2);
++        let first = &data[DEPOSIT_ANSWER_HEAD_LEN..];
++        assert_eq!(&first[..8], &5u64.to_le_bytes());
++        assert_eq!(&first[8..16], &5000u64.to_le_bytes());
++        assert_eq!(first[16], 0);
++        let second = &first[DEPOSIT_ANSWER_ENTRY_LEN..];
++        assert_eq!(&second[..8], &6u64.to_le_bytes());
++        assert_eq!(second[16], 1);
++        assert_eq!(&second[17..49], &[7u8; 32]);
++    }
++
++    #[test]
++    fn the_config_gives_the_credits_and_d() {
++        let mut data = vec![0u8; 155];
++        data[..8].copy_from_slice(&CONFIG_DISCRIMINATOR);
++        data[80..88].copy_from_slice(&6u64.to_le_bytes());
++        data[88..96].copy_from_slice(&100u64.to_le_bytes());
++        data[96..104].copy_from_slice(&700u64.to_le_bytes());
++        data[104..136].copy_from_slice(&hash(9));
++        assert_eq!(deposit_confirmations(&data), Some(6));
++        assert_eq!(
++            Credits::read(&data),
++            Some(Credits {
++                credited_height: 700,
++                credited_block: hash(9),
++                lag: 100,
++            })
++        );
++        data[0] ^= 1;
++        assert_eq!(deposit_confirmations(&data), None);
++        assert_eq!(Credits::read(&data), None);
++        assert_eq!(Credits::read(&CONFIG_DISCRIMINATOR), None);
++    }
++
++    #[test]
++    fn a_deep_block_gives_its_deposits() {
++        let view = BmmView::default();
++        let mut blocks = chain(100, 110, 0);
++        blocks[4].1.deposits = Arc::from([deposit(3, b"x")]);
++        view.replace_from(&blocks);
++        let block = view.deep_block(104, &hash(104), 6).unwrap();
++        assert_eq!(block.deposits.len(), 1);
++        assert_eq!(view.deep_block(105, &hash(105), 6), None);
++        assert_eq!(view.deep_block(104, &hash(1), 6), None);
 +    }
 +
 +    #[test]
@@ -3174,6 +4154,7 @@ index 0000000..943ee72
 +                        hash: hash(height as u8),
 +                        prev_hash: hash((height as u8).wrapping_sub(1)),
 +                        commitment,
++                        deposits: Arc::from([]),
 +                    },
 +                )
 +            })
@@ -3304,10 +4285,10 @@ index 0000000..943ee72
 +}
 diff --git a/sol-drivechain-bmm/src/pairs.rs b/sol-drivechain-bmm/src/pairs.rs
 new file mode 100644
-index 0000000..ba772c5
+index 0000000..3d6992d
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/pairs.rs
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,303 @@
 +//! The published pairs. A bidder sends the Solana block hash and the payee of
 +//! its bid to the validators, outside any transaction. A commitment h* counts
 +//! only when a pair with SHA-256(block hash ‖ payee) = h* is known.
@@ -3517,6 +4498,7 @@ index 0000000..ba772c5
 +                        hash: [height as u8; 32],
 +                        prev_hash: [(height as u8).wrapping_sub(1); 32],
 +                        commitment: (height == 105).then(|| pair(5).commitment()),
++                        deposits: std::sync::Arc::from([]),
 +                    },
 +                )
 +            })
@@ -3612,10 +4594,10 @@ index 0000000..ba772c5
 +}
 diff --git a/sol-drivechain-bmm/src/poller.rs b/sol-drivechain-bmm/src/poller.rs
 new file mode 100644
-index 0000000..872956f
+index 0000000..c0fd0d1
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/poller.rs
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,323 @@
 +//! Copies the active eCash chain from the local enforcer into the view.
 +
 +use {
@@ -3625,6 +4607,7 @@ index 0000000..872956f
 +        view,
 +    },
 +    std::{
++        collections::HashMap,
 +        sync::{
 +            Arc,
 +            atomic::{AtomicBool, Ordering},
@@ -3774,12 +4757,15 @@ index 0000000..872956f
 +    loop {
 +        let from = tip.height.saturating_sub(span);
 +        let blocks = read_down(enforcer, sidechain_slot, &tip.hash, tip.height, from).await?;
-+        let Some(&(lowest, oldest)) = blocks.first() else {
++        let Some((lowest, oldest_prev_hash)) =
++            blocks.first().map(|(height, block)| (*height, block.prev_hash))
++        else {
 +            return Ok(());
 +        };
 +        let parent = lowest.checked_sub(1).and_then(|below| view.block_at(below));
-+        if connects(lowest, &oldest.prev_hash, parent) || span >= INITIAL_WINDOW {
-+            if !connects(lowest, &oldest.prev_hash, parent) {
++        let joins = connects(lowest, &oldest_prev_hash, parent);
++        if joins || span >= INITIAL_WINDOW {
++            if !joins {
 +                log::warn!(
 +                    "the BMM view reaches only eCash height {lowest}, and the heights below it \
 +                     stay unanswered until a backfill"
@@ -3811,15 +4797,26 @@ index 0000000..872956f
 +    if wanted > below {
 +        return Ok(());
 +    }
-+    let prev_hash_hex = hex::encode(block.prev_hash.iter().rev().copied().collect::<Vec<_>>());
-+    let blocks = read_down(enforcer, sidechain_slot, &prev_hash_hex, below, wanted).await?;
++    let blocks = read_down(
++        enforcer,
++        sidechain_slot,
++        &reverse_hex(&block.prev_hash),
++        below,
++        wanted,
++    )
++    .await?;
 +    view.extend_below(&blocks);
 +    Ok(())
 +}
 +
-+/// Reads the blocks from `top` (at `top_height`) down to `from`, and returns
-+/// them from low to high. It returns fewer if the enforcer holds no BMM data
-+/// below its start height.
++/// A block hash in the reversed hex of the enforcer.
++fn reverse_hex(hash: &BlockHash) -> String {
++    hex::encode(hash.iter().rev().copied().collect::<Vec<_>>())
++}
++
++/// Reads the blocks from `top` (at `top_height`) down to `from`, with their
++/// deposits, and returns them from low to high. It returns fewer if the
++/// enforcer holds no BMM data below its start height.
 +async fn read_down(
 +    enforcer: &mut Enforcer,
 +    sidechain_slot: u8,
@@ -3845,6 +4842,7 @@ index 0000000..872956f
 +                    hash: decode_block_hash(&header.hash)?,
 +                    prev_hash: decode_block_hash(&header.prev_hash)?,
 +                    commitment,
++                    deposits: Arc::from([]),
 +                },
 +            ));
 +        }
@@ -3861,6 +4859,20 @@ index 0000000..872956f
 +        cursor_height = below;
 +    }
 +    blocks.reverse();
++    let Some((lowest, oldest)) = blocks.first() else {
++        return Ok(blocks);
++    };
++    let start = (*lowest > 0).then(|| reverse_hex(&oldest.prev_hash));
++    let mut deposits: HashMap<BlockHash, Vec<_>> = enforcer
++        .deposits(sidechain_slot, start.as_deref(), top)
++        .await?
++        .into_iter()
++        .collect();
++    for (_, block) in blocks.iter_mut() {
++        if let Some(found) = deposits.remove(&block.hash) {
++            block.deposits = Arc::from(found);
++        }
++    }
 +    Ok(blocks)
 +}
 +
@@ -3873,6 +4885,7 @@ index 0000000..872956f
 +            hash: [byte; 32],
 +            prev_hash: [prev; 32],
 +            commitment: None,
++            deposits: Arc::from([]),
 +        }
 +    }
 +

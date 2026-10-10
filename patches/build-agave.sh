@@ -28,6 +28,11 @@
 #    takes the pairs, and the validator sends them to every peer. The runtime
 #    writes a block record, and a settle pays only a block in the record of
 #    its own fork.
+# 9. Before a `credit_deposits` runs, the bank asks the local enforcer for the
+#    deposits of that eCash block, after D confirmations from the bridge
+#    config. A checkpoint counts only when its bank credited every deposit
+#    through H - lag, and the active eCash chain still holds those credits.
+#    No leader builds on a bank whose credits the active chain dropped.
 #
 # To move to a later Agave, raise AGAVE_TAG and run this again.
 set -euo pipefail
