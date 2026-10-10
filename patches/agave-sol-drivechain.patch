@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 96da5bb..d7dcb6d 100644
+index 96da5bb..da7ef1f 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -279,6 +279,7 @@ name = "agave-reserved-account-keys"
@@ -40,7 +40,15 @@ index 96da5bb..d7dcb6d 100644
  [[package]]
  name = "solana-account"
  version = "3.4.0"
-@@ -8515,7 +8532,12 @@ version = "4.2.2"
+@@ -8074,6 +8091,7 @@ dependencies = [
+  "shaq",
+  "signal-hook",
+  "slab",
++ "sol-drivechain-bmm",
+  "solana-account 4.3.1",
+  "solana-accounts-db",
+  "solana-address-lookup-table-interface",
+@@ -8515,7 +8533,12 @@ version = "4.2.2"
  dependencies = [
   "agave-feature-set",
   "solana-fee-structure",
@@ -53,7 +61,15 @@ index 96da5bb..d7dcb6d 100644
  ]
  
  [[package]]
-@@ -10266,6 +10288,7 @@ dependencies = [
+@@ -9082,6 +9105,7 @@ dependencies = [
+  "rocksdb",
+  "scopeguard",
+  "serde",
++ "sol-drivechain-bmm",
+  "solana-account 4.3.1",
+  "solana-account-decoder",
+  "solana-accounts-db",
+@@ -10266,6 +10290,7 @@ dependencies = [
   "crossbeam-channel",
   "crossbeam-utils",
   "dashmap",
@@ -61,7 +77,7 @@ index 96da5bb..d7dcb6d 100644
   "imbl",
   "itertools 0.14.0",
   "libc",
-@@ -10287,6 +10310,7 @@ dependencies = [
+@@ -10287,6 +10312,7 @@ dependencies = [
   "serde_with",
   "shuttle",
   "smallvec",
@@ -89,6 +105,18 @@ index 4231f07..42a1ad9 100644
  solana-syscalls = { path = "syscalls", version = "=4.2.2", default-features = false, features = ["agave-unstable-api"] }
  solana-system-interface = { version = ">=3.2.0,<3.3.0", features = ["alloc", "bincode", "serde", "wincode"] }
  solana-system-program = { path = "programs/system", version = "=4.2.2", features = ["agave-unstable-api"] }
+diff --git a/core/Cargo.toml b/core/Cargo.toml
+index 57ac688..6392ac8 100644
+--- a/core/Cargo.toml
++++ b/core/Cargo.toml
+@@ -92,6 +92,7 @@ serde_bytes = { workspace = true }
+ shaq = { workspace = true }
+ signal-hook = { workspace = true }
+ slab = { workspace = true }
++sol-drivechain-bmm = { workspace = true }
+ solana-account = { workspace = true }
+ solana-accounts-db = { workspace = true }
+ solana-address-lookup-table-interface = { workspace = true }
 diff --git a/core/src/banking_stage/consumer.rs b/core/src/banking_stage/consumer.rs
 index 9c1e4e5..c709057 100644
 --- a/core/src/banking_stage/consumer.rs
@@ -116,6 +144,557 @@ index 9c1e4e5..c709057 100644
          let transaction_counts = LeaderProcessedTransactionCounts {
              processed_count: processed_counts.processed_transactions_count,
              processed_with_successful_result_count: processed_counts
+diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
+new file mode 100644
+index 0000000..2c4b54f
+--- /dev/null
++++ b/core/src/bmm_fork_choice.rs
+@@ -0,0 +1,211 @@
++//! sol-drivechain: BMM checkpoints select the fork and move the root. The
++//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
++//! the bank forks and the eCash view, and it keeps the anchors on disk.
++
++use {
++    crate::consensus::{Tower, heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice},
++    sol_drivechain_bmm::{
++        fork_choice::{self, Checkpoint, Choice, ForkBank, Restart, Saved},
++        view,
++    },
++    solana_clock::Slot,
++    solana_pubkey::Pubkey,
++    solana_runtime::{bank::Bank, bank_forks::BankForks},
++    std::{
++        io,
++        path::{Path, PathBuf},
++        sync::{Arc, RwLock},
++    },
++};
++
++/// The exit code of a validator that must start again from an older snapshot.
++pub const RESTART_EXIT_CODE: i32 = 75;
++
++pub(crate) struct BmmForkChoice {
++    ledger: PathBuf,
++    archives: Option<PathBuf>,
++    saved: Saved,
++    key: Option<(u64, Slot, usize, Slot)>,
++    banks: Vec<ForkBank>,
++    checkpoints: Vec<Checkpoint>,
++    tip_height: u64,
++    choice: Choice,
++    missing_archive_height: u64,
++}
++
++impl BmmForkChoice {
++    /// `None` when BMM does not control the forks.
++    pub(crate) fn new(ledger: &Path, archives: Option<PathBuf>) -> Option<Self> {
++        if !fork_choice::enabled() {
++            return None;
++        }
++        // The validator read this file at start, so an error here is new.
++        let saved = Saved::load(ledger)
++            .unwrap_or_else(|error| panic!("cannot read the BMM fork choice state: {error}"));
++        info!(
++            "BMM fork choice is on with {:?} and {} anchors",
++            fork_choice::params(),
++            saved.anchors.len()
++        );
++        Some(Self {
++            ledger: ledger.to_path_buf(),
++            archives,
++            saved,
++            key: None,
++            banks: Vec::new(),
++            checkpoints: Vec::new(),
++            tip_height: 0,
++            choice: Choice::default(),
++            missing_archive_height: 0,
++        })
++    }
++
++    /// Computes the choice again when the eCash view or the frozen banks
++    /// changed. `frozen_banks` holds the root and the frozen banks above it.
++    pub(crate) fn update(&mut self, root: Slot, frozen_banks: &[Arc<Bank>]) {
++        let generation = view().generation();
++        let highest = frozen_banks.iter().map(|bank| bank.slot()).max().unwrap_or(root);
++        let key = (generation, root, frozen_banks.len(), highest);
++        if self.key == Some(key) {
++            return;
++        }
++        let Some((tip_height, checkpoints)) = view().checkpoints() else {
++            return;
++        };
++        self.key = Some(key);
++        self.banks = frozen_banks
++            .iter()
++            .map(|bank| ForkBank {
++                slot: bank.slot(),
++                hash: bank.hash().to_bytes(),
++                parent: (bank.slot() != root).then(|| bank.parent_slot()),
++            })
++            .collect();
++        self.checkpoints = checkpoints;
++        self.tip_height = tip_height;
++        let choice = fork_choice::choose(
++            root,
++            &self.banks,
++            &self.checkpoints,
++            tip_height,
++            fork_choice::params(),
++        );
++        if choice.head != self.choice.head || choice.fallback != self.choice.fallback {
++            info!(
++                "BMM fork choice: head {:?} with {} checkpoints above root {root}, eCash tip \
++                 {tip_height}, fallback {}",
++                choice.head, choice.count, choice.fallback
++            );
++        }
++        self.choice = choice;
++    }
++
++    /// True when the stake votes move the root, because no checkpoint came for
++    /// the fallback span.
++    pub(crate) fn tower_roots(&self) -> bool {
++        self.choice.fallback
++    }
++
++    /// The heaviest bank under the BMM head, or `None` when no checkpoint is
++    /// above the root.
++    pub(crate) fn heaviest(
++        &self,
++        fork_choice: &HeaviestSubtreeForkChoice,
++        bank_forks: &RwLock<BankForks>,
++    ) -> Option<Arc<Bank>> {
++        let bank_forks = bank_forks.read().unwrap();
++        let head = bank_forks.get(self.choice.head?)?;
++        let (slot, _) = fork_choice.best_slot(&(head.slot(), head.hash()))?;
++        bank_forks.get(slot)
++    }
++
++    /// The anchor that the root must move to. It writes the new anchors to
++    /// disk first, so a restart still knows them.
++    pub(crate) fn take_new_root(&mut self, root: Slot) -> io::Result<Option<Slot>> {
++        let Some(new_root) = self.choice.new_root.filter(|new_root| *new_root > root) else {
++            return Ok(None);
++        };
++        let mut saved = self.saved.clone();
++        saved.anchors.extend(self.choice.new_anchors.iter().copied());
++        fork_choice::retain_anchors(&mut saved.anchors, self.tip_height);
++        saved.pruned.extend(self.choice.new_pruned.iter().copied());
++        fork_choice::retain_pruned(&mut saved.pruned, self.tip_height);
++        saved.store(&self.ledger)?;
++        self.saved = saved;
++        self.choice.new_root = None;
++        Ok(Some(new_root))
++    }
++
++    /// A restart request when a branch that splits behind the root holds more
++    /// checkpoints. It writes the request to disk. The request waits while no
++    /// snapshot archive at or below the anchor exists.
++    pub(crate) fn take_restart(&mut self, root: Slot) -> io::Result<Option<Restart>> {
++        let Some(restart) = fork_choice::restart(
++            root,
++            &self.banks,
++            &self.checkpoints,
++            self.tip_height,
++            &self.saved.anchors,
++            &self.saved.pruned,
++            fork_choice::params(),
++            self.saved.handled_height,
++        ) else {
++            return Ok(None);
++        };
++        let archive = match &self.archives {
++            Some(archives) => {
++                fork_choice::highest_full_archive_at_or_below(archives, restart.anchor.slot)?
++            }
++            None => None,
++        };
++        if archive.is_none() {
++            if restart.trigger_height > self.missing_archive_height {
++                self.missing_archive_height = restart.trigger_height;
++                error!(
++                    "BMM checkpoints up to eCash height {} select a branch behind root {root}, \
++                     but no snapshot archive is at or below anchor slot {}. The validator \
++                     cannot roll back.",
++                    restart.trigger_height, restart.anchor.slot
++                );
++            }
++            return Ok(None);
++        }
++        let mut saved = self.saved.clone();
++        saved.handled_height = restart.trigger_height;
++        saved.restart_to = Some(restart.anchor.slot);
++        saved.store(&self.ledger)?;
++        self.saved = saved;
++        Ok(Some(restart))
++    }
++}
++
++/// Makes the tower fit the bank forks root `root` and the bank `heaviest`.
++/// When the last vote is on the path of `heaviest`, only the tower root moves
++/// up. Else the tower starts again from the lockouts that `heaviest` holds,
++/// and the result is the old last vote: a vote at or below it would repeat an
++/// older vote in gossip.
++pub(crate) fn fit_tower(
++    tower: &mut Tower,
++    node: &Pubkey,
++    vote_account: &Pubkey,
++    root: Slot,
++    heaviest: &Bank,
++) -> Option<Slot> {
++    let last = tower.last_voted_slot();
++    let on_path = last.is_none_or(|last| {
++        last == heaviest.slot() || heaviest.ancestors.contains_key(&last)
++    });
++    if on_path {
++        if tower.root() < root {
++            tower.set_bmm_root(root);
++        }
++        return None;
++    }
++    warn!(
++        "BMM fork choice resets the tower: last vote {last:?}, tower root {}, root {root}, bank {}",
++        tower.root(),
++        heaviest.slot()
++    );
++    *tower = Tower::new(node, vote_account, root, heaviest);
++    last
++}
+diff --git a/core/src/consensus.rs b/core/src/consensus.rs
+index e59db19..46bf7c3 100644
+--- a/core/src/consensus.rs
++++ b/core/src/consensus.rs
+@@ -841,15 +841,13 @@ impl Tower {
+             }
+         }
+ 
++        // sol-drivechain: BMM moves the bank forks root, so a fork can split
++        // below the tower root.
+         if let Some(root_slot) = vote_state.root_slot
+             && slot != root_slot
++            && !ancestors.contains(&root_slot)
+         {
+-            // This case should never happen because bank forks purges all
+-            // non-descendants of the root every time root is set
+-            assert!(
+-                ancestors.contains(&root_slot),
+-                "ancestors: {ancestors:?}, slot: {slot} root: {root_slot}"
+-            );
++            return true;
+         }
+ 
+         false
+@@ -1675,6 +1673,13 @@ impl Tower {
+         self.vote_state.votes.retain(should_retain);
+     }
+ 
++    /// sol-drivechain: moves the tower root up to a BMM root that is on the
++    /// path of the last vote, and drops the votes at or below it.
++    pub fn set_bmm_root(&mut self, root: Slot) {
++        self.initialize_root(root);
++        self.initialize_lockouts(|vote| vote.slot() > root);
++    }
++
+     // Updating root is needed to correctly restore from newly-saved tower for the next
+     // boot
+     fn initialize_root(&mut self, root: Slot) {
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+index 5180157..09cd825 100644
+--- a/core/src/lib.rs
++++ b/core/src/lib.rs
+@@ -12,6 +12,7 @@ pub mod admin_rpc_post_init;
+ pub mod banking_simulation;
+ pub mod banking_stage;
+ pub mod banking_trace;
++pub mod bmm_fork_choice;
+ pub(crate) mod block_creation_loop;
+ pub mod cluster_info_vote_listener;
+ pub mod cluster_slots_service;
+diff --git a/core/src/replay_stage.rs b/core/src/replay_stage.rs
+index c5a5f4d..a1f7858 100644
+--- a/core/src/replay_stage.rs
++++ b/core/src/replay_stage.rs
+@@ -4,6 +4,7 @@ use {
+         banking_stage::update_bank_forks_and_poh_recorder_for_new_tpu_bank,
+         banking_trace::BankingTracer,
+         block_creation_loop::ReplayHighestFrozen,
++        bmm_fork_choice::{self, BmmForkChoice},
+         cluster_info_vote_listener::{
+             DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver, VoteTracker,
+         },
+@@ -874,6 +875,13 @@ impl ReplayStage {
+                 r_bank_forks.working_bank()
+             };
+             let mut last_threshold_failure_slot = 0;
++            let mut bmm_vote_floor: Slot = 0;
++            let mut bmm_choice = BmmForkChoice::new(
++                blockstore.ledger_path(),
++                snapshot_controller
++                    .as_ref()
++                    .map(|controller| controller.snapshot_config().full_snapshot_archives_dir.clone()),
++            );
+             // Thread pool to (maybe) replay multiple threads in parallel
+             let replay_mode = if replay_forks_threads.get() == 1 {
+                 ForkReplayMode::Serial
+@@ -1255,9 +1263,37 @@ impl ReplayStage {
+                     compute_slot_stats_time.stop();
+ 
+                     let mut select_forks_time = Measure::start("select_forks_time");
+-                    let (heaviest_bank, heaviest_bank_on_same_voted_fork) = tbft_structs
++                    let (mut heaviest_bank, mut heaviest_bank_on_same_voted_fork) = tbft_structs
+                         .heaviest_subtree_fork_choice
+                         .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
++                    if let Some(bmm) = bmm_choice.as_mut() {
++                        bmm.update(forks_root, &frozen_banks);
++                        let bmm_heaviest =
++                            bmm.heaviest(&tbft_structs.heaviest_subtree_fork_choice, &bank_forks);
++                        if let Some(bmm_heaviest) = &bmm_heaviest
++                            && bmm_heaviest.slot() != heaviest_bank.slot()
++                        {
++                            info!(
++                                "BMM fork choice selects slot {} over slot {}",
++                                bmm_heaviest.slot(),
++                                heaviest_bank.slot()
++                            );
++                            heaviest_bank = bmm_heaviest.clone();
++                            heaviest_bank_on_same_voted_fork = Some(heaviest_bank.clone());
++                        }
++                        if (tower.root() < forks_root || bmm_heaviest.is_some())
++                            && let Some(last) = bmm_fork_choice::fit_tower(
++                                &mut tower,
++                                &my_pubkey,
++                                &vote_account,
++                                forks_root,
++                                &heaviest_bank,
++                            )
++                        {
++                            bmm_vote_floor = bmm_vote_floor.max(last);
++                            heaviest_bank_on_same_voted_fork = Some(heaviest_bank.clone());
++                        }
++                    }
+                     select_forks_time.stop();
+ 
+                     let mut select_vote_and_reset_forks_time =
+@@ -1276,6 +1312,9 @@ impl ReplayStage {
+                         &latest_validator_votes_for_frozen_banks,
+                         &tbft_structs.heaviest_subtree_fork_choice,
+                     );
++                    // sol-drivechain: after a tower reset, a vote at or below the old last
++                    // vote would repeat an older vote in gossip.
++                    let vote_bank = vote_bank.filter(|(bank, _)| bank.slot() > bmm_vote_floor);
+                     select_vote_and_reset_forks_time.stop();
+ 
+                     if vote_bank.is_none() {
+@@ -1347,8 +1386,33 @@ impl ReplayStage {
+                             wait_to_vote_slot,
+                             migration_status.as_ref(),
+                             &mut tbft_structs,
++                            bmm_choice
++                                .as_ref()
++                                .is_none_or(BmmForkChoice::tower_roots),
+                         );
+                     }
++                    if let Some(bmm) = bmm_choice.as_mut()
++                        && let Some(last) = Self::handle_bmm_root(
++                            bmm,
++                            &mut tower,
++                            &my_pubkey,
++                            &vote_account,
++                            &bank_forks,
++                            &mut progress,
++                            &blockstore,
++                            &leader_schedule_cache,
++                            snapshot_controller.as_deref(),
++                            rpc_subscriptions.as_deref(),
++                            &block_commitment_cache,
++                            &bank_notification_sender,
++                            &mut has_new_vote_been_rooted,
++                            &mut tracked_vote_transactions,
++                            &drop_bank_sender,
++                            &mut tbft_structs,
++                        )
++                    {
++                        bmm_vote_floor = bmm_vote_floor.max(last);
++                    }
+                     voting_time.stop();
+ 
+                     let mut reset_bank_time = Measure::start("reset_bank");
+@@ -2038,6 +2102,13 @@ impl ReplayStage {
+         // confirmed, what happens then? Should probably keep track of dumped list and skip things
+         // in `duplicate_slots_to_repair` that have already been dumped. Add test.
+         duplicate_slots_to_repair.retain(|duplicate_slot, correct_hash| {
++            // sol-drivechain: a BMM switch prunes forks that the stake confirmed.
++            // Such a slot is gone on purpose, so there is nothing to repair.
++            if sol_drivechain_bmm::fork_choice::enabled()
++                && bank_forks.read().unwrap().get(*duplicate_slot).is_none()
++            {
++                return false;
++            }
+             // Should not dump duplicate slots if there is currently a poh bank building
+             // on top of that slot, as BankingStage might still be referencing/touching that state
+             // concurrently.
+@@ -2911,7 +2982,11 @@ impl ReplayStage {
+                 ("leader", next_leader_id.to_string(), String),
+             );
+ 
+-            if !Self::check_propagation_for_start_leader(poh_slot, parent_slot, progress_map) {
++            // sol-drivechain: a leader on a branch that BMM selects keeps its
++            // slots, even when a stake majority ignores its blocks.
++            if !sol_drivechain_bmm::fork_choice::enabled()
++                && !Self::check_propagation_for_start_leader(poh_slot, parent_slot, progress_map)
++            {
+                 let latest_unconfirmed_leader_slot = progress_map
+                     .get_latest_leader_slot_must_exist(parent_slot)
+                     .expect(
+@@ -3047,16 +3122,21 @@ impl ReplayStage {
+         wait_to_vote_slot: Option<Slot>,
+         migration_status: &MigrationStatus,
+         tbft_structs: &mut TowerBFTStructures,
++        tower_roots: bool,
+     ) {
+         assert!(!migration_status.is_alpenglow_enabled());
+         if bank.is_empty() {
+             datapoint_info!("replay_stage-voted_empty_bank", ("slot", bank.slot(), i64));
+         }
+         trace!("handle votable bank {}", bank.slot());
+-        let new_root = tower.record_bank_vote(bank).filter(|root| {
+-            // We do not root during the migration - post genesis rooting is handled by votor
+-            migration_status.should_report_commitment_or_root(*root)
+-        });
++        let new_root = tower
++            .record_bank_vote(bank)
++            .filter(|root| {
++                // We do not root during the migration - post genesis rooting is handled by votor
++                migration_status.should_report_commitment_or_root(*root)
++            })
++            // sol-drivechain: BMM checkpoints move the root, except in a fallback.
++            .filter(|_| tower_roots);
+ 
+         if let Some(new_root) = new_root {
+             let highest_super_majority_root = Some(
+@@ -4955,6 +5035,90 @@ impl ReplayStage {
+         duplicate_confirmed_forks
+     }
+ 
++    /// sol-drivechain: moves the root to the BMM anchor, and stops the process
++    /// when a branch that splits behind the root holds more checkpoints.
++    #[allow(clippy::too_many_arguments)]
++    fn handle_bmm_root(
++        bmm: &mut BmmForkChoice,
++        tower: &mut Tower,
++        my_pubkey: &Pubkey,
++        vote_account: &Pubkey,
++        bank_forks: &RwLock<BankForks>,
++        progress: &mut ProgressMap,
++        blockstore: &Blockstore,
++        leader_schedule_cache: &Arc<LeaderScheduleCache>,
++        snapshot_controller: Option<&SnapshotController>,
++        rpc_subscriptions: Option<&RpcSubscriptions>,
++        block_commitment_cache: &Arc<RwLock<BlockCommitmentCache>>,
++        bank_notification_sender: &Option<BankNotificationSenderConfig>,
++        has_new_vote_been_rooted: &mut bool,
++        tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
++        drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
++        tbft_structs: &mut TowerBFTStructures,
++    ) -> Option<Slot> {
++        let root = bank_forks.read().unwrap().root();
++        match bmm.take_restart(root) {
++            Ok(None) => (),
++            Ok(Some(restart)) => {
++                error!(
++                    "BMM checkpoints up to eCash height {} select a branch that splits behind root \
++                     {root}. The validator stops, and its next start loads a snapshot at or \
++                     below anchor slot {}.",
++                    restart.trigger_height, restart.anchor.slot
++                );
++                std::process::exit(bmm_fork_choice::RESTART_EXIT_CODE);
++            }
++            Err(error) => error!("cannot write the BMM restart request: {error}"),
++        }
++        let new_root = match bmm.take_new_root(root) {
++            Ok(Some(new_root)) => new_root,
++            Ok(None) => return None,
++            Err(error) => {
++                error!("cannot write the BMM anchors, so the root stays at {root}: {error}");
++                return None;
++            }
++        };
++        info!("BMM fork choice moves the root from {root} to anchor {new_root}");
++        let highest_super_majority_root = Some(
++            block_commitment_cache
++                .read()
++                .unwrap()
++                .highest_super_majority_root(),
++        );
++        let parent_slot = bank_forks
++            .read()
++            .unwrap()
++            .get(new_root)
++            .map(|bank| bank.parent_slot())
++            .unwrap_or(root);
++        Self::check_and_handle_new_root(
++            my_pubkey,
++            parent_slot,
++            new_root,
++            bank_forks,
++            progress,
++            blockstore,
++            leader_schedule_cache,
++            snapshot_controller,
++            rpc_subscriptions,
++            highest_super_majority_root,
++            bank_notification_sender,
++            has_new_vote_been_rooted,
++            tracked_vote_transactions,
++            drop_bank_sender,
++            tbft_structs,
++        );
++        let heaviest = bank_forks.read().unwrap().get(
++            tbft_structs
++                .heaviest_subtree_fork_choice
++                .best_overall_slot()
++                .0,
++        );
++        heaviest.and_then(|heaviest| {
++            bmm_fork_choice::fit_tower(tower, my_pubkey, vote_account, new_root, &heaviest)
++        })
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     /// A wrapper around `root_utils::check_and_handle_new_root` which:
+     /// - calls into `root_utils::set_bank_forks_root`
+diff --git a/core/src/validator.rs b/core/src/validator.rs
+index 400ad25..c0bdb9d 100644
+--- a/core/src/validator.rs
++++ b/core/src/validator.rs
+@@ -2159,6 +2159,14 @@ fn post_process_restored_tower(
+ 
+     let restored_tower = restored_tower.and_then(|tower| {
+         let root_bank = bank_forks.root_bank();
++        // sol-drivechain: the tower root runs ahead of a BMM root, and such a
++        // tower would stop the votes until its last vote.
++        if sol_drivechain_bmm::fork_choice::enabled() && tower.root() > root_bank.slot() {
++            should_require_tower = false;
++            return Err(crate::consensus::TowerError::FatallyInconsistent(
++                "the tower root is above the BMM root",
++            ));
++        }
+         let slot_history = root_bank
+             .get_slot_history()
+             .expect("slot history must exist");
+@@ -2588,7 +2596,10 @@ impl<'a> ProcessBlockStore<'a> {
+         // Load and post process tower
+         let tower = {
+             let restored_tower = Tower::restore(self.config.tower_storage.as_ref(), self.id);
+-            if let Ok(tower) = &restored_tower {
++            // sol-drivechain: BMM moves the root, so the tower root must not.
++            if let Ok(tower) = &restored_tower
++                && !sol_drivechain_bmm::fork_choice::enabled()
++            {
+                 // reconciliation attempt 1 of 2 with tower
+                 reconcile_blockstore_roots_with_external_source(
+                     ExternalRootSource::Tower(tower.root()),
 diff --git a/fee/Cargo.toml b/fee/Cargo.toml
 index 518446a..0c12fa3 100644
 --- a/fee/Cargo.toml
@@ -278,6 +857,67 @@ index d92fd92..b6879fc 100644
          let vote_account = vote_state::create_v4_account_with_authorized(
              identity_pubkey,
              identity_pubkey,
+diff --git a/ledger/Cargo.toml b/ledger/Cargo.toml
+index 0405082..db3a19a 100644
+--- a/ledger/Cargo.toml
++++ b/ledger/Cargo.toml
+@@ -59,6 +59,7 @@ rayon = { workspace = true }
+ reed-solomon-erasure = { workspace = true, features = ["simd-accel"] }
+ scopeguard = { workspace = true }
+ serde = { workspace = true }
++sol-drivechain-bmm = { workspace = true }
+ solana-account = { workspace = true }
+ solana-account-decoder = { workspace = true }
+ solana-accounts-db = { workspace = true }
+diff --git a/ledger/src/blockstore.rs b/ledger/src/blockstore.rs
+index 15cb02f..65b52c8 100644
+--- a/ledger/src/blockstore.rs
++++ b/ledger/src/blockstore.rs
+@@ -5356,6 +5356,28 @@ impl Blockstore {
+         Ok(())
+     }
+ 
++    /// Removes every root above `slot`, so the next start replays the forks
++    /// above it. Returns the removed roots. sol-drivechain restarts with this
++    /// after BMM checkpoints select a branch that splits behind the root.
++    pub fn remove_roots_above(&self, slot: Slot) -> Result<Vec<Slot>> {
++        let removed: Vec<Slot> = self
++            .rooted_slot_iterator(slot.saturating_add(1))?
++            .collect();
++        let mut write_batch = self.get_write_batch()?;
++        for rooted_slot in &removed {
++            self.roots_cf.delete_in_batch(&mut write_batch, *rooted_slot);
++        }
++        self.write_batch(write_batch)?;
++        let max_root = self
++            .roots_cf
++            .iter(IteratorMode::End)?
++            .next()
++            .map(|(rooted_slot, _)| rooted_slot)
++            .unwrap_or(0);
++        self.max_root.store(max_root, Ordering::Relaxed);
++        Ok(removed)
++    }
++
+     pub fn mark_slots_as_if_rooted_normally_at_startup(
+         &self,
+         slots: Vec<(Slot, Option<Hash>)>,
+diff --git a/ledger/src/blockstore_processor.rs b/ledger/src/blockstore_processor.rs
+index beafe9f..65745ac 100644
+--- a/ledger/src/blockstore_processor.rs
++++ b/ledger/src/blockstore_processor.rs
+@@ -2455,7 +2455,10 @@ fn load_frozen_forks(
+             // If we've reached the last known root in blockstore, start looking
+             // for newer cluster confirmed roots
+             let new_root_bank = {
+-                if bank_forks.read().unwrap().root() >= max_root {
++                // sol-drivechain: BMM checkpoints move the root, not the stake.
++                if bank_forks.read().unwrap().root() >= max_root
++                    && !sol_drivechain_bmm::fork_choice::enabled()
++                {
+                     supermajority_root_from_vote_accounts(
+                         bank.total_epoch_stake(),
+                         &bank.vote_accounts(),
 diff --git a/reserved-account-keys/Cargo.toml b/reserved-account-keys/Cargo.toml
 index 1432f72..e77c934 100644
 --- a/reserved-account-keys/Cargo.toml
@@ -915,12 +1555,885 @@ index 0000000..4a3af6f
 +        assert_eq!(decoded, reply);
 +    }
 +}
+diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
+new file mode 100644
+index 0000000..69a5e1a
+--- /dev/null
++++ b/sol-drivechain-bmm/src/fork_choice.rs
+@@ -0,0 +1,867 @@
++//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
++//! the Solana root.
++//!
++//! A checkpoint is an eCash block whose BMM commitment names a frozen Solana
++//! bank by its bank hash. The branch with the most checkpoints above the root
++//! wins. A tie goes to the lower bank hash. The root moves to the newest
++//! checkpoint on the winning branch with `root_depth` eCash blocks on top.
++//! When no commitment comes for `fallback_blocks` eCash blocks, the root
++//! follows the stake votes again. A commitment for an absent bank also stops
++//! the fallback, because its bank can still arrive.
++
++use {
++    crate::{BlockHash, Commitment},
++    std::{
++        collections::{HashMap, HashSet},
++        fs,
++        io::{self, Write},
++        path::{Path, PathBuf},
++        sync::atomic::{AtomicBool, AtomicU64, Ordering},
++    },
++};
++
++pub type Slot = u64;
++
++/// The hash of a frozen bank, as `Bank::hash` gives it.
++pub type BankHash = [u8; 32];
++
++/// K, the eCash blocks on top of a checkpoint before it becomes a root.
++pub const DEFAULT_ROOT_DEPTH: u64 = 2;
++
++/// L, the eCash blocks without a checkpoint before the root follows the stake
++/// votes.
++pub const DEFAULT_FALLBACK_BLOCKS: u64 = 6;
++
++/// The anchors stay this many eCash blocks below the tip, the same window that
++/// the view reads at start.
++const ANCHOR_WINDOW: u64 = 4032;
++
++/// The file in the ledger directory that keeps the anchors and the restart
++/// request.
++pub const STATE_FILE: &str = "bmm-fork-choice";
++
++/// The directory in the ledger directory that takes the snapshot archives
++/// above a restart slot.
++pub const SET_ASIDE_DIR: &str = "bmm-set-aside";
++
++static ENABLED: AtomicBool = AtomicBool::new(false);
++static ROOT_DEPTH: AtomicU64 = AtomicU64::new(DEFAULT_ROOT_DEPTH);
++static FALLBACK_BLOCKS: AtomicU64 = AtomicU64::new(DEFAULT_FALLBACK_BLOCKS);
++
++/// Lets BMM checkpoints select the fork and move the root.
++pub fn enable(params: Params) {
++    ROOT_DEPTH.store(params.root_depth, Ordering::Relaxed);
++    FALLBACK_BLOCKS.store(params.fallback_blocks, Ordering::Relaxed);
++    ENABLED.store(true, Ordering::Relaxed);
++}
++
++/// True when BMM checkpoints select the fork and move the root.
++pub fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// The values that `enable` set.
++pub fn params() -> Params {
++    Params {
++        root_depth: ROOT_DEPTH.load(Ordering::Relaxed),
++        fallback_blocks: FALLBACK_BLOCKS.load(Ordering::Relaxed),
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Params {
++    pub root_depth: u64,
++    pub fallback_blocks: u64,
++}
++
++impl Default for Params {
++    fn default() -> Self {
++        Self {
++            root_depth: DEFAULT_ROOT_DEPTH,
++            fallback_blocks: DEFAULT_FALLBACK_BLOCKS,
++        }
++    }
++}
++
++/// A frozen bank at or above the root. The root has no parent.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct ForkBank {
++    pub slot: Slot,
++    pub hash: BankHash,
++    pub parent: Option<Slot>,
++}
++
++/// An eCash block of the active chain with a BMM commitment.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Checkpoint {
++    pub height: u64,
++    pub block_hash: BlockHash,
++    pub commitment: Commitment,
++}
++
++/// A checkpoint whose bank became a root. The bank leaves the fork tree, so
++/// the node keeps this record of it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Anchor {
++    pub slot: Slot,
++    pub bank_hash: BankHash,
++    pub height: u64,
++    pub block_hash: BlockHash,
++}
++
++impl Anchor {
++    /// True when the active eCash chain still holds this checkpoint.
++    pub fn is_active(&self, checkpoints: &[Checkpoint]) -> bool {
++        checkpoints.iter().any(|checkpoint| {
++            checkpoint.height == self.height
++                && checkpoint.block_hash == self.block_hash
++                && checkpoint.commitment == self.bank_hash
++        })
++    }
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct Choice {
++    /// The newest checkpoint bank on the branch with the most checkpoints
++    /// above the root.
++    pub head: Option<Slot>,
++    /// The checkpoints above the root on that branch.
++    pub count: usize,
++    /// The newest checkpoint bank on that branch with `root_depth` eCash
++    /// blocks on top, when it is above the root.
++    pub new_root: Option<Slot>,
++    /// The checkpoints at or below `new_root` and above the root.
++    pub new_anchors: Vec<Anchor>,
++    /// The checkpoints for banks that the move to `new_root` prunes. They
++    /// lost the fork choice, so they can never ask for a restart.
++    pub new_pruned: Vec<Checkpoint>,
++    /// No commitment came for `fallback_blocks` eCash blocks.
++    pub fallback: bool,
++}
++
++/// Selects the branch and the next root from the fork tree and the active
++/// eCash chain.
++pub fn choose(
++    root: Slot,
++    banks: &[ForkBank],
++    checkpoints: &[Checkpoint],
++    tip_height: u64,
++    params: Params,
++) -> Choice {
++    let tree = Tree::new(banks);
++    let matched: Vec<(Checkpoint, Slot)> = checkpoints
++        .iter()
++        .filter_map(|checkpoint| {
++            tree.slot_of(&checkpoint.commitment)
++                .map(|slot| (*checkpoint, slot))
++        })
++        .collect();
++
++    let fallback = checkpoints
++        .iter()
++        .map(|checkpoint| checkpoint.height)
++        .max()
++        .is_none_or(|height| tip_height.saturating_sub(height) >= params.fallback_blocks);
++
++    let mut direct: HashMap<Slot, usize> = HashMap::new();
++    for (_, slot) in matched.iter().filter(|(_, slot)| *slot > root) {
++        let count = direct.entry(*slot).or_default();
++        *count = count.saturating_add(1);
++    }
++    let mut counts: HashMap<Slot, usize> = HashMap::new();
++    let head = direct
++        .keys()
++        .map(|slot| (*slot, tree.count(*slot, root, &direct, &mut counts)))
++        .max_by(|(a_slot, a_count), (b_slot, b_count)| {
++            a_count
++                .cmp(b_count)
++                .then_with(|| tree.hash(*b_slot).cmp(&tree.hash(*a_slot)))
++        });
++    let Some((head, count)) = head else {
++        return Choice {
++            fallback,
++            ..Choice::default()
++        };
++    };
++
++    let path: HashSet<Slot> = tree.path(head, root).collect();
++    let deep_enough = |checkpoint: &Checkpoint| {
++        tip_height.saturating_sub(checkpoint.height) >= params.root_depth
++    };
++    let new_root = matched
++        .iter()
++        .filter(|(checkpoint, slot)| path.contains(slot) && deep_enough(checkpoint))
++        .map(|(_, slot)| *slot)
++        .max();
++    let new_pruned = new_root
++        .map(|new_root| {
++            matched
++                .iter()
++                .filter(|(_, slot)| {
++                    *slot > root && !path.contains(slot) && !tree.descends(*slot, new_root)
++                })
++                .map(|(checkpoint, _)| *checkpoint)
++                .collect()
++        })
++        .unwrap_or_default();
++    let new_anchors = new_root
++        .map(|new_root| {
++            matched
++                .iter()
++                .filter(|(_, slot)| *slot <= new_root && path.contains(slot))
++                .map(|(checkpoint, slot)| Anchor {
++                    slot: *slot,
++                    bank_hash: checkpoint.commitment,
++                    height: checkpoint.height,
++                    block_hash: checkpoint.block_hash,
++                })
++                .collect()
++        })
++        .unwrap_or_default();
++    Choice {
++        head: Some(head),
++        count,
++        new_root,
++        new_anchors,
++        new_pruned,
++        fallback,
++    }
++}
++
++/// A request to restart from a snapshot at or below `anchor.slot`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Restart {
++    pub anchor: Anchor,
++    /// The highest eCash height of the unknown checkpoints that caused it.
++    pub trigger_height: u64,
++}
++
++/// Finds a branch that splits behind the root and holds more checkpoints than
++/// this branch.
++///
++/// The root can pass the newest active anchor in two ways: the stake votes
++/// moved it in a fallback, or an eCash reorg removed a newer anchor. If more
++/// checkpoints above that anchor name banks that this node does not know, the
++/// node must replay from a snapshot at or below the anchor. Unknown
++/// checkpoints at or below `handled_height` caused an earlier restart, and
++/// they cannot cause another. `pruned` holds checkpoints for banks that lost
++/// the fork choice here.
++#[allow(clippy::too_many_arguments)]
++pub fn restart(
++    root: Slot,
++    banks: &[ForkBank],
++    checkpoints: &[Checkpoint],
++    tip_height: u64,
++    anchors: &[Anchor],
++    pruned: &[Checkpoint],
++    params: Params,
++    handled_height: u64,
++) -> Option<Restart> {
++    let anchor = *anchors
++        .iter()
++        .filter(|anchor| anchor.is_active(checkpoints))
++        .max_by_key(|anchor| anchor.slot)?;
++    if anchor.slot >= root {
++        return None;
++    }
++    let known: HashSet<BankHash> = banks
++        .iter()
++        .map(|bank| bank.hash)
++        .chain(anchors.iter().map(|anchor| anchor.bank_hash))
++        .chain(pruned.iter().map(|checkpoint| checkpoint.commitment))
++        .collect();
++    let above = checkpoints
++        .iter()
++        .filter(|checkpoint| checkpoint.height > anchor.height);
++    let lost: HashSet<BankHash> = pruned.iter().map(|checkpoint| checkpoint.commitment).collect();
++    let ours = above
++        .clone()
++        .filter(|checkpoint| {
++            known.contains(&checkpoint.commitment) && !lost.contains(&checkpoint.commitment)
++        })
++        .count();
++    let theirs: Vec<u64> = above
++        .filter(|checkpoint| {
++            !known.contains(&checkpoint.commitment)
++                && tip_height.saturating_sub(checkpoint.height) >= params.root_depth
++        })
++        .map(|checkpoint| checkpoint.height)
++        .collect();
++    let trigger_height = *theirs.iter().max()?;
++    (theirs.len() > ours && trigger_height > handled_height).then_some(Restart {
++        anchor,
++        trigger_height,
++    })
++}
++
++/// Keeps the pruned checkpoints that the view can still hold.
++pub fn retain_pruned(pruned: &mut Vec<Checkpoint>, tip_height: u64) {
++    let floor = tip_height.saturating_sub(ANCHOR_WINDOW);
++    pruned.retain(|checkpoint| checkpoint.height >= floor);
++    pruned.sort_by_key(|checkpoint| checkpoint.height);
++    pruned.dedup();
++}
++
++/// Keeps the anchors that the view can still check, and always the newest.
++pub fn retain_anchors(anchors: &mut Vec<Anchor>, tip_height: u64) {
++    let newest = anchors.iter().map(|anchor| anchor.slot).max();
++    let floor = tip_height.saturating_sub(ANCHOR_WINDOW);
++    anchors.retain(|anchor| anchor.height >= floor || Some(anchor.slot) == newest);
++    anchors.sort_by_key(|anchor| (anchor.slot, anchor.height));
++    anchors.dedup();
++}
++
++struct Tree {
++    parent: HashMap<Slot, Option<Slot>>,
++    hash: HashMap<Slot, BankHash>,
++    slot: HashMap<BankHash, Slot>,
++}
++
++impl Tree {
++    fn new(banks: &[ForkBank]) -> Self {
++        Self {
++            parent: banks.iter().map(|bank| (bank.slot, bank.parent)).collect(),
++            hash: banks.iter().map(|bank| (bank.slot, bank.hash)).collect(),
++            slot: banks.iter().map(|bank| (bank.hash, bank.slot)).collect(),
++        }
++    }
++
++    fn slot_of(&self, hash: &BankHash) -> Option<Slot> {
++        self.slot.get(hash).copied()
++    }
++
++    fn hash(&self, slot: Slot) -> BankHash {
++        self.hash.get(&slot).copied().unwrap_or_default()
++    }
++
++    /// True when `slot` is `ancestor` or one of its descendants.
++    fn descends(&self, slot: Slot, ancestor: Slot) -> bool {
++        self.path(slot, ancestor.saturating_sub(1))
++            .any(|step| step == ancestor)
++    }
++
++    /// The slots from `slot` down to the slot above `root`.
++    fn path(&self, slot: Slot, root: Slot) -> impl Iterator<Item = Slot> + '_ {
++        std::iter::successors(Some(slot), |slot| {
++            self.parent.get(slot).copied().flatten()
++        })
++        .take_while(move |slot| *slot > root)
++    }
++
++    /// The checkpoints on the path from `slot` down to the slot above `root`.
++    fn count(
++        &self,
++        slot: Slot,
++        root: Slot,
++        direct: &HashMap<Slot, usize>,
++        memo: &mut HashMap<Slot, usize>,
++    ) -> usize {
++        let mut unknown = Vec::new();
++        let mut base = 0;
++        for step in self.path(slot, root) {
++            if let Some(known) = memo.get(&step) {
++                base = *known;
++                break;
++            }
++            unknown.push(step);
++        }
++        for step in unknown.into_iter().rev() {
++            base = base.saturating_add(direct.get(&step).copied().unwrap_or_default());
++            memo.insert(step, base);
++        }
++        base
++    }
++}
++
++/// What a node keeps on disk between two runs.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct Saved {
++    pub anchors: Vec<Anchor>,
++    pub pruned: Vec<Checkpoint>,
++    /// Unknown checkpoints up to this eCash height caused a restart before.
++    pub handled_height: u64,
++    /// The next start must load a snapshot at or below this slot.
++    pub restart_to: Option<Slot>,
++}
++
++impl Saved {
++    /// Reads the state file in `ledger`. A missing file gives the default.
++    pub fn load(ledger: &Path) -> io::Result<Self> {
++        let text = match fs::read_to_string(ledger.join(STATE_FILE)) {
++            Ok(text) => text,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
++            Err(error) => return Err(error),
++        };
++        Self::parse(&text).ok_or_else(|| {
++            io::Error::new(
++                io::ErrorKind::InvalidData,
++                format!("{} holds a bad line", ledger.join(STATE_FILE).display()),
++            )
++        })
++    }
++
++    /// Writes the state file in `ledger` in one rename.
++    pub fn store(&self, ledger: &Path) -> io::Result<()> {
++        let path = ledger.join(STATE_FILE);
++        let temp = ledger.join(format!("{STATE_FILE}.tmp"));
++        let mut file = fs::File::create(&temp)?;
++        file.write_all(self.render().as_bytes())?;
++        file.sync_all()?;
++        fs::rename(temp, path)
++    }
++
++    fn render(&self) -> String {
++        let mut text = String::new();
++        for anchor in &self.anchors {
++            text.push_str(&format!(
++                "anchor {} {} {} {}\n",
++                anchor.slot,
++                to_hex(&anchor.bank_hash),
++                anchor.height,
++                to_hex(&anchor.block_hash)
++            ));
++        }
++        for checkpoint in &self.pruned {
++            text.push_str(&format!(
++                "pruned {} {} {}\n",
++                checkpoint.height,
++                to_hex(&checkpoint.commitment),
++                to_hex(&checkpoint.block_hash)
++            ));
++        }
++        text.push_str(&format!("handled {}\n", self.handled_height));
++        if let Some(slot) = self.restart_to {
++            text.push_str(&format!("restart {slot}\n"));
++        }
++        text
++    }
++
++    fn parse(text: &str) -> Option<Self> {
++        let mut saved = Self::default();
++        for line in text.lines().filter(|line| !line.trim().is_empty()) {
++            let words: Vec<&str> = line.split_whitespace().collect();
++            match words.as_slice() {
++                ["anchor", slot, bank_hash, height, block_hash] => saved.anchors.push(Anchor {
++                    slot: slot.parse().ok()?,
++                    bank_hash: from_hex(bank_hash)?,
++                    height: height.parse().ok()?,
++                    block_hash: from_hex(block_hash)?,
++                }),
++                ["pruned", height, commitment, block_hash] => saved.pruned.push(Checkpoint {
++                    height: height.parse().ok()?,
++                    block_hash: from_hex(block_hash)?,
++                    commitment: from_hex(commitment)?,
++                }),
++                ["handled", height] => saved.handled_height = height.parse().ok()?,
++                ["restart", slot] => saved.restart_to = Some(slot.parse().ok()?),
++                _ => return None,
++            }
++        }
++        Some(saved)
++    }
++}
++
++fn to_hex(bytes: &[u8; 32]) -> String {
++    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
++}
++
++fn from_hex(text: &str) -> Option<[u8; 32]> {
++    if text.len() != 64 {
++        return None;
++    }
++    let mut bytes = [0u8; 32];
++    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
++        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
++    }
++    Some(bytes)
++}
++
++/// The slot of a full snapshot archive, or the slot of an incremental one.
++fn archive_slot(name: &str) -> Option<Slot> {
++    let rest = name
++        .strip_prefix("incremental-snapshot-")
++        .map(|rest| rest.split_once('-').map(|(_, rest)| rest))
++        .unwrap_or_else(|| name.strip_prefix("snapshot-"))?;
++    rest.split_once('-')?.0.parse().ok()
++}
++
++fn is_full_archive(name: &str) -> bool {
++    name.starts_with("snapshot-")
++}
++
++/// The highest full snapshot archive slot in `dir` at or below `slot`.
++pub fn highest_full_archive_at_or_below(dir: &Path, slot: Slot) -> io::Result<Option<Slot>> {
++    let mut highest = None;
++    for entry in fs::read_dir(dir)? {
++        let name = entry?.file_name();
++        let Some(name) = name.to_str() else { continue };
++        if let Some(archive) = archive_slot(name).filter(|_| is_full_archive(name))
++            && archive <= slot
++        {
++            highest = highest.max(Some(archive));
++        }
++    }
++    Ok(highest)
++}
++
++/// Moves every snapshot archive in `dirs` above `slot` into `aside`, so the
++/// next start loads an older one. Nothing gets deleted. Returns the moved
++/// paths.
++pub fn set_aside_archives_above(
++    dirs: &[&Path],
++    slot: Slot,
++    aside: &Path,
++) -> io::Result<Vec<PathBuf>> {
++    let mut moved = Vec::new();
++    for dir in dirs {
++        for entry in fs::read_dir(dir)? {
++            let path = entry?.path();
++            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
++                continue;
++            };
++            if archive_slot(name).is_some_and(|archive| archive > slot) {
++                fs::create_dir_all(aside)?;
++                let target = aside.join(name);
++                fs::rename(&path, &target)?;
++                moved.push(target);
++            }
++        }
++    }
++    Ok(moved)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const PARAMS: Params = Params {
++        root_depth: 2,
++        fallback_blocks: 6,
++    };
++
++    fn hash(slot: Slot) -> BankHash {
++        let mut hash = [0u8; 32];
++        hash[..8].copy_from_slice(&slot.to_be_bytes());
++        hash[31] = 1;
++        hash
++    }
++
++    /// A fork tree from `(slot, parent)` pairs. The first pair is the root.
++    fn tree(pairs: &[(Slot, Slot)]) -> Vec<ForkBank> {
++        pairs
++            .iter()
++            .enumerate()
++            .map(|(index, (slot, parent))| ForkBank {
++                slot: *slot,
++                hash: hash(*slot),
++                parent: (index > 0).then_some(*parent),
++            })
++            .collect()
++    }
++
++    fn block(height: u64) -> BlockHash {
++        [height as u8; 32]
++    }
++
++    fn checkpoint(height: u64, slot: Slot) -> Checkpoint {
++        Checkpoint {
++            height,
++            block_hash: block(height),
++            commitment: hash(slot),
++        }
++    }
++
++    fn unknown(height: u64) -> Checkpoint {
++        Checkpoint {
++            height,
++            block_hash: block(height),
++            commitment: [0xee; 32],
++        }
++    }
++
++    fn anchor(height: u64, slot: Slot) -> Anchor {
++        Anchor {
++            slot,
++            bank_hash: hash(slot),
++            height,
++            block_hash: block(height),
++        }
++    }
++
++    /// Root 10. Branch A: 11, 12, 13. Branch B: 14, 15 off 10.
++    fn split() -> Vec<ForkBank> {
++        tree(&[(10, 0), (11, 10), (12, 11), (13, 12), (14, 10), (15, 14)])
++    }
++
++    #[test]
++    fn no_checkpoint_gives_no_head_and_a_fallback() {
++        let choice = choose(10, &split(), &[], 100, PARAMS);
++        assert_eq!(choice.head, None);
++        assert!(choice.fallback);
++    }
++
++    #[test]
++    fn the_branch_with_more_checkpoints_wins() {
++        let checkpoints = [checkpoint(100, 11), checkpoint(101, 12), checkpoint(102, 15)];
++        let choice = choose(10, &split(), &checkpoints, 102, PARAMS);
++        assert_eq!(choice.head, Some(12));
++        assert_eq!(choice.count, 2);
++    }
++
++    #[test]
++    fn a_newer_checkpoint_on_the_same_branch_moves_the_head() {
++        let checkpoints = [checkpoint(100, 11), checkpoint(101, 13)];
++        let choice = choose(10, &split(), &checkpoints, 101, PARAMS);
++        assert_eq!(choice.head, Some(13));
++        assert_eq!(choice.count, 2);
++    }
++
++    #[test]
++    fn a_tie_goes_to_the_lower_bank_hash() {
++        let checkpoints = [checkpoint(100, 13), checkpoint(101, 15)];
++        let choice = choose(10, &split(), &checkpoints, 101, PARAMS);
++        assert_eq!(choice.head, Some(13));
++        assert!(hash(13) < hash(15));
++        let reversed = [checkpoint(100, 15), checkpoint(101, 13)];
++        assert_eq!(choose(10, &split(), &reversed, 101, PARAMS).head, Some(13));
++    }
++
++    #[test]
++    fn checkpoints_at_or_below_the_root_do_not_count() {
++        let checkpoints = [checkpoint(100, 10), checkpoint(101, 10), checkpoint(102, 15)];
++        let choice = choose(10, &split(), &checkpoints, 102, PARAMS);
++        assert_eq!(choice.head, Some(15));
++        assert_eq!(choice.count, 1);
++    }
++
++    #[test]
++    fn a_checkpoint_for_an_absent_bank_stays_pending_until_the_bank_freezes() {
++        let checkpoints = [checkpoint(100, 12), checkpoint(101, 15), checkpoint(102, 16)];
++        let before = choose(10, &split(), &checkpoints, 102, PARAMS);
++        assert_eq!(before.head, Some(12));
++        let mut banks = split();
++        banks.push(ForkBank {
++            slot: 16,
++            hash: hash(16),
++            parent: Some(15),
++        });
++        let after = choose(10, &banks, &checkpoints, 102, PARAMS);
++        assert_eq!(after.head, Some(16));
++        assert_eq!(after.count, 2);
++    }
++
++    #[test]
++    fn the_root_moves_to_the_newest_checkpoint_with_k_blocks_on_top() {
++        let checkpoints = [checkpoint(100, 11), checkpoint(101, 12), checkpoint(102, 13)];
++        let choice = choose(10, &split(), &checkpoints, 103, PARAMS);
++        assert_eq!(choice.head, Some(13));
++        assert_eq!(choice.new_root, Some(12));
++        assert_eq!(choice.new_anchors, vec![anchor(100, 11), anchor(101, 12)]);
++    }
++
++    #[test]
++    fn the_root_stays_without_a_deep_checkpoint() {
++        let checkpoints = [checkpoint(100, 11)];
++        let choice = choose(10, &split(), &checkpoints, 101, PARAMS);
++        assert_eq!(choice.head, Some(11));
++        assert_eq!(choice.new_root, None);
++        assert!(choice.new_anchors.is_empty());
++    }
++
++    #[test]
++    fn a_deep_checkpoint_on_the_losing_branch_never_becomes_a_root() {
++        let checkpoints = [checkpoint(100, 15), checkpoint(105, 11), checkpoint(106, 12)];
++        let choice = choose(10, &split(), &checkpoints, 106, PARAMS);
++        assert_eq!(choice.head, Some(12));
++        assert_eq!(choice.new_root, None);
++    }
++
++    #[test]
++    fn the_fallback_starts_after_l_blocks_without_a_checkpoint() {
++        let checkpoints = [checkpoint(100, 11)];
++        assert!(!choose(10, &split(), &checkpoints, 105, PARAMS).fallback);
++        assert!(choose(10, &split(), &checkpoints, 106, PARAMS).fallback);
++    }
++
++    #[test]
++    fn a_checkpoint_below_the_root_counts_for_the_fallback() {
++        let checkpoints = [checkpoint(100, 5)];
++        assert!(!choose(10, &split(), &checkpoints, 103, PARAMS).fallback);
++        assert!(choose(10, &split(), &checkpoints, 106, PARAMS).fallback);
++    }
++
++    #[test]
++    fn a_pending_checkpoint_stops_the_fallback() {
++        let checkpoints = [checkpoint(90, 11), unknown(104)];
++        assert!(!choose(10, &split(), &checkpoints, 105, PARAMS).fallback);
++        assert!(choose(10, &split(), &checkpoints, 110, PARAMS).fallback);
++    }
++
++    #[test]
++    fn no_restart_while_the_root_is_the_newest_anchor() {
++        let checkpoints = [checkpoint(100, 10), unknown(101), unknown(102)];
++        let anchors = [anchor(100, 10)];
++        assert_eq!(
++            restart(10, &split(), &checkpoints, 105, &anchors, &[], PARAMS, 0),
++            None
++        );
++    }
++
++    #[test]
++    fn more_unknown_checkpoints_past_the_anchor_ask_for_a_restart() {
++        let checkpoints = [checkpoint(100, 5), unknown(101), unknown(102)];
++        let anchors = [anchor(100, 5)];
++        assert_eq!(
++            restart(10, &split(), &checkpoints, 105, &anchors, &[], PARAMS, 0),
++            Some(Restart {
++                anchor: anchor(100, 5),
++                trigger_height: 102,
++            })
++        );
++    }
++
++    #[test]
++    fn a_restart_waits_for_k_blocks_on_the_unknown_checkpoints() {
++        let checkpoints = [checkpoint(100, 5), unknown(101), unknown(102)];
++        let anchors = [anchor(100, 5)];
++        assert_eq!(
++            restart(10, &split(), &checkpoints, 102, &anchors, &[], PARAMS, 0),
++            None
++        );
++    }
++
++    #[test]
++    fn our_own_checkpoints_past_the_anchor_hold_off_a_restart() {
++        let checkpoints = [checkpoint(100, 5), unknown(101), checkpoint(102, 12)];
++        let anchors = [anchor(100, 5)];
++        assert_eq!(
++            restart(10, &split(), &checkpoints, 105, &anchors, &[], PARAMS, 0),
++            None
++        );
++    }
++
++    #[test]
++    fn handled_checkpoints_cause_no_second_restart() {
++        let checkpoints = [checkpoint(100, 5), unknown(101), unknown(102)];
++        let anchors = [anchor(100, 5)];
++        assert_eq!(
++            restart(10, &split(), &checkpoints, 105, &anchors, &[], PARAMS, 102),
++            None
++        );
++    }
++
++    #[test]
++    fn a_reorged_anchor_falls_back_to_the_older_active_anchor() {
++        let checkpoints = [checkpoint(100, 5), unknown(101), unknown(102), unknown(103)];
++        let anchors = [anchor(100, 5), anchor(101, 10)];
++        assert_eq!(
++            restart(10, &split(), &checkpoints, 106, &anchors, &[], PARAMS, 0),
++            Some(Restart {
++                anchor: anchor(100, 5),
++                trigger_height: 103,
++            })
++        );
++    }
++
++    #[test]
++    fn a_checkpoint_that_lost_here_asks_for_no_restart() {
++        let checkpoints = [checkpoint(100, 5), unknown(101), unknown(102)];
++        let anchors = [anchor(100, 5)];
++        let pruned = [unknown(101), unknown(102)];
++        assert_eq!(
++            restart(10, &split(), &checkpoints, 105, &anchors, &pruned, PARAMS, 0),
++            None
++        );
++    }
++
++    #[test]
++    fn a_root_move_lists_the_checkpoints_that_it_prunes() {
++        let checkpoints = [checkpoint(100, 15), checkpoint(101, 11), checkpoint(102, 12)];
++        let choice = choose(10, &split(), &checkpoints, 104, PARAMS);
++        assert_eq!(choice.new_root, Some(12));
++        assert_eq!(choice.new_pruned, vec![checkpoint(100, 15)]);
++    }
++
++    #[test]
++    fn a_root_move_keeps_checkpoints_above_the_new_root() {
++        let checkpoints = [checkpoint(100, 11), checkpoint(101, 12), checkpoint(102, 13)];
++        let choice = choose(10, &split(), &checkpoints, 103, PARAMS);
++        assert_eq!(choice.new_root, Some(12));
++        assert!(choice.new_pruned.is_empty());
++    }
++
++    #[test]
++    fn no_anchor_means_no_restart() {
++        let checkpoints = [unknown(101), unknown(102)];
++        assert_eq!(restart(10, &split(), &checkpoints, 105, &[], &[], PARAMS, 0), None);
++    }
++
++    #[test]
++    fn retain_keeps_the_window_and_the_newest_anchor() {
++        let mut anchors = vec![anchor(10, 50), anchor(5000, 70), anchor(9, 90)];
++        retain_anchors(&mut anchors, 6000);
++        assert_eq!(anchors, vec![anchor(5000, 70), anchor(9, 90)]);
++    }
++
++    #[test]
++    fn the_state_file_keeps_anchors_and_the_restart() {
++        let dir = std::env::temp_dir().join(format!("bmm-state-{}", std::process::id()));
++        fs::create_dir_all(&dir).unwrap();
++        assert_eq!(Saved::load(&dir).unwrap(), Saved::default());
++        let saved = Saved {
++            anchors: vec![anchor(100, 5), anchor(101, 12)],
++            pruned: vec![checkpoint(102, 15)],
++            handled_height: 102,
++            restart_to: Some(5),
++        };
++        saved.store(&dir).unwrap();
++        assert_eq!(Saved::load(&dir).unwrap(), saved);
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_bad_state_file_is_an_error() {
++        let dir = std::env::temp_dir().join(format!("bmm-bad-state-{}", std::process::id()));
++        fs::create_dir_all(&dir).unwrap();
++        fs::write(dir.join(STATE_FILE), "anchor 1 2\n").unwrap();
++        assert!(Saved::load(&dir).is_err());
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn archive_names_give_their_slots() {
++        assert_eq!(archive_slot("snapshot-2050003-DZwd.tar.zst"), Some(2050003));
++        assert_eq!(
++            archive_slot("incremental-snapshot-2050003-2074803-8Ea.tar.zst"),
++            Some(2074803)
++        );
++        assert_eq!(archive_slot("genesis.tar.bz2"), None);
++        assert_eq!(archive_slot("rocksdb"), None);
++    }
++
++    #[test]
++    fn archives_above_the_slot_move_aside_and_older_ones_stay() {
++        let dir = std::env::temp_dir().join(format!("bmm-archives-{}", std::process::id()));
++        let aside = dir.join(SET_ASIDE_DIR);
++        fs::create_dir_all(&dir).unwrap();
++        for name in [
++            "snapshot-100-a.tar.zst",
++            "snapshot-200-b.tar.zst",
++            "incremental-snapshot-100-150-c.tar.zst",
++            "incremental-snapshot-100-180-d.tar.zst",
++            "genesis.tar.bz2",
++        ] {
++            fs::write(dir.join(name), b"").unwrap();
++        }
++        assert_eq!(highest_full_archive_at_or_below(&dir, 170).unwrap(), Some(100));
++        assert_eq!(highest_full_archive_at_or_below(&dir, 99).unwrap(), None);
++        let moved = set_aside_archives_above(&[&dir], 170, &aside).unwrap();
++        assert_eq!(moved.len(), 2);
++        assert!(dir.join("snapshot-100-a.tar.zst").exists());
++        assert!(dir.join("incremental-snapshot-100-150-c.tar.zst").exists());
++        assert!(aside.join("snapshot-200-b.tar.zst").exists());
++        assert!(aside.join("incremental-snapshot-100-180-d.tar.zst").exists());
++        assert!(dir.join("genesis.tar.bz2").exists());
++        fs::remove_dir_all(&dir).unwrap();
++    }
++}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..c99da14
+index 0000000..08071ff
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,466 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -931,6 +2444,7 @@ index 0000000..c99da14
 +
 +#[cfg(feature = "poller")]
 +mod enforcer;
++pub mod fork_choice;
 +#[cfg(feature = "poller")]
 +mod poller;
 +
@@ -1046,6 +2560,8 @@ index 0000000..c99da14
 +    active: BTreeMap<u64, Block>,
 +    /// The lowest height that a caller asked for and the view did not hold.
 +    wanted_low: Option<u64>,
++    /// Goes up by one at each change of the active chain.
++    generation: u64,
 +}
 +
 +/// The active eCash chain of the local enforcer.
@@ -1126,6 +2642,7 @@ index 0000000..c99da14
 +        if state.wanted_low.is_some_and(|wanted| wanted >= lowest) {
 +            state.wanted_low = None;
 +        }
++        state.generation = state.generation.wrapping_add(1);
 +        self.changed.notify_all();
 +    }
 +
@@ -1144,6 +2661,7 @@ index 0000000..c99da14
 +        {
 +            state.wanted_low = None;
 +        }
++        state.generation = state.generation.wrapping_add(1);
 +        self.changed.notify_all();
 +    }
 +
@@ -1170,6 +2688,29 @@ index 0000000..c99da14
 +    /// The lowest height that a caller asked for and the view did not hold.
 +    pub fn wanted_low(&self) -> Option<u64> {
 +        self.state.lock().unwrap().wanted_low
++    }
++
++    /// A number that changes at each change of the active chain.
++    pub fn generation(&self) -> u64 {
++        self.state.lock().unwrap().generation
++    }
++
++    /// The tip height and every active block with a commitment, from low to
++    /// high, or `None` before the first read from the enforcer.
++    pub fn checkpoints(&self) -> Option<(u64, Vec<fork_choice::Checkpoint>)> {
++        let state = self.state.lock().unwrap();
++        let checkpoints = state
++            .active
++            .iter()
++            .filter_map(|(height, block)| {
++                block.commitment.map(|commitment| fork_choice::Checkpoint {
++                    height: *height,
++                    block_hash: block.hash,
++                    commitment,
++                })
++            })
++            .collect();
++        Some((state.tip_height?, checkpoints))
 +    }
 +}
 +
@@ -1333,6 +2874,21 @@ index 0000000..c99da14
 +            Some(Some([104; 32]))
 +        );
 +        handle.join().unwrap();
++    }
++
++    #[test]
++    fn checkpoints_list_the_blocks_with_a_commitment() {
++        let view = BmmView::default();
++        assert_eq!(view.checkpoints(), None);
++        let before = view.generation();
++        view.replace_from(&chain(100, 105, 0));
++        assert_ne!(view.generation(), before);
++        let (tip, checkpoints) = view.checkpoints().unwrap();
++        assert_eq!(tip, 105);
++        let heights: Vec<u64> = checkpoints.iter().map(|checkpoint| checkpoint.height).collect();
++        assert_eq!(heights, vec![100, 102, 104]);
++        assert_eq!(checkpoints[1].block_hash, hash(102));
++        assert_eq!(checkpoints[1].commitment, [102; 32]);
 +    }
 +
 +    #[test]
@@ -1821,10 +3377,10 @@ index 2b88952..d0ee0e7 100644
  solana-accounts-db = { workspace = true }
  solana-clap-utils = { workspace = true }
 diff --git a/validator/src/commands/run/args.rs b/validator/src/commands/run/args.rs
-index a1683a4..dde7d04 100644
+index a1683a4..0f130a8 100644
 --- a/validator/src/commands/run/args.rs
 +++ b/validator/src/commands/run/args.rs
-@@ -499,6 +499,36 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a,
+@@ -499,6 +499,58 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a,
              .hidden(hidden_unless_forced())
              .help("Skip the check for PoH speed."),
      )
@@ -1858,14 +3414,45 @@ index a1683a4..dde7d04 100644
 +                 run. Every validator of the cluster must use the same value.",
 +            ),
 +    )
++    .arg(
++        Arg::with_name("bmm_root_depth")
++            .long("bmm-root-depth")
++            .value_name("K")
++            .takes_value(true)
++            .default_value("2")
++            .help(
++                "The eCash blocks that must be on top of a BMM checkpoint before its Solana \
++                 block becomes a root.",
++            ),
++    )
++    .arg(
++        Arg::with_name("bmm_fallback_blocks")
++            .long("bmm-fallback-blocks")
++            .value_name("L")
++            .takes_value(true)
++            .default_value("6")
++            .help(
++                "After this many eCash blocks without a BMM checkpoint, the stake votes move \
++                 the root again.",
++            ),
++    )
      .arg(
          Arg::with_name("no_os_network_limits_test")
              .hidden(hidden_unless_forced())
 diff --git a/validator/src/commands/run/execute.rs b/validator/src/commands/run/execute.rs
-index 683eebb..48c98e7 100644
+index 683eebb..81e7cb9 100644
 --- a/validator/src/commands/run/execute.rs
 +++ b/validator/src/commands/run/execute.rs
-@@ -271,6 +271,16 @@ pub fn execute(
+@@ -107,7 +107,7 @@ pub fn execute(
+         unsafe { env::set_var("RUST_BACKTRACE", "1") }
+     }
+ 
+-    let run_args = RunArgs::from_clap_arg_match(matches)?;
++    let mut run_args = RunArgs::from_clap_arg_match(matches)?;
+ 
+     let cli::thread_args::NumThreadConfig {
+         accounts_db_background_threads,
+@@ -271,6 +271,20 @@ pub fn execute(
  
      let exit = Arc::new(AtomicBool::new(false));
  
@@ -1875,6 +3462,10 @@ index 683eebb..48c98e7 100644
 +        let sidechain_slot = value_t_or_exit!(matches, "bmm_sidechain_slot", u8);
 +        sol_drivechain_bmm::start_poller(enforcer_url.to_owned(), sidechain_slot, exit.clone())
 +            .map_err(|error| format!("cannot start the BMM poller: {error}"))?;
++        sol_drivechain_bmm::fork_choice::enable(sol_drivechain_bmm::fork_choice::Params {
++            root_depth: value_t_or_exit!(matches, "bmm_root_depth", u64),
++            fallback_blocks: value_t_or_exit!(matches, "bmm_fallback_blocks", u64),
++        });
 +    } else {
 +        warn!("no --bmm-enforcer-url: this validator cannot check a block with a BMM settle");
 +    }
@@ -1882,3 +3473,73 @@ index 683eebb..48c98e7 100644
      #[cfg(not(target_os = "linux"))]
      let _ = config;
  
+@@ -922,6 +936,12 @@ pub fn execute(
+     let mut ledger_lock = ledger_lockfile(&ledger_path);
+     let _ledger_write_guard = lock_ledger(&ledger_path, &mut ledger_lock);
+ 
++    if sol_drivechain_bmm::fork_choice::enabled()
++        && prepare_bmm_restart(&ledger_path, &mut validator_config)?
++    {
++        run_args.rpc_bootstrap_config.no_snapshot_fetch = true;
++    }
++
+     let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));
+     let admin_service_post_init = Arc::new(RwLock::new(None));
+     let (rpc_to_plugin_manager_sender, rpc_to_plugin_manager_receiver) =
+@@ -1142,6 +1162,56 @@ pub fn execute(
+     Ok(())
+ }
+ 
++/// sol-drivechain: when BMM asked for a restart, puts every snapshot archive
++/// above the anchor slot aside and removes the roots above it. Then the start
++/// loads an older snapshot and replays the forks above it. Returns true when it
++/// prepared a restart.
++fn prepare_bmm_restart(
++    ledger_path: &Path,
++    validator_config: &mut ValidatorConfig,
++) -> Result<bool, String> {
++    use sol_drivechain_bmm::fork_choice::{SET_ASIDE_DIR, Saved, set_aside_archives_above};
++
++    let mut saved = Saved::load(ledger_path)
++        .map_err(|error| format!("cannot read the BMM fork choice state: {error}"))?;
++    let Some(slot) = saved.restart_to else {
++        return Ok(false);
++    };
++    let snapshot_config = &validator_config.snapshot_config;
++    let mut archive_dirs = vec![snapshot_config.full_snapshot_archives_dir.as_path()];
++    if snapshot_config.incremental_snapshot_archives_dir
++        != snapshot_config.full_snapshot_archives_dir
++    {
++        archive_dirs.push(snapshot_config.incremental_snapshot_archives_dir.as_path());
++    }
++    let seconds = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_err(|error| format!("the clock is before 1970: {error}"))?
++        .as_secs();
++    let aside = ledger_path.join(SET_ASIDE_DIR).join(seconds.to_string());
++    let moved = set_aside_archives_above(&archive_dirs, slot, &aside)
++        .map_err(|error| format!("cannot put the snapshot archives above slot {slot} aside: {error}"))?;
++    let blockstore = solana_ledger::blockstore::Blockstore::open(ledger_path)
++        .map_err(|error| format!("cannot open the blockstore for a BMM restart: {error:?}"))?;
++    let removed = blockstore
++        .remove_roots_above(slot)
++        .map_err(|error| format!("cannot remove the roots above slot {slot}: {error:?}"))?;
++    drop(blockstore);
++    validator_config.use_snapshot_archives_at_startup = UseSnapshotArchivesAtStartup::Always;
++    saved.restart_to = None;
++    saved
++        .store(ledger_path)
++        .map_err(|error| format!("cannot write the BMM fork choice state: {error}"))?;
++    warn!(
++        "BMM restart: the start loads a snapshot at or below slot {slot}. {} archives went to {}, \
++         and {} roots above slot {slot} are gone.",
++        moved.len(),
++        aside.display(),
++        removed.len()
++    );
++    Ok(true)
++}
++
+ // This function is duplicated in ledger-tool/src/main.rs...
+ fn hardforks_of(matches: &ArgMatches<'_>, name: &str) -> Option<Vec<Slot>> {
+     if matches.is_present(name) {

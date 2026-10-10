@@ -18,6 +18,11 @@
 #    local enforcer. The bank checks each `settle_bmm` against it, and the
 #    syscall `sol_get_bmm_commitment` answers the bridge from it.
 # 6. The validator takes `--bmm-enforcer-url` and `--bmm-sidechain-slot`.
+# 7. BMM checkpoints select the fork and move the root. After
+#    `--bmm-fallback-blocks` eCash blocks without a commitment, the stake votes
+#    move the root. A branch that splits behind the root and holds more
+#    checkpoints stops the validator with exit code 75, and the next start
+#    loads an older snapshot.
 #
 # To move to a later Agave, raise AGAVE_TAG and run this again.
 set -euo pipefail
