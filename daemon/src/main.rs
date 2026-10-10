@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use sol_drivechain_daemon::enforcer::{Declaration, Enforcer};
 use sol_drivechain_daemon::network::PegNetwork;
 use sol_drivechain_daemon::proto::mainchain::AckAllProposalsPolicy;
-use sol_drivechain_daemon::{address, bmm, bridge, peg, seed};
+use sol_drivechain_daemon::{address, bmm, bridge, credit, peg, seed};
 use solana_sdk::{pubkey::Pubkey, signature::read_keypair_file, signer::Signer as _};
 
 /// The lamport count of one SOL.
@@ -158,12 +158,26 @@ enum Command {
         /// The keypair that pays the rent of the config account.
         #[arg(long)]
         payer: PathBuf,
-        /// The keypair whose pubkey credits every deposit.
+        /// The keypair whose pubkey marks a withdrawal paid.
         #[arg(long)]
         oracle: PathBuf,
         /// The first eCash height that BMM settles, normally the current tip.
         #[arg(long)]
         bmm_start_height: u64,
+        /// The deposits up to this eCash height count as credited. It
+        /// defaults to the BMM start height.
+        #[arg(long)]
+        deposit_start_height: Option<u64>,
+        /// D, the eCash confirmations before a credit. It defaults to the
+        /// count of the network.
+        #[arg(long)]
+        deposit_confirmations: Option<u64>,
+        #[arg(long, default_value = "regtest")]
+        network: PegNetwork,
+        /// A BMM checkpoint at eCash height H counts only when its bank
+        /// credited every deposit through H minus this lag.
+        #[arg(long, default_value_t = 100)]
+        deposit_lag: u64,
     },
     /// Burns lamports and asks the mainchain to pay a Bitcoin address.
     Withdraw {
@@ -192,6 +206,23 @@ enum Command {
         solana_rpc_url: String,
         #[arg(long)]
         program_id: String,
+        /// Reads the branch that the validator follows, not the confirmed one.
+        #[arg(long)]
+        processed: bool,
+    },
+    /// Credits the deposits of each eCash height in order. Anyone can run it.
+    Credit {
+        #[arg(long, default_value = "http://127.0.0.1:50051")]
+        enforcer_url: String,
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+        #[arg(long)]
+        slot: u8,
+        #[arg(long)]
+        program_id: String,
+        /// The keypair that signs and pays the fees.
+        #[arg(long)]
+        payer: PathBuf,
     },
     /// Prints the address of one account of a BIP39 seed phrase.
     SeedPubkey {
@@ -289,6 +320,10 @@ enum Command {
         /// Bids, but keeps the pair back.
         #[arg(long)]
         withhold: bool,
+        /// Bids for this Solana bank hash, in base58, and not for the newest
+        /// recorded block. A test uses it.
+        #[arg(long, conflicts_with = "commitment")]
+        block: Option<String>,
     },
     /// Publishes one BMM pair to a validator.
     PublishPair {
@@ -354,7 +389,8 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         interval_secs: u64,
     },
-    /// Runs the peg. It credits deposits and it proposes withdrawal bundles.
+    /// Runs the peg. It credits deposits, it proposes withdrawal bundles, and
+    /// it marks the paid withdrawals.
     Run {
         #[arg(long, default_value = "regtest")]
         network: PegNetwork,
@@ -368,9 +404,6 @@ enum Command {
         program_id: String,
         #[arg(long)]
         oracle: PathBuf,
-        /// Defaults to the safe count of the network.
-        #[arg(long)]
-        confirmations: Option<u32>,
         #[arg(long, default_value_t = 30)]
         bundle_interval_secs: u64,
     },
@@ -432,6 +465,8 @@ enum CliError {
     Peg(#[from] peg::PegError),
     #[error(transparent)]
     Bmm(#[from] bmm::BmmError),
+    #[error(transparent)]
+    Credit(#[from] credit::CreditError),
 }
 
 fn main() -> Result<(), CliError> {
@@ -627,7 +662,7 @@ fn main() -> Result<(), CliError> {
                                     deposit.sequence_number, deposit.value_sats
                                 );
                                 match parsed {
-                                    Ok(pubkey) => println!("  the daemon credits {pubkey}"),
+                                    Ok(pubkey) => println!("  the target is {pubkey}"),
                                     Err(error) => println!("  the address fails: {error}"),
                                 }
                             }
@@ -646,8 +681,19 @@ fn main() -> Result<(), CliError> {
             payer,
             oracle,
             bmm_start_height,
+            deposit_start_height,
+            deposit_confirmations,
+            network,
+            deposit_lag,
         } => {
             let program_id = parse_pubkey(&program_id)?;
+            let start = bridge::Start {
+                bmm_start_height,
+                deposit_start_height: deposit_start_height.unwrap_or(bmm_start_height),
+                deposit_confirmations: deposit_confirmations
+                    .unwrap_or_else(|| u64::from(network.default_confirmations())),
+                deposit_lag,
+            };
             let payer_key = read_keypair_file(&payer).map_err(|_| CliError::NoOracleKey {
                 path: payer.clone(),
             })?;
@@ -659,11 +705,15 @@ fn main() -> Result<(), CliError> {
                 &program_id,
                 &payer_key.pubkey(),
                 &oracle_key.pubkey(),
-                bmm_start_height,
+                start,
             );
             send_one(&rpc, &payer_key, instruction, "initialize")?;
             println!("the bridge config holds oracle {}", oracle_key.pubkey());
             println!("BMM settles from eCash height {bmm_start_height}");
+            println!(
+                "credits start after eCash height {} with {} confirmations and lag {}",
+                start.deposit_start_height, start.deposit_confirmations, start.deposit_lag
+            );
             println!("config {}", bridge::config_pda(&program_id).0);
             Ok(())
         }
@@ -710,9 +760,17 @@ fn main() -> Result<(), CliError> {
         Command::BridgeState {
             solana_rpc_url,
             program_id,
+            processed,
         } => {
             let program_id = parse_pubkey(&program_id)?;
-            let rpc = blocking_rpc(&solana_rpc_url);
+            let rpc = if processed {
+                solana_rpc_client::rpc_client::RpcClient::new_with_commitment(
+                    solana_rpc_url,
+                    solana_commitment_config::CommitmentConfig::processed(),
+                )
+            } else {
+                blocking_rpc(&solana_rpc_url)
+            };
             let (config_key, _) = bridge::config_pda(&program_id);
             let (vault_key, _) = bridge::vault_pda(&program_id);
             let data = rpc
@@ -742,7 +800,33 @@ fn main() -> Result<(), CliError> {
             println!("treasury lamports {treasury}");
             println!("bmm next height   {}", config.bmm_next_height);
             println!("bmm paid total    {}", config.bmm_paid_total);
+            println!("credited height   {}", config.credited_height);
+            println!("credit index      {}", config.credit_index);
+            println!("stranded lamports {}", config.stranded_lamports);
+            println!("deposit confirmations {}", config.deposit_confirmations);
+            println!("deposit lag       {}", config.deposit_lag);
             Ok(())
+        }
+        Command::Credit {
+            enforcer_url,
+            solana_rpc_url,
+            slot,
+            program_id,
+            payer,
+        } => {
+            let program_id = parse_pubkey(&program_id)?;
+            let payer_key = read_keypair_file(&payer).map_err(|_| CliError::NoIdentityKey {
+                path: payer.clone(),
+            })?;
+            runtime.block_on(async {
+                let mut enforcer = sol_drivechain_daemon::enforcer::Enforcer::connect(
+                    enforcer_url,
+                    u32::from(slot),
+                )
+                .await?;
+                credit::run(&mut enforcer, solana_rpc_url, program_id, &payer_key).await?;
+                Ok(())
+            })
         }
         Command::SeedPubkey {
             mnemonic_file,
@@ -838,7 +922,6 @@ fn main() -> Result<(), CliError> {
             slot,
             program_id,
             oracle,
-            confirmations,
             bundle_interval_secs,
         } => {
             let program_id = parse_pubkey(&program_id)?;
@@ -851,7 +934,6 @@ fn main() -> Result<(), CliError> {
                 solana_rpc_url,
                 sidechain_id: slot,
                 program_id,
-                confirmations: confirmations.unwrap_or_else(|| network.default_confirmations()),
                 bundle_interval: Duration::from_secs(bundle_interval_secs.max(1)),
             };
             runtime.block_on(peg::run(settings, keypair))?;
@@ -891,6 +973,7 @@ fn main() -> Result<(), CliError> {
             sats,
             commitment,
             withhold,
+            block,
         } => runtime.block_on(async {
             let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
             let mut enforcer = enforcer.open().await?;
@@ -898,10 +981,16 @@ fn main() -> Result<(), CliError> {
             let height = u64::from(tip.1) + 1;
             let pair = match payee {
                 Some(payee) => {
-                    let (slot, block) = bmm::newest_recorded_block(&rpc)
-                        .await?
-                        .ok_or(CliError::EmptyBlockRecord)?;
-                    println!("slot {slot}");
+                    let block = match block {
+                        Some(block) => parse_pubkey(&block)?.to_bytes(),
+                        None => {
+                            let (slot, block) = bmm::newest_recorded_block(&rpc)
+                                .await?
+                                .ok_or(CliError::EmptyBlockRecord)?;
+                            println!("slot {slot}");
+                            block
+                        }
+                    };
                     Some(bmm::Pair {
                         height,
                         block,
@@ -1261,7 +1350,6 @@ mod tests {
         let Command::Run {
             network,
             slot,
-            confirmations,
             bundle_interval_secs,
             ..
         } = cli.command
@@ -1270,7 +1358,6 @@ mod tests {
         };
         assert_eq!(network, PegNetwork::Regtest);
         assert_eq!(slot, 8);
-        assert_eq!(confirmations, None);
         assert_eq!(bundle_interval_secs, 30);
     }
 }

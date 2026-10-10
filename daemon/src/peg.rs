@@ -11,10 +11,9 @@ use solana_sdk::{
 };
 
 use crate::{
-    address, bridge,
+    bridge, credit,
     enforcer::{BundleEvent, Enforcer, PegEvent},
     m6::{self, Payout},
-    pending::PendingDeposits,
     proto::mainchain::WithdrawalBundlePolicy,
 };
 
@@ -24,7 +23,6 @@ pub struct Settings {
     pub solana_rpc_url: String,
     pub sidechain_id: u8,
     pub program_id: Pubkey,
-    pub confirmations: u32,
     pub bundle_interval: Duration,
 }
 
@@ -36,6 +34,8 @@ pub enum PegError {
     Bridge(#[from] crate::bridge::BridgeError),
     #[error(transparent)]
     M6(#[from] crate::m6::M6Error),
+    #[error(transparent)]
+    Credit(#[from] crate::credit::CreditError),
     #[error("the Solana rpc call `{call}` failed")]
     Rpc {
         call: &'static str,
@@ -139,8 +139,7 @@ pub async fn run(settings: Settings, oracle: Keypair) -> Result<(), PegError> {
     enforcer.check_network(settings.network).await?;
     tracing::info!(
         network = settings.network.name(),
-        confirmations = settings.confirmations,
-        "the peg credits a deposit after this many mainchain confirmations"
+        "the peg credits deposits and proposes withdrawal bundles"
     );
     enforcer
         .set_withdrawal_bundle_policy(WithdrawalBundlePolicy::Known)
@@ -157,62 +156,38 @@ pub async fn run(settings: Settings, oracle: Keypair) -> Result<(), PegError> {
         bundle_loop(bundle_enforcer, bundle_rpc, program_id, interval).await
     });
 
-    let result = deposit_loop(&mut enforcer, &rpc, &settings, &oracle).await;
+    let mut credit_enforcer = enforcer.clone();
+    let result = tokio::select! {
+        result = paid_loop(&mut enforcer, &rpc, &settings, &oracle) => result,
+        result = credit::run(
+            &mut credit_enforcer,
+            settings.solana_rpc_url.clone(),
+            program_id,
+            &oracle,
+        ) => result.map_err(PegError::from),
+    };
     bundles.abort();
     result
 }
 
-async fn deposit_loop(
+/// Closes the withdrawal records that a paid bundle covers.
+async fn paid_loop(
     enforcer: &mut Enforcer,
     rpc: &RpcClient,
     settings: &Settings,
     oracle: &Keypair,
 ) -> Result<(), PegError> {
-    let mut pending = PendingDeposits::new(settings.confirmations);
-    // Subscribe before the backfill, so no block can fall between the two. A
-    // block that both carry goes into the queue twice, and the high-water
-    // check in `credit_deposit` skips the second credit.
     let mut stream = enforcer.subscribe_events().await?;
-
-    // The stream starts at the next block, and the queue lives in memory. A
-    // restart would lose every deposit that still waits, and every block that
-    // connected while the daemon was down.
-    let tip = enforcer.chain_tip().await?;
-    let history = enforcer.two_way_peg_data(tip).await?;
-    tracing::info!(blocks = history.len(), %tip, "the daemon replays the peg history");
-    for event in history {
-        if let PegEvent::Connect {
-            height, deposits, ..
-        } = event
-        {
-            for deposit in pending.connect(height, deposits) {
-                credit_deposit(rpc, settings, oracle, &deposit).await?;
-            }
-        }
-    }
-
     while let Some(item) = stream.next().await {
         let response = item.map_err(PegError::Stream)?;
         match crate::enforcer::peg_event(response)? {
             PegEvent::Disconnect { block_hash } => {
                 tracing::warn!(%block_hash, "the mainchain disconnected a block");
-                pending.disconnect();
             }
             PegEvent::Connect {
-                height,
-                deposits,
-                bundles,
-                ..
+                height, bundles, ..
             } => {
-                let ready = pending.connect(height, deposits);
-                tracing::trace!(
-                    height,
-                    waiting = pending.waiting(),
-                    "the daemon read a block"
-                );
-                for deposit in ready {
-                    credit_deposit(rpc, settings, oracle, &deposit).await?;
-                }
+                tracing::trace!(height, "the daemon read a block");
                 for bundle in bundles {
                     close_paid_records(rpc, settings, oracle, bundle).await?;
                 }
@@ -220,75 +195,6 @@ async fn deposit_loop(
         }
     }
     Err(PegError::StreamClosed)
-}
-
-async fn credit_deposit(
-    rpc: &RpcClient,
-    settings: &Settings,
-    oracle: &Keypair,
-    deposit: &crate::enforcer::DepositEvent,
-) -> Result<(), PegError> {
-    let text = match std::str::from_utf8(&deposit.address) {
-        Ok(text) => text,
-        Err(error) => {
-            tracing::warn!(
-                sequence_number = deposit.sequence_number,
-                %error,
-                "the deposit address is not utf8, so the daemon skips it"
-            );
-            return Ok(());
-        }
-    };
-    let recipient = match address::parse_deposit_recipient(text) {
-        Ok(recipient) => recipient,
-        Err(error) => {
-            tracing::warn!(
-                sequence_number = deposit.sequence_number,
-                address = text,
-                %error,
-                "the deposit address does not parse, so the daemon skips it"
-            );
-            return Ok(());
-        }
-    };
-
-    // A replay after a restart sees deposits the bridge credited long ago. The
-    // bridge would refuse them, and the refusal would stop the daemon.
-    let high_water = read_config(rpc, &settings.program_id)
-        .await?
-        .deposit_high_water;
-    if already_credited(deposit.sequence_number, high_water) {
-        tracing::debug!(
-            sequence_number = deposit.sequence_number,
-            high_water,
-            "the bridge already credited this deposit"
-        );
-        return Ok(());
-    }
-
-    let instruction = bridge::deposit_ix(
-        &settings.program_id,
-        &oracle.pubkey(),
-        &recipient,
-        deposit.sequence_number,
-        deposit.value_sats,
-    );
-    send(rpc, oracle, instruction, "deposit").await?;
-    tracing::info!(
-        sequence_number = deposit.sequence_number,
-        value_sats = deposit.value_sats,
-        %recipient,
-        "the daemon credited a deposit"
-    );
-    Ok(())
-}
-
-/// True when the bridge already applied this mainchain sequence number.
-///
-/// The bridge holds the lowest number a deposit may still use, and it moves
-/// only forward.
-fn already_credited(sequence_number: u64, high_water: u64) -> bool {
-    sequence_number < high_water
 }
 
 async fn close_paid_records(
@@ -374,28 +280,6 @@ async fn send(
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_number_below_the_high_water_is_already_credited() {
-        assert!(already_credited(4, 5));
-        assert!(already_credited(0, 1));
-    }
-
-    #[test]
-    fn the_high_water_itself_is_still_open() {
-        // The bridge stores the lowest number a deposit may still use.
-        assert!(!already_credited(5, 5));
-    }
-
-    #[test]
-    fn a_number_above_the_high_water_is_open() {
-        // A paid withdrawal also moves the mainchain counter, so gaps occur.
-        assert!(!already_credited(9, 5));
-    }
-
-    #[test]
-    fn nothing_is_credited_on_a_fresh_bridge() {
-        assert!(!already_credited(0, 0));
-    }
     use bitcoin::{absolute::LockTime, transaction::Version, TxOut};
 
     fn a_record(index: u64, payout_sats: u64, script: u8) -> bridge::WithdrawalRecord {
