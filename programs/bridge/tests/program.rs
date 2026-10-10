@@ -5,11 +5,15 @@
 
 use std::path::PathBuf;
 
-use anchor_lang::{prelude::Pubkey, Discriminator, InstructionData, ToAccountMetas};
+use anchor_lang::{
+    prelude::{AccountMeta, Pubkey},
+    Discriminator, InstructionData, ToAccountMetas,
+};
 use litesvm::LiteSVM;
 use sol_drivechain_bridge::{
-    accounts, commitment_of, instruction, BmmAnswer, Config, WithdrawalRecord, BMM_ANSWER_ID,
-    BMM_ANSWER_LEN, LAMPORTS_PER_SAT, MAX_SCRIPT_PUBKEY_LEN,
+    accounts, commitment_of, instruction, AnsweredDeposit, BmmAnswer, Config, DepositAnswer,
+    WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, DEPOSIT_ANSWER_ENTRY_LEN,
+    DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID, LAMPORTS_PER_SAT, MAX_SCRIPT_PUBKEY_LEN,
 };
 use solana_account::Account;
 use solana_instruction::Instruction;
@@ -29,6 +33,11 @@ const SYSVAR_PROGRAM: Pubkey =
 
 /// The eCash height at which the chain starts to settle BMM.
 const BMM_START: u64 = 100;
+
+/// The deposits up to this eCash height count as credited at the start.
+const DEPOSIT_START: u64 = 200;
+const DEPOSIT_CONFIRMATIONS: u64 = 6;
+const DEPOSIT_LAG: u64 = 100;
 
 /// The rent reserve of an empty account under the default LiteSVM rent.
 const TREASURY_RESERVE: u64 = 890_880;
@@ -104,6 +113,9 @@ impl Chain {
             instruction::Initialize {
                 oracle: oracle_key,
                 bmm_start_height: BMM_START,
+                deposit_start_height: DEPOSIT_START,
+                deposit_confirmations: DEPOSIT_CONFIRMATIONS,
+                deposit_lag: DEPOSIT_LAG,
             }
             .data(),
         );
@@ -138,36 +150,115 @@ impl Chain {
             .map_err(|failed| format!("{:?}", failed.err))
     }
 
-    fn deposit_as(
+    /// Writes the `DepositAnswer` account, the way the patched validator does
+    /// for a tx with a top-level `credit_deposits`: the part of `deposits`
+    /// from `first`, at most `count` of them.
+    fn deposit_answer(
         &mut self,
-        signer: &Keypair,
-        recipient: Pubkey,
-        sequence_number: u64,
-        value_sats: u64,
-    ) -> Result<(), String> {
-        let instruction = self.build(
-            accounts::Deposit {
-                config: self.config,
-                vault: self.vault,
-                recipient,
-                oracle: signer.pubkey(),
-                system_program: SYSTEM_PROGRAM,
+        height: u64,
+        prev_block_hash: [u8; 32],
+        deposits: &[AnsweredDeposit],
+        first: u32,
+        count: u8,
+    ) {
+        let part: Vec<&AnsweredDeposit> = deposits
+            .iter()
+            .skip(first as usize)
+            .take(usize::from(count))
+            .collect();
+        let mut data = height.to_le_bytes().to_vec();
+        data.extend_from_slice(&ecash_block(height));
+        data.extend_from_slice(&prev_block_hash);
+        data.extend_from_slice(&(deposits.len() as u32).to_le_bytes());
+        data.extend_from_slice(&first.to_le_bytes());
+        data.push(part.len() as u8);
+        for deposit in part {
+            data.extend_from_slice(&deposit.sequence_number.to_le_bytes());
+            data.extend_from_slice(&deposit.value_sats.to_le_bytes());
+            match deposit.target {
+                Some(target) => {
+                    data.push(1);
+                    data.extend_from_slice(target.as_ref());
+                }
+                None => {
+                    data.push(0);
+                    data.extend_from_slice(&[0u8; 32]);
+                }
             }
-            .to_account_metas(None),
-            instruction::Deposit {
-                sequence_number,
-                value_sats,
-            }
-            .data(),
-        );
-        let signer = signer.insecure_clone();
-        self.send(instruction, &signer)
+        }
+        self.svm
+            .set_account(
+                DEPOSIT_ANSWER_ID,
+                Account {
+                    lamports: 1,
+                    data,
+                    owner: SYSVAR_PROGRAM,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
     }
 
+    /// A `credit_deposits` with one writable account for each target in the
+    /// part, the way the daemon builds it.
+    fn credit_ix(
+        &self,
+        height: u64,
+        deposits: &[AnsweredDeposit],
+        first: u32,
+        count: u8,
+    ) -> Instruction {
+        let mut metas = accounts::CreditDeposits {
+            config: self.config,
+            vault: self.vault,
+            deposit_answer: DEPOSIT_ANSWER_ID,
+            system_program: SYSTEM_PROGRAM,
+        }
+        .to_account_metas(None);
+        metas.extend(
+            deposits
+                .iter()
+                .skip(first as usize)
+                .take(usize::from(count))
+                .filter_map(|deposit| deposit.target)
+                .map(|target| AccountMeta::new(target, false)),
+        );
+        self.build(
+            metas,
+            instruction::CreditDeposits {
+                height,
+                block_hash: ecash_block(height),
+                first,
+                count,
+            }
+            .data(),
+        )
+    }
+
+    /// Credits a part of the deposits of eCash block `ecash_block(height)`,
+    /// whose parent is `ecash_block(height - 1)`. A stranger sends it.
+    fn credit_part(
+        &mut self,
+        height: u64,
+        deposits: &[AnsweredDeposit],
+        first: u32,
+        count: u8,
+    ) -> Result<(), String> {
+        self.deposit_answer(height, ecash_block(height - 1), deposits, first, count);
+        let instruction = self.credit_ix(height, deposits, first, count);
+        self.send_all(&[instruction])
+    }
+
+    fn credit(&mut self, height: u64, deposits: &[AnsweredDeposit]) -> Result<(), String> {
+        self.credit_part(height, deposits, 0, deposits.len() as u8)
+    }
+
+    /// Credits one deposit to the user at the next eCash height.
     fn deposit(&mut self, sequence_number: u64, value_sats: u64) -> Result<(), String> {
-        let oracle = self.oracle.insecure_clone();
-        let recipient = self.user.pubkey();
-        self.deposit_as(&oracle, recipient, sequence_number, value_sats)
+        let height = self.config().credited_height + 1;
+        let user = self.user.pubkey();
+        self.credit(height, &[to(user, sequence_number, value_sats)])
     }
 
     fn withdraw(
@@ -337,6 +428,30 @@ impl Chain {
     }
 }
 
+/// The eCash block at a height in these tests.
+fn ecash_block(height: u64) -> [u8; 32] {
+    let mut block = [0xe0u8; 32];
+    block[..8].copy_from_slice(&height.to_le_bytes());
+    block
+}
+
+fn to(target: Pubkey, sequence_number: u64, value_sats: u64) -> AnsweredDeposit {
+    AnsweredDeposit {
+        sequence_number,
+        value_sats,
+        target: Some(target),
+    }
+}
+
+/// A deposit whose OP_RETURN names no pubkey.
+fn nowhere(sequence_number: u64, value_sats: u64) -> AnsweredDeposit {
+    AnsweredDeposit {
+        sequence_number,
+        value_sats,
+        target: None,
+    }
+}
+
 fn decode<T: anchor_lang::AccountDeserialize>(data: &[u8]) -> T {
     let mut slice = data;
     T::try_deserialize(&mut slice).expect("the account decodes")
@@ -362,8 +477,8 @@ fn the_discriminator_is_eight_bytes_of_sha256() {
         &hash(b"account:Config").to_bytes()[..8]
     );
     assert_eq!(
-        instruction::Deposit::DISCRIMINATOR,
-        &hash(b"global:deposit").to_bytes()[..8]
+        instruction::CreditDeposits::DISCRIMINATOR,
+        &hash(b"global:credit_deposits").to_bytes()[..8]
     );
     assert_eq!(
         instruction::Withdraw::DISCRIMINATOR,
@@ -418,47 +533,205 @@ fn initialize_names_the_oracle_and_starts_the_counters() {
     assert_eq!(config.pegged_lamports, 0);
     assert_eq!(config.withdrawal_count, 0);
     assert_eq!(config.bmm_next_height, BMM_START);
+    assert_eq!(config.deposit_confirmations, DEPOSIT_CONFIRMATIONS);
+    assert_eq!(config.deposit_lag, DEPOSIT_LAG);
+    assert_eq!(config.credited_height, DEPOSIT_START);
+    assert_eq!(config.credited_block, [0u8; 32]);
+    assert_eq!(config.credit_index, 0);
+    assert_eq!(config.stranded_lamports, 0);
 }
 
 #[test]
-fn a_deposit_credits_ten_lamports_for_each_satoshi() {
+fn the_validator_reads_the_config_at_fixed_offsets() {
+    // The patched validator reads D, the lag, and the credits by offset.
     let mut chain = Chain::start();
-    let before = chain.balance(&chain.user.pubkey());
-    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    let user = chain.user.pubkey();
+    chain
+        .credit(DEPOSIT_START + 1, &[to(user, 0, A_DEPOSIT_SATS)])
+        .expect("the credit lands");
+    let data = chain.svm.get_account(&chain.config).unwrap().data;
+    let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    assert_eq!(&data[..8], Config::DISCRIMINATOR);
+    assert_eq!(at(80), DEPOSIT_CONFIRMATIONS);
+    assert_eq!(at(88), DEPOSIT_LAG);
+    assert_eq!(at(96), DEPOSIT_START + 1);
+    assert_eq!(&data[104..136], &ecash_block(DEPOSIT_START + 1));
+}
+
+#[test]
+fn credit_deposits_carries_the_height_the_block_the_first_index_and_the_count() {
+    // The patched validator reads the question at bytes 8 to 53.
+    let data = instruction::CreditDeposits {
+        height: 0x0102_0304_0506_0708,
+        block_hash: [9u8; 32],
+        first: 0x0a0b_0c0d,
+        count: 7,
+    }
+    .data();
+    assert_eq!(data.len(), 53);
+    assert_eq!(&data[8..16], &0x0102_0304_0506_0708u64.to_le_bytes());
+    assert_eq!(&data[16..48], &[9u8; 32]);
+    assert_eq!(&data[48..52], &0x0a0b_0c0du32.to_le_bytes());
+    assert_eq!(data[52], 7);
+}
+
+#[test]
+fn the_deposit_answer_decodes_its_head_and_entries() {
+    let target = Pubkey::new_from_array([3u8; 32]);
+    let mut data = 9u64.to_le_bytes().to_vec();
+    data.extend_from_slice(&[1u8; 32]);
+    data.extend_from_slice(&[2u8; 32]);
+    data.extend_from_slice(&5u32.to_le_bytes());
+    data.extend_from_slice(&3u32.to_le_bytes());
+    data.push(2);
+    for (sequence_number, flag) in [(7u64, 1u8), (8, 0)] {
+        data.extend_from_slice(&sequence_number.to_le_bytes());
+        data.extend_from_slice(&100u64.to_le_bytes());
+        data.push(flag);
+        data.extend_from_slice(target.as_ref());
+    }
     assert_eq!(
-        chain.balance(&chain.user.pubkey()) - before,
-        A_DEPOSIT_SATS * LAMPORTS_PER_SAT
+        data.len(),
+        DEPOSIT_ANSWER_HEAD_LEN + 2 * DEPOSIT_ANSWER_ENTRY_LEN
     );
+    let answer = DepositAnswer::decode(&data).unwrap();
+    assert_eq!(answer.height, 9);
+    assert_eq!(answer.block_hash, [1u8; 32]);
+    assert_eq!(answer.prev_block_hash, [2u8; 32]);
+    assert_eq!(answer.total, 5);
+    assert_eq!(answer.first, 3);
+    assert_eq!(answer.deposits, vec![to(target, 7, 100), nowhere(8, 100)]);
+    assert_eq!(DepositAnswer::decode(&data[..data.len() - 1]), None);
+    let flag = DEPOSIT_ANSWER_HEAD_LEN + 16;
+    data[flag] = 2;
+    assert_eq!(DepositAnswer::decode(&data), None);
+}
+
+#[test]
+fn a_credit_pays_ten_lamports_for_each_satoshi_out_of_the_vault() {
+    let mut chain = Chain::start();
+    let user = chain.user.pubkey();
+    let user_before = chain.balance(&user);
+    let vault_before = chain.balance(&chain.vault);
+    chain
+        .credit(DEPOSIT_START + 1, &[to(user, 0, A_DEPOSIT_SATS)])
+        .expect("the credit lands");
+    let lamports = A_DEPOSIT_SATS * LAMPORTS_PER_SAT;
+    assert_eq!(chain.balance(&user) - user_before, lamports);
+    assert_eq!(vault_before - chain.balance(&chain.vault), lamports);
+    let config = chain.config();
+    assert_eq!(config.pegged_lamports, lamports);
+    assert_eq!(config.deposit_high_water, 1);
+    assert_eq!(config.credited_height, DEPOSIT_START + 1);
+    assert_eq!(config.credited_block, ecash_block(DEPOSIT_START + 1));
+}
+
+#[test]
+fn anyone_can_credit_and_nobody_needs_the_oracle() {
+    let mut chain = Chain::start();
+    let stranger = chain.a_stranger().pubkey();
+    chain
+        .credit(DEPOSIT_START + 1, &[to(stranger, 0, A_DEPOSIT_SATS)])
+        .expect("a stranger sends the credit");
     assert_eq!(
         chain.config().pegged_lamports,
         A_DEPOSIT_SATS * LAMPORTS_PER_SAT
     );
-    assert_eq!(chain.config().deposit_high_water, 1);
 }
 
 #[test]
-fn a_deposit_takes_the_lamports_out_of_the_vault() {
+fn credits_go_in_height_order_and_an_empty_height_counts() {
     let mut chain = Chain::start();
-    let before = chain.balance(&chain.vault);
-    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
-    assert_eq!(
-        before - chain.balance(&chain.vault),
-        A_DEPOSIT_SATS * LAMPORTS_PER_SAT
-    );
+    let user = chain.user.pubkey();
+    chain
+        .credit(DEPOSIT_START + 1, &[])
+        .expect("an empty height");
+    assert_eq!(chain.config().credited_height, DEPOSIT_START + 1);
+    chain
+        .credit(DEPOSIT_START + 2, &[to(user, 3, 100_000)])
+        .expect("the next height");
+    chain
+        .credit(
+            DEPOSIT_START + 3,
+            &[to(user, 4, 100_000), to(user, 9, 100_000)],
+        )
+        .expect("the height after it");
+    let config = chain.config();
+    assert_eq!(config.credited_height, DEPOSIT_START + 3);
+    assert_eq!(config.deposit_high_water, 10);
+    assert_eq!(config.pegged_lamports, 3 * 100_000 * LAMPORTS_PER_SAT);
 }
 
 #[test]
-fn a_repeat_sequence_number_fails() {
+fn a_credit_out_of_height_order_fails() {
     let mut chain = Chain::start();
-    chain.deposit(4, A_DEPOSIT_SATS).expect("the deposit lands");
-    assert!(chain.deposit(4, A_DEPOSIT_SATS).is_err());
+    let user = chain.user.pubkey();
+    assert!(chain
+        .credit(DEPOSIT_START + 2, &[to(user, 0, A_DEPOSIT_SATS)])
+        .is_err());
+    assert!(chain
+        .credit(DEPOSIT_START, &[to(user, 0, A_DEPOSIT_SATS)])
+        .is_err());
+    assert_eq!(chain.config().credited_height, DEPOSIT_START);
+    assert_eq!(chain.config().pegged_lamports, 0);
 }
 
 #[test]
-fn a_lower_sequence_number_fails() {
+fn a_block_takes_several_parts_in_order() {
     let mut chain = Chain::start();
-    chain.deposit(9, A_DEPOSIT_SATS).expect("the deposit lands");
-    assert!(chain.deposit(8, A_DEPOSIT_SATS).is_err());
+    let user = chain.user.pubkey();
+    let height = DEPOSIT_START + 1;
+    let deposits = [
+        to(user, 0, 100_000),
+        nowhere(1, 100_000),
+        to(user, 2, 100_000),
+    ];
+    assert!(chain.credit_part(height, &deposits, 1, 2).is_err());
+    chain
+        .credit_part(height, &deposits, 0, 2)
+        .expect("the first part");
+    let config = chain.config();
+    assert_eq!(config.credited_height, DEPOSIT_START);
+    assert_eq!(config.credit_index, 2);
+    assert!(chain.credit_part(height, &deposits, 0, 2).is_err());
+    assert!(chain.credit_part(height, &deposits, 1, 2).is_err());
+    assert!(chain.credit(height + 1, &[]).is_err());
+    chain
+        .credit_part(height, &deposits, 2, 1)
+        .expect("the last part");
+    let config = chain.config();
+    assert_eq!(config.credited_height, height);
+    assert_eq!(config.credit_index, 0);
+    assert_eq!(config.pegged_lamports, 2 * 100_000 * LAMPORTS_PER_SAT);
+    assert_eq!(config.stranded_lamports, 100_000 * LAMPORTS_PER_SAT);
+}
+
+#[test]
+fn an_empty_part_of_a_block_with_deposits_fails() {
+    let mut chain = Chain::start();
+    let user = chain.user.pubkey();
+    let deposits = [to(user, 0, 100_000)];
+    assert!(chain
+        .credit_part(DEPOSIT_START + 1, &deposits, 0, 0)
+        .is_err());
+}
+
+#[test]
+fn a_double_credit_fails() {
+    let mut chain = Chain::start();
+    let user = chain.user.pubkey();
+    let deposits = [to(user, 4, A_DEPOSIT_SATS)];
+    chain
+        .credit(DEPOSIT_START + 1, &deposits)
+        .expect("the first credit");
+    let before = chain.balance(&user);
+    assert!(chain.credit(DEPOSIT_START + 1, &deposits).is_err());
+    assert!(chain.credit(DEPOSIT_START + 2, &deposits).is_err());
+    assert!(chain
+        .credit(DEPOSIT_START + 2, &[to(user, 3, A_DEPOSIT_SATS)])
+        .is_err());
+    assert_eq!(chain.balance(&user), before);
+    assert_eq!(chain.config().deposit_high_water, 5);
 }
 
 #[test]
@@ -472,19 +745,149 @@ fn a_sequence_number_gap_is_fine() {
 }
 
 #[test]
-fn a_zero_deposit_fails() {
+fn a_block_that_does_not_follow_the_credited_block_fails() {
     let mut chain = Chain::start();
-    assert!(chain.deposit(0, 0).is_err());
+    let user = chain.user.pubkey();
+    chain
+        .credit(DEPOSIT_START + 1, &[])
+        .expect("the first height");
+    let deposits = [to(user, 0, A_DEPOSIT_SATS)];
+    chain.deposit_answer(DEPOSIT_START + 2, [0xaa; 32], &deposits, 0, 1);
+    let instruction = chain.credit_ix(DEPOSIT_START + 2, &deposits, 0, 1);
+    assert!(chain.send_all(&[instruction]).is_err());
+    assert_eq!(chain.config().credited_height, DEPOSIT_START + 1);
 }
 
 #[test]
-fn only_the_oracle_credits_a_deposit() {
+fn a_credit_without_an_answer_or_with_another_answer_fails() {
     let mut chain = Chain::start();
-    let thief = chain.a_stranger();
-    let recipient = thief.pubkey();
-    assert!(chain
-        .deposit_as(&thief, recipient, 0, A_DEPOSIT_SATS)
-        .is_err());
+    let user = chain.user.pubkey();
+    let deposits = [to(user, 0, A_DEPOSIT_SATS)];
+    let instruction = chain.credit_ix(DEPOSIT_START + 1, &deposits, 0, 1);
+    assert!(chain.send_all(std::slice::from_ref(&instruction)).is_err());
+    chain.deposit_answer(
+        DEPOSIT_START + 2,
+        ecash_block(DEPOSIT_START),
+        &deposits,
+        0,
+        1,
+    );
+    assert!(chain.send_all(std::slice::from_ref(&instruction)).is_err());
+    chain.deposit_answer(
+        DEPOSIT_START + 1,
+        ecash_block(DEPOSIT_START),
+        &deposits,
+        0,
+        0,
+    );
+    assert!(chain.send_all(&[instruction]).is_err());
+    assert_eq!(chain.config().pegged_lamports, 0);
+}
+
+#[test]
+fn a_wrong_or_missing_target_fails() {
+    let mut chain = Chain::start();
+    let user = chain.user.pubkey();
+    let thief = chain.a_stranger().pubkey();
+    let height = DEPOSIT_START + 1;
+    let deposits = [to(user, 0, A_DEPOSIT_SATS)];
+    chain.deposit_answer(height, ecash_block(height - 1), &deposits, 0, 1);
+    let mut wrong = chain.credit_ix(height, &deposits, 0, 1);
+    wrong.accounts.last_mut().unwrap().pubkey = thief;
+    assert!(chain.send_all(&[wrong]).is_err());
+    let mut missing = chain.credit_ix(height, &deposits, 0, 1);
+    missing.accounts.pop();
+    assert!(chain.send_all(&[missing]).is_err());
+    assert_eq!(chain.config().pegged_lamports, 0);
+}
+
+#[test]
+fn a_read_only_target_fails_the_tx_and_strands_nothing() {
+    let mut chain = Chain::start();
+    let user = chain.user.pubkey();
+    let height = DEPOSIT_START + 1;
+    let deposits = [to(user, 0, A_DEPOSIT_SATS)];
+    chain.deposit_answer(height, ecash_block(height - 1), &deposits, 0, 1);
+    let mut instruction = chain.credit_ix(height, &deposits, 0, 1);
+    instruction.accounts.last_mut().unwrap().is_writable = false;
+    assert!(chain.send_all(&[instruction]).is_err());
+    assert_eq!(chain.config().stranded_lamports, 0);
+    assert_eq!(chain.config().credited_height, DEPOSIT_START);
+}
+
+#[test]
+fn a_target_that_cannot_take_the_lamports_strands_them_in_the_vault() {
+    let mut chain = Chain::start();
+    let below_rent = Keypair::new().pubkey();
+    let program = chain.program_id;
+    let vault = chain.vault;
+    let vault_before = chain.balance(&vault);
+    let deposits = [
+        nowhere(0, 1_000),
+        to(below_rent, 1, 1_000),
+        to(program, 2, 1_000),
+        to(vault, 3, 1_000),
+    ];
+    chain
+        .credit(DEPOSIT_START + 1, &deposits)
+        .expect("the height credits");
+    let config = chain.config();
+    assert_eq!(config.stranded_lamports, 4 * 1_000 * LAMPORTS_PER_SAT);
+    assert_eq!(config.pegged_lamports, 0);
+    assert_eq!(config.deposit_high_water, 4);
+    assert_eq!(config.credited_height, DEPOSIT_START + 1);
+    assert_eq!(chain.balance(&vault), vault_before);
+    assert_eq!(chain.balance(&below_rent), 0);
+}
+
+#[test]
+fn both_balance_equations_hold_from_deposit_to_paid_withdrawal() {
+    let mut chain = Chain::start();
+    let user = chain.user.pubkey();
+    // The eCash side, which the test keeps: the treasury and the deposits
+    // that no credit took yet.
+    let mut treasury_sats: u64 = 0;
+    let mut awaiting_sats: u64 = 0;
+    let check = |chain: &Chain, treasury_sats: u64, awaiting_sats: u64| {
+        let config = chain.config();
+        assert_eq!(
+            chain.balance(&chain.vault) + config.pegged_lamports,
+            VAULT_LAMPORTS
+        );
+        let pending: u64 = (0..config.withdrawal_count)
+            .filter_map(|index| chain.record(index))
+            .map(|record| record.burned_lamports)
+            .sum();
+        assert_eq!(
+            treasury_sats * LAMPORTS_PER_SAT,
+            config.pegged_lamports
+                + config.stranded_lamports
+                + awaiting_sats * LAMPORTS_PER_SAT
+                + pending
+        );
+    };
+    check(&chain, treasury_sats, awaiting_sats);
+
+    let deposits = [to(user, 0, A_DEPOSIT_SATS), nowhere(1, 30_000)];
+    treasury_sats += A_DEPOSIT_SATS + 30_000;
+    awaiting_sats += A_DEPOSIT_SATS + 30_000;
+    check(&chain, treasury_sats, awaiting_sats);
+
+    chain
+        .credit(DEPOSIT_START + 1, &deposits)
+        .expect("the credit lands");
+    awaiting_sats -= A_DEPOSIT_SATS + 30_000;
+    check(&chain, treasury_sats, awaiting_sats);
+
+    chain
+        .withdraw(0, 5_000_000, 1_000, &A_P2WPKH)
+        .expect("the withdrawal lands");
+    check(&chain, treasury_sats, awaiting_sats);
+
+    let oracle = chain.oracle.insecure_clone();
+    chain.mark_paid_as(&oracle, 0).expect("mark_paid succeeds");
+    treasury_sats -= 5_000_000 / LAMPORTS_PER_SAT;
+    check(&chain, treasury_sats, awaiting_sats);
 }
 
 #[test]

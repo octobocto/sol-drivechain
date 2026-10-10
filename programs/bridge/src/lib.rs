@@ -25,17 +25,41 @@ pub const BMM_ANSWER_ID: Pubkey = pubkey!("BmmAnswer1111111111111111111111111111
 /// recorded.
 pub const BMM_ANSWER_LEN: usize = 8 + 32 + 1 + 32 + 32 + 1;
 
+/// The account that the patched validator builds for each tx with a
+/// top-level `credit_deposits`. It holds the deposits of one eCash block from
+/// the local enforcer.
+pub const DEPOSIT_ANSWER_ID: Pubkey = pubkey!("DepositAnswer111111111111111111111111111111");
+
+/// The `DepositAnswer` head: height, block hash, parent hash, deposit count of
+/// the block, first index, entry count.
+pub const DEPOSIT_ANSWER_HEAD_LEN: usize = 8 + 32 + 32 + 4 + 4 + 1;
+
+/// One `DepositAnswer` entry: sequence number, value in sats, a flag, and the
+/// target pubkey.
+pub const DEPOSIT_ANSWER_ENTRY_LEN: usize = 8 + 8 + 1 + 32;
+
 const OP_RETURN: u8 = 0x6a;
+
+/// The owner of every sysvar. The runtime sends a sysvar read-only.
+const SYSVAR_OWNER: Pubkey = pubkey!("Sysvar1111111111111111111111111111111111111");
 
 #[program]
 pub mod bridge {
     use super::*;
 
+    /// Sets up the bridge. Deposits up to eCash height `deposit_start_height`
+    /// count as credited. A credit waits for `deposit_confirmations` eCash
+    /// confirmations, and a BMM checkpoint at eCash height H counts only when
+    /// its bank credited every deposit through H - `deposit_lag`.
     pub fn initialize(
         ctx: Context<Initialize>,
         oracle: Pubkey,
         bmm_start_height: u64,
+        deposit_start_height: u64,
+        deposit_confirmations: u64,
+        deposit_lag: u64,
     ) -> Result<()> {
+        require_gte!(deposit_confirmations, 1, BridgeError::NoConfirmations);
         let config = &mut ctx.accounts.config;
         config.oracle = oracle;
         config.deposit_high_water = 0;
@@ -43,6 +67,12 @@ pub mod bridge {
         config.withdrawal_count = 0;
         config.bmm_next_height = bmm_start_height;
         config.bmm_paid_total = 0;
+        config.deposit_confirmations = deposit_confirmations;
+        config.deposit_lag = deposit_lag;
+        config.credited_height = deposit_start_height;
+        config.credited_block = [0; 32];
+        config.credit_index = 0;
+        config.stranded_lamports = 0;
         config.bump = ctx.bumps.config;
         config.vault_bump = ctx.bumps.vault;
         config.treasury_bump = ctx.bumps.treasury;
@@ -118,42 +148,140 @@ pub mod bridge {
         Ok(())
     }
 
-    pub fn deposit(ctx: Context<Deposit>, sequence_number: u64, value_sats: u64) -> Result<()> {
-        require!(value_sats > 0, BridgeError::ZeroAmount);
-        // The mainchain counter climbs on every treasury change, and a paid
-        // withdrawal is one. So a gap is normal, and the test is `>=`, never
-        // equality. This one check is the whole guard against a repeat credit.
-        require!(
-            sequence_number >= ctx.accounts.config.deposit_high_water,
-            BridgeError::SequenceNumberAlreadyApplied
+    /// Credits the deposits of eCash block `block_hash` at height `height`,
+    /// from index `first`, `count` of them. Anyone can send it. The heights go
+    /// in order, and a block with many deposits takes several parts in order.
+    /// The remaining accounts are the targets of the deposits that name a
+    /// pubkey, in deposit order. A target that cannot take the lamports leaves
+    /// them in the vault as stranded.
+    pub fn credit_deposits<'info>(
+        ctx: Context<'info, CreditDeposits<'info>>,
+        height: u64,
+        block_hash: [u8; 32],
+        first: u32,
+        count: u8,
+    ) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require_eq!(
+            height,
+            config
+                .credited_height
+                .checked_add(1)
+                .ok_or(BridgeError::AmountOverflow)?,
+            BridgeError::CreditOutOfOrder
         );
-
-        let lamports = value_sats
-            .checked_mul(LAMPORTS_PER_SAT)
+        require_eq!(
+            u64::from(first),
+            config.credit_index,
+            BridgeError::PartOutOfOrder
+        );
+        let answer = DepositAnswer::read(&ctx.accounts.deposit_answer)?;
+        require!(
+            answer.height == height
+                && answer.block_hash == block_hash
+                && answer.first == first
+                && answer.deposits.len() == usize::from(count),
+            BridgeError::AnswerForAnotherQuestion
+        );
+        require!(
+            config.credited_block == [0; 32] || answer.prev_block_hash == config.credited_block,
+            BridgeError::NotOnCreditedChain
+        );
+        let end = u64::from(first)
+            .checked_add(u64::from(count))
             .ok_or(BridgeError::AmountOverflow)?;
+        require!(count > 0 || answer.total == 0, BridgeError::EmptyPart);
 
-        let config = &mut ctx.accounts.config;
-        config.deposit_high_water = sequence_number
-            .checked_add(1)
-            .ok_or(BridgeError::AmountOverflow)?;
-        config.pegged_lamports = config
-            .pegged_lamports
-            .checked_add(lamports)
-            .ok_or(BridgeError::AmountOverflow)?;
-
+        let vault = ctx.accounts.vault.to_account_info();
+        let rent = Rent::get()?;
         let vault_bump = config.vault_bump;
         let signer_seeds: &[&[&[u8]]] = &[&[VAULT_SEED, &[vault_bump]]];
-        transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.system_program.key(),
-                Transfer {
-                    from: ctx.accounts.vault.to_account_info(),
-                    to: ctx.accounts.recipient.to_account_info(),
-                },
-                signer_seeds,
-            ),
-            lamports,
-        )
+        let mut targets = ctx.remaining_accounts.iter();
+        let mut high_water = config.deposit_high_water;
+        let mut credited: u64 = 0;
+        let mut stranded: u64 = 0;
+        for deposit in &answer.deposits {
+            require_gte!(
+                deposit.sequence_number,
+                high_water,
+                BridgeError::SequenceNumberAlreadyApplied
+            );
+            high_water = deposit
+                .sequence_number
+                .checked_add(1)
+                .ok_or(BridgeError::AmountOverflow)?;
+            let lamports = deposit
+                .value_sats
+                .checked_mul(LAMPORTS_PER_SAT)
+                .ok_or(BridgeError::AmountOverflow)?;
+            let target = match deposit.target {
+                Some(key) => {
+                    let target = targets.next().ok_or(BridgeError::MissingTarget)?;
+                    require_keys_eq!(target.key(), key, BridgeError::WrongTarget);
+                    Some(target)
+                }
+                None => None,
+            };
+            let takes = match target {
+                Some(target) => can_take(target, &vault.key(), lamports, &rent)?,
+                None => false,
+            };
+            match target {
+                Some(target) if takes => {
+                    if lamports > 0 {
+                        transfer(
+                            CpiContext::new_with_signer(
+                                ctx.accounts.system_program.key(),
+                                Transfer {
+                                    from: vault.clone(),
+                                    to: target.clone(),
+                                },
+                                signer_seeds,
+                            ),
+                            lamports,
+                        )?;
+                    }
+                    credited = credited
+                        .checked_add(lamports)
+                        .ok_or(BridgeError::AmountOverflow)?;
+                    msg!(
+                        "deposit {} credits {} lamports to {}",
+                        deposit.sequence_number,
+                        lamports,
+                        target.key()
+                    );
+                }
+                _ => {
+                    stranded = stranded
+                        .checked_add(lamports)
+                        .ok_or(BridgeError::AmountOverflow)?;
+                    msg!(
+                        "deposit {} strands {} lamports in the vault",
+                        deposit.sequence_number,
+                        lamports
+                    );
+                }
+            }
+        }
+
+        let config = &mut ctx.accounts.config;
+        config.deposit_high_water = high_water;
+        config.pegged_lamports = config
+            .pegged_lamports
+            .checked_add(credited)
+            .ok_or(BridgeError::AmountOverflow)?;
+        config.stranded_lamports = config
+            .stranded_lamports
+            .checked_add(stranded)
+            .ok_or(BridgeError::AmountOverflow)?;
+        if end >= u64::from(answer.total) {
+            config.credited_height = height;
+            config.credited_block = block_hash;
+            config.credit_index = 0;
+        } else {
+            config.credit_index = end;
+        }
+        Ok(())
     }
 
     pub fn withdraw(
@@ -270,6 +398,87 @@ impl BmmAnswer {
     }
 }
 
+/// One deposit of a `DepositAnswer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnsweredDeposit {
+    pub sequence_number: u64,
+    pub value_sats: u64,
+    /// The pubkey that the OP_RETURN names, or `None` when it names none.
+    pub target: Option<Pubkey>,
+}
+
+/// The answer of the local enforcer to the first top-level `credit_deposits`
+/// of the tx: a part of the deposits of one eCash block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepositAnswer {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub prev_block_hash: [u8; 32],
+    /// The deposit count of the whole block.
+    pub total: u32,
+    pub first: u32,
+    pub deposits: Vec<AnsweredDeposit>,
+}
+
+impl DepositAnswer {
+    pub fn read(account: &UncheckedAccount) -> Result<Self> {
+        let data = account.try_borrow_data()?;
+        Self::decode(&data).ok_or_else(|| error!(BridgeError::NoAnswer))
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let head = data.get(..DEPOSIT_ANSWER_HEAD_LEN)?;
+        let count = usize::from(head[80]);
+        let entries = data.get(DEPOSIT_ANSWER_HEAD_LEN..)?;
+        if entries.len() != count.checked_mul(DEPOSIT_ANSWER_ENTRY_LEN)? {
+            return None;
+        }
+        let deposits = entries
+            .chunks_exact(DEPOSIT_ANSWER_ENTRY_LEN)
+            .map(|entry| {
+                let target = match entry[16] {
+                    0 => None,
+                    1 => Some(Pubkey::new_from_array(entry[17..49].try_into().ok()?)),
+                    _ => return None,
+                };
+                Some(AnsweredDeposit {
+                    sequence_number: u64::from_le_bytes(entry[..8].try_into().ok()?),
+                    value_sats: u64::from_le_bytes(entry[8..16].try_into().ok()?),
+                    target,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            height: u64::from_le_bytes(head[..8].try_into().ok()?),
+            block_hash: head[8..40].try_into().ok()?,
+            prev_block_hash: head[40..72].try_into().ok()?,
+            total: u32::from_le_bytes(head[72..76].try_into().ok()?),
+            first: u32::from_le_bytes(head[76..80].try_into().ok()?),
+            deposits,
+        })
+    }
+}
+
+/// True when a deposit target can take `lamports`. A target that cannot
+/// keeps them in the vault. A writable target that the tx sends read-only
+/// fails the tx, so no sender can strand a deposit on purpose.
+fn can_take(target: &AccountInfo, vault: &Pubkey, lamports: u64, rent: &Rent) -> Result<bool> {
+    if target.key() == *vault || target.executable {
+        return Ok(false);
+    }
+    if !target.is_writable {
+        require!(
+            *target.owner == SYSVAR_OWNER,
+            BridgeError::TargetNotWritable
+        );
+        return Ok(false);
+    }
+    let Some(after) = target.lamports().checked_add(lamports) else {
+        return Ok(false);
+    };
+    Ok(rent.is_exempt(after, target.data_len()))
+}
+
 /// True when the payee can take the payout. A payee that cannot take it gets
 /// nothing, and the fees go to the next winner.
 fn can_hold(payee: &UncheckedAccount, treasury: Pubkey, payout: u64) -> Result<bool> {
@@ -318,15 +527,14 @@ pub struct SettleBmm<'info> {
 }
 
 #[derive(Accounts)]
-pub struct Deposit<'info> {
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = oracle)]
+pub struct CreditDeposits<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
     #[account(mut, seeds = [VAULT_SEED], bump = config.vault_bump)]
     pub vault: SystemAccount<'info>,
-    /// CHECK: the daemon reads this pubkey out of the mainchain deposit address.
-    #[account(mut)]
-    pub recipient: UncheckedAccount<'info>,
-    pub oracle: Signer<'info>,
+    /// CHECK: the address fixes the account, and the validator builds its data.
+    #[account(address = DEPOSIT_ANSWER_ID)]
+    pub deposit_answer: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -380,6 +588,20 @@ pub struct Config {
     pub bmm_next_height: u64,
     /// Every lamport that `settle_bmm` paid to a winner.
     pub bmm_paid_total: u64,
+    /// D: a block credits its deposits after this many eCash confirmations.
+    pub deposit_confirmations: u64,
+    /// A BMM checkpoint at eCash height H counts only when its bank credited
+    /// every deposit through H - `deposit_lag`.
+    pub deposit_lag: u64,
+    /// The highest eCash height with every deposit credited.
+    pub credited_height: u64,
+    /// The eCash block at `credited_height`. Zero before the first credit.
+    pub credited_block: [u8; 32],
+    /// The index of the next deposit to credit at `credited_height + 1`.
+    pub credit_index: u64,
+    /// Lamports of deposits whose target could not take them. They stay in
+    /// the vault.
+    pub stranded_lamports: u64,
     pub bump: u8,
     pub vault_bump: u8,
     pub treasury_bump: u8,
@@ -404,8 +626,6 @@ pub enum BridgeError {
     SequenceNumberAlreadyApplied,
     #[msg("The amount is not a whole number of satoshis.")]
     AmountNotAWholeSat,
-    #[msg("The amount is zero.")]
-    ZeroAmount,
     #[msg("The mainchain fee is above the amount.")]
     FeeAboveAmount,
     #[msg("The payout is dust.")]
@@ -432,4 +652,20 @@ pub enum BridgeError {
     PairDoesNotMatch,
     #[msg("The block record of this fork does not hold the Solana block.")]
     BlockNotRecorded,
+    #[msg("A credit needs at least one eCash confirmation.")]
+    NoConfirmations,
+    #[msg("The eCash height is not the next height to credit.")]
+    CreditOutOfOrder,
+    #[msg("The first deposit index is not the next deposit to credit.")]
+    PartOutOfOrder,
+    #[msg("The eCash block does not follow the last credited block.")]
+    NotOnCreditedChain,
+    #[msg("The part holds no deposit, but the block holds deposits.")]
+    EmptyPart,
+    #[msg("A deposit names a target that the remaining accounts do not hold.")]
+    MissingTarget,
+    #[msg("A remaining account is not the target of its deposit.")]
+    WrongTarget,
+    #[msg("The tx sends a deposit target read-only.")]
+    TargetNotWritable,
 }
