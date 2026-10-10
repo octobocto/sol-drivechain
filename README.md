@@ -114,24 +114,38 @@ Only regtest is tested end to end.
 ## BMM
 
 Validators get fees only when they win a BIP301 bid on eCash. The commitment
-on eCash is the payee pubkey, and that is the whole h*. Each validator reads
-eCash from its own enforcer.
+on eCash is h* = SHA-256(Solana bank hash ‖ payee pubkey). Each validator
+reads eCash from its own enforcer.
 
 1. **Fees.** The patched runtime sends every fee to the treasury PDA.
-2. **Bid.** For each new eCash tip T, a validator sends one BMM request with
-   its payee pubkey and a bid in sats. The bid is at most the fee income of
-   one block interval, from the growth of `treasury + bmm_paid_total`.
-3. **Win.** The miner of block H = T + 1 takes the top bid. It puts that
-   pubkey in the coinbase, and the request pays the bid. A losing request is
-   invalid, so it costs nothing.
-4. **Settle.** When block H + N + 1 arrives, any node sends
-   `settle_bmm(H, hash(H))`. The winner does not need to be the sender. The
-   program pays the whole treasury above its rent reserve to the pubkey in
-   the coinbase, and it adds that amount to `bmm_paid_total`. A height with
-   no commitment pays nobody, and its fees go to the next winner.
+2. **Bid.** For each new eCash tip T, a validator reads the newest block in
+   the block record of the branch that it follows, at `processed`. It sends
+   one BMM request with h* for that block and a bid in sats. The bid is at
+   most the fee income of one block interval, from the growth of
+   `treasury + bmm_paid_total`.
+3. **Pair.** The bidder sends the pair (T + 1, bank hash, payee) to the RPC
+   method `bmmPublishPairs` of a validator. Each validator keeps the pairs in
+   `bmm-pairs` in its ledger directory, and sends them to the RPC of every
+   other validator. No transaction carries a pair, so a leader cannot hide
+   one.
+4. **Win.** The miner of block H = T + 1 takes the top bid. It puts h* in the
+   coinbase, and the request pays the bid. A losing request is invalid, so it
+   costs nothing.
+5. **Settle.** When block H + N + 1 arrives, any node sends
+   `settle_bmm(H, hash(H), bank hash)` with the payee account. The program
+   checks SHA-256(bank hash ‖ payee) against h*, and it checks that the block
+   record of the bank holds the block. It pays the whole treasury above its
+   rent reserve to the payee, and it adds that amount to `bmm_paid_total`.
 
-Heights settle one at a time, in order. Each winner gets the fees between the
-settle of H − 1 and the settle of H, about one block interval.
+`bmm_next_height` is a cursor. A settle at H moves it to H + 1, so no height
+below H can settle later. A commitment that nobody settles keeps its fees in
+the treasury, and the next settle takes them.
+
+The block record (`BmmB1ocks1111111111111111111111111111111111`) is an
+account that the runtime writes. It holds the bank hash of the last block of
+each 32 slots on the fork, for 2048 strides, about 7 hours. Only a block in
+the record of the settling bank can take a payout, so a commitment to a block
+on another branch never pays.
 
 The Agave patch adds these parts:
 
@@ -140,8 +154,10 @@ The Agave patch adds these parts:
 | Treasury | Every fee goes to the treasury, not to the leader. |
 | Vote fee | A simple vote pays no signature fee. The genesis keeps Alpenglow off, so votes are txs. |
 | `sol-drivechain-bmm` | A view of the active eCash chain, filled from the local enforcer. |
-| Pre-check | For each tx with a top-level `settle_bmm(H, M)`, the check asks the view. It passes only when M is the active block at H. A leader needs N + 1 blocks on top, and replay needs N. |
-| `BmmAnswer` | The runtime builds this account for the tx, the same way as the instructions sysvar. It holds the height, the block hash, and the commitment. The bridge reads it. |
+| Pre-check | For each tx with a top-level `settle_bmm(H, M, S)`, the check asks the view. It passes only when M is the active block at H. A leader needs N + 1 blocks on top, and replay needs N. |
+| `BmmAnswer` | The runtime builds this account for the tx, the same way as the instructions sysvar. It holds the height, the block hash, the commitment, the Solana block S, and whether the block record holds S. The bridge reads it. |
+| Block record | The runtime writes the last block of each 32 slots into `BmmB1ocks…`. |
+| Pairs | `bmmPublishPairs` and `bmmGetPairs` on the RPC, the `bmm-pairs` file, and the push to other validators. |
 | Flags | `--bmm-enforcer-url`, `--bmm-sidechain-slot`, and `--bmm-confirmations`. |
 
 A "not ready" settle waits in the leader queue and goes into a later block.
@@ -157,12 +173,7 @@ reorg changes no Solana state.
 A payee that cannot take the payout gets nothing, and the fees go to the next
 winner. The settle still lands. That holds for an account below its rent
 reserve, for an executable account, and for an account that the runtime
-demotes to read only. A settle that failed for such a payee would stop every
-later height, so a bid with a bad payee would stop the whole chain.
-
-This plan carries no checkpoint of Solana state on eCash. To add one later,
-make the commitment `hash(payee, slot, slot hash)` and add a claim
-instruction.
+demotes to read only.
 
 ## Two depths: D for a deposit, N for a BMM settle
 
@@ -233,8 +244,8 @@ The mainchain releases the Bitcoin, not a key. The oracle key only credits
 lamports for a deposit that the mainchain already confirmed, and the bridge
 counts `pegged_lamports` so the validator's genesis lamports can never peg out.
 
-No key controls BMM. The coinbase names the payee, and any user can send the
-settle that pays it.
+No key controls BMM. The coinbase commits to the payee, the pair names it, and
+any user can send the settle that pays it.
 
 ## Layout
 
@@ -483,8 +494,11 @@ with mode 600.
 | `bridge-state` | Prints the bridge config, the vault, the treasury, and the BMM totals. |
 | `initialize` | Creates the bridge config account. |
 | `run` | Runs the peg. |
-| `bmm` | Bids for eCash blocks, and settles each eCash height. |
-| `settle-bmm` | Settles one eCash height by hand. |
+| `bmm` | Bids for eCash blocks, publishes the pairs, and settles the commitments in height order. |
+| `bid-bmm` | Sends one bid and publishes its pair. |
+| `publish-pair` | Publishes one pair to a validator. |
+| `bmm-block` | Prints the newest block in the block record. |
+| `settle-bmm` | Settles one commitment by hand. |
 | `ecash-tip` | Prints the height and the hash of the eCash tip. |
 | `ecash-walk` | Prints how far the enforcer walks back in one call. |
 
