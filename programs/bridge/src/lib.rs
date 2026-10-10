@@ -21,8 +21,9 @@ pub const TREASURY_SEED: &[u8] = b"treasury";
 /// top-level `settle_bmm`. It holds the answer of the local enforcer.
 pub const BMM_ANSWER_ID: Pubkey = pubkey!("BmmAnswer1111111111111111111111111111111111");
 
-/// The `BmmAnswer` data: height, block hash, found, commitment.
-pub const BMM_ANSWER_LEN: usize = 8 + 32 + 1 + 32;
+/// The `BmmAnswer` data: height, block hash, found, commitment, Solana block,
+/// recorded.
+pub const BMM_ANSWER_LEN: usize = 8 + 32 + 1 + 32 + 32 + 1;
 
 const OP_RETURN: u8 = 0x6a;
 
@@ -48,59 +49,68 @@ pub mod bridge {
         Ok(())
     }
 
-    /// Settles eCash height `height`, which block `block_hash` holds on the
-    /// active chain. The payee in its BMM commitment gets the whole treasury.
-    pub fn settle_bmm(ctx: Context<SettleBmm>, height: u64, block_hash: [u8; 32]) -> Result<()> {
-        require_eq!(
+    /// Settles the commitment at eCash height `height`, which block
+    /// `block_hash` holds on the active chain. The commitment must be
+    /// SHA-256(`solana_block` ‖ payee), and `solana_block` must be in the
+    /// block record of this fork. The payee gets the whole treasury, and the
+    /// cursor moves past `height`, so no lower height can settle later.
+    pub fn settle_bmm(
+        ctx: Context<SettleBmm>,
+        height: u64,
+        block_hash: [u8; 32],
+        solana_block: [u8; 32],
+    ) -> Result<()> {
+        require_gte!(
             height,
             ctx.accounts.config.bmm_next_height,
-            BridgeError::HeightOutOfOrder
+            BridgeError::HeightAlreadyPassed
         );
         let answer = BmmAnswer::read(&ctx.accounts.bmm_answer)?;
         require!(
-            answer.height == height && answer.block_hash == block_hash,
+            answer.height == height
+                && answer.block_hash == block_hash
+                && answer.solana_block == solana_block,
             BridgeError::AnswerForAnotherQuestion
         );
+        let commitment = answer.commitment.ok_or(BridgeError::NoCommitment)?;
+        let payee = &ctx.accounts.payee;
+        require!(
+            commitment_of(&solana_block, &payee.key()) == commitment,
+            BridgeError::PairDoesNotMatch
+        );
+        require!(answer.recorded, BridgeError::BlockNotRecorded);
 
-        if let Some(commitment) = answer.commitment {
-            let payee = &ctx.accounts.payee;
-            require_keys_eq!(
-                payee.key(),
-                Pubkey::new_from_array(commitment),
-                BridgeError::WrongPayeeAccount
+        let treasury = &ctx.accounts.treasury;
+        let payout = treasury
+            .lamports()
+            .saturating_sub(Rent::get()?.minimum_balance(0));
+        if payout > 0 && can_hold(payee, treasury.key(), payout)? {
+            let treasury_bump = ctx.accounts.config.treasury_bump;
+            let signer_seeds: &[&[&[u8]]] = &[&[TREASURY_SEED, &[treasury_bump]]];
+            transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.system_program.key(),
+                    Transfer {
+                        from: treasury.to_account_info(),
+                        to: payee.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                payout,
+            )?;
+            let config = &mut ctx.accounts.config;
+            config.bmm_paid_total = config
+                .bmm_paid_total
+                .checked_add(payout)
+                .ok_or(BridgeError::AmountOverflow)?;
+            msg!(
+                "eCash height {} pays {} lamports to {}",
+                height,
+                payout,
+                payee.key()
             );
-            let treasury = &ctx.accounts.treasury;
-            let payout = treasury
-                .lamports()
-                .saturating_sub(Rent::get()?.minimum_balance(0));
-            if payout > 0 && can_hold(payee, treasury.key(), payout)? {
-                let treasury_bump = ctx.accounts.config.treasury_bump;
-                let signer_seeds: &[&[&[u8]]] = &[&[TREASURY_SEED, &[treasury_bump]]];
-                transfer(
-                    CpiContext::new_with_signer(
-                        ctx.accounts.system_program.key(),
-                        Transfer {
-                            from: treasury.to_account_info(),
-                            to: payee.to_account_info(),
-                        },
-                        signer_seeds,
-                    ),
-                    payout,
-                )?;
-                let config = &mut ctx.accounts.config;
-                config.bmm_paid_total = config
-                    .bmm_paid_total
-                    .checked_add(payout)
-                    .ok_or(BridgeError::AmountOverflow)?;
-                msg!(
-                    "eCash height {} pays {} lamports to {}",
-                    height,
-                    payout,
-                    payee.key()
-                );
-            } else {
-                msg!("eCash height {} pays nothing to {}", height, payee.key());
-            }
+        } else {
+            msg!("eCash height {} pays nothing to {}", height, payee.key());
         }
 
         let config = &mut ctx.accounts.config;
@@ -209,13 +219,21 @@ pub mod bridge {
     }
 }
 
-/// The answer of the local enforcer to the first top-level `settle_bmm` of the
-/// tx.
+/// h* of a BMM bid: SHA-256(Solana block ‖ payee).
+pub fn commitment_of(solana_block: &[u8; 32], payee: &Pubkey) -> [u8; 32] {
+    solana_sha256_hasher::hashv(&[solana_block, payee.as_ref()]).to_bytes()
+}
+
+/// The answer of the local enforcer and of the bank to the first top-level
+/// `settle_bmm` of the tx.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BmmAnswer {
     pub height: u64,
     pub block_hash: [u8; 32],
     pub commitment: Option<[u8; 32]>,
+    pub solana_block: [u8; 32],
+    /// The block record of the bank holds `solana_block`.
+    pub recorded: bool,
 }
 
 impl BmmAnswer {
@@ -230,26 +248,30 @@ impl BmmAnswer {
         }
         let height = u64::from_le_bytes(data[..8].try_into().ok()?);
         let block_hash: [u8; 32] = data[8..40].try_into().ok()?;
-        let commitment: [u8; 32] = data[41..].try_into().ok()?;
-        match data[40] {
-            0 => Some(Self {
-                height,
-                block_hash,
-                commitment: None,
-            }),
-            1 => Some(Self {
-                height,
-                block_hash,
-                commitment: Some(commitment),
-            }),
-            _ => None,
-        }
+        let commitment: [u8; 32] = data[41..73].try_into().ok()?;
+        let commitment = match data[40] {
+            0 => None,
+            1 => Some(commitment),
+            _ => return None,
+        };
+        let solana_block: [u8; 32] = data[73..105].try_into().ok()?;
+        let recorded = match data[105] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        Some(Self {
+            height,
+            block_hash,
+            commitment,
+            solana_block,
+            recorded,
+        })
     }
 }
 
-/// True when the payee can take the payout. A settle that failed here would
-/// stop every later height, so a payee that cannot take it gets nothing, and
-/// the fees go to the next winner.
+/// True when the payee can take the payout. A payee that cannot take it gets
+/// nothing, and the fees go to the next winner.
 fn can_hold(payee: &UncheckedAccount, treasury: Pubkey, payout: u64) -> Result<bool> {
     if !payee.is_writable || payee.executable || payee.key() == treasury {
         return Ok(false);
@@ -285,10 +307,9 @@ pub struct SettleBmm<'info> {
     pub config: Account<'info, Config>,
     #[account(mut, seeds = [TREASURY_SEED], bump = config.treasury_bump)]
     pub treasury: SystemAccount<'info>,
-    /// CHECK: the program compares this key with the commitment in the answer,
-    /// and it pays only an account that the runtime lets it write. A `mut`
-    /// constraint would fail the tx for a payee that the runtime demotes, for
-    /// example a program, and that would stop every later height.
+    /// CHECK: the program hashes this key into the commitment, and it pays
+    /// only an account that the runtime lets it write. A `mut` constraint would
+    /// fail the tx for a payee that the runtime demotes, for example a program.
     pub payee: UncheckedAccount<'info>,
     /// CHECK: the address fixes the account, and the validator builds its data.
     #[account(address = BMM_ANSWER_ID)]
@@ -355,7 +376,7 @@ pub struct Config {
     pub deposit_high_water: u64,
     pub pegged_lamports: u64,
     pub withdrawal_count: u64,
-    /// The lowest eCash height that `settle_bmm` has not settled.
+    /// The cursor: the lowest eCash height that `settle_bmm` may still settle.
     pub bmm_next_height: u64,
     /// Every lamport that `settle_bmm` paid to a winner.
     pub bmm_paid_total: u64,
@@ -399,12 +420,16 @@ pub enum BridgeError {
     AmountAbovePeggedTotal,
     #[msg("The amount overflows a u64.")]
     AmountOverflow,
-    #[msg("Only the next eCash height can settle.")]
-    HeightOutOfOrder,
+    #[msg("The cursor is past this eCash height.")]
+    HeightAlreadyPassed,
     #[msg("The tx holds no BMM answer.")]
     NoAnswer,
-    #[msg("The BMM answer is for another eCash height or block.")]
+    #[msg("The BMM answer is for another eCash height, eCash block, or Solana block.")]
     AnswerForAnotherQuestion,
-    #[msg("The payee account is not the payee in the BMM commitment.")]
-    WrongPayeeAccount,
+    #[msg("The eCash block holds no BMM commitment for the sidechain.")]
+    NoCommitment,
+    #[msg("SHA-256 of the Solana block and the payee is not the commitment.")]
+    PairDoesNotMatch,
+    #[msg("The block record of this fork does not hold the Solana block.")]
+    BlockNotRecorded,
 }

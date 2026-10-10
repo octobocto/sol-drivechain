@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use anchor_lang::{prelude::Pubkey, Discriminator, InstructionData, ToAccountMetas};
 use litesvm::LiteSVM;
 use sol_drivechain_bridge::{
-    accounts, instruction, BmmAnswer, Config, WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN,
-    LAMPORTS_PER_SAT, MAX_SCRIPT_PUBKEY_LEN,
+    accounts, commitment_of, instruction, BmmAnswer, Config, WithdrawalRecord, BMM_ANSWER_ID,
+    BMM_ANSWER_LEN, LAMPORTS_PER_SAT, MAX_SCRIPT_PUBKEY_LEN,
 };
 use solana_account::Account;
 use solana_instruction::Instruction;
@@ -215,14 +215,16 @@ impl Chain {
 
     /// Writes the `BmmAnswer` account, the way the patched validator does
     /// for a tx with a top-level `settle_bmm`.
-    fn answer(&mut self, height: u64, block_hash: [u8; 32], payee: Option<Pubkey>) {
+    fn answer(&mut self, answer: BmmAnswer) {
         let mut data = vec![0u8; BMM_ANSWER_LEN];
-        data[..8].copy_from_slice(&height.to_le_bytes());
-        data[8..40].copy_from_slice(&block_hash);
-        if let Some(payee) = payee {
+        data[..8].copy_from_slice(&answer.height.to_le_bytes());
+        data[8..40].copy_from_slice(&answer.block_hash);
+        if let Some(commitment) = answer.commitment {
             data[40] = 1;
-            data[41..].copy_from_slice(payee.as_ref());
+            data[41..73].copy_from_slice(&commitment);
         }
+        data[73..105].copy_from_slice(&answer.solana_block);
+        data[105] = u8::from(answer.recorded);
         self.svm
             .set_account(
                 BMM_ANSWER_ID,
@@ -237,7 +239,19 @@ impl Chain {
             .unwrap();
     }
 
-    fn settle_ix(&self, height: u64, block_hash: [u8; 32], payee: Pubkey) -> Instruction {
+    /// The answer for a commitment at `height` in eCash block `BLOCK` to
+    /// `SOLANA_BLOCK` and `payee`, with the Solana block in the record.
+    fn win(&mut self, height: u64, payee: Pubkey) {
+        self.answer(BmmAnswer {
+            height,
+            block_hash: BLOCK,
+            commitment: Some(commitment_of(&SOLANA_BLOCK, &payee)),
+            solana_block: SOLANA_BLOCK,
+            recorded: true,
+        });
+    }
+
+    fn settle_ix(&self, height: u64, solana_block: [u8; 32], payee: Pubkey) -> Instruction {
         let mut metas = accounts::SettleBmm {
             config: self.config,
             treasury: self.treasury,
@@ -253,7 +267,15 @@ impl Chain {
                 meta.is_writable = true;
             }
         }
-        self.build(metas, instruction::SettleBmm { height, block_hash }.data())
+        self.build(
+            metas,
+            instruction::SettleBmm {
+                height,
+                block_hash: BLOCK,
+                solana_block,
+            }
+            .data(),
+        )
     }
 
     /// Sends the instructions in one tx, signed by a new stranger.
@@ -273,8 +295,8 @@ impl Chain {
             .map_err(|failed| format!("{:?}", failed.err))
     }
 
-    fn settle(&mut self, height: u64, block_hash: [u8; 32], payee: Pubkey) -> Result<(), String> {
-        let instruction = self.settle_ix(height, block_hash, payee);
+    fn settle(&mut self, height: u64, payee: Pubkey) -> Result<(), String> {
+        let instruction = self.settle_ix(height, SOLANA_BLOCK, payee);
         self.send_all(&[instruction])
     }
 
@@ -362,16 +384,29 @@ fn the_discriminator_is_eight_bytes_of_sha256() {
 }
 
 #[test]
-fn settle_bmm_carries_the_height_then_the_block_hash() {
-    // The patched validator reads the question at bytes 8 to 48.
+fn settle_bmm_carries_the_height_the_block_hash_then_the_solana_block() {
+    // The patched validator reads the question at bytes 8 to 80.
     let data = instruction::SettleBmm {
         height: 0x0102_0304_0506_0708,
         block_hash: [9u8; 32],
+        solana_block: [7u8; 32],
     }
     .data();
-    assert_eq!(data.len(), 48);
+    assert_eq!(data.len(), 80);
     assert_eq!(&data[8..16], &0x0102_0304_0506_0708u64.to_le_bytes());
     assert_eq!(&data[16..48], &[9u8; 32]);
+    assert_eq!(&data[48..80], &[7u8; 32]);
+}
+
+#[test]
+fn the_commitment_is_sha256_of_the_solana_block_then_the_payee() {
+    let payee = Pubkey::new_from_array([4u8; 32]);
+    let mut bytes = SOLANA_BLOCK.to_vec();
+    bytes.extend_from_slice(payee.as_ref());
+    assert_eq!(
+        commitment_of(&SOLANA_BLOCK, &payee),
+        solana_sha256_hasher::hash(&bytes).to_bytes()
+    );
 }
 
 #[test]
@@ -599,43 +634,48 @@ fn a_full_round_trip_returns_the_vault_to_its_genesis_balance() {
 }
 
 const BLOCK: [u8; 32] = [0xb1; 32];
-const OTHER_BLOCK: [u8; 32] = [0xb2; 32];
+const SOLANA_BLOCK: [u8; 32] = [0x5b; 32];
+const OTHER_SOLANA_BLOCK: [u8; 32] = [0x5c; 32];
 
 #[test]
-fn the_answer_decodes_found_and_none() {
+fn the_answer_decodes_found_none_and_recorded() {
     let mut data = vec![0u8; BMM_ANSWER_LEN];
     data[..8].copy_from_slice(&5u64.to_le_bytes());
     data[8..40].copy_from_slice(&BLOCK);
+    data[73..105].copy_from_slice(&SOLANA_BLOCK);
     assert_eq!(
         BmmAnswer::decode(&data),
         Some(BmmAnswer {
             height: 5,
             block_hash: BLOCK,
             commitment: None,
+            solana_block: SOLANA_BLOCK,
+            recorded: false,
         })
     );
     data[40] = 1;
-    data[41..].copy_from_slice(&[4u8; 32]);
-    assert_eq!(
-        BmmAnswer::decode(&data).unwrap().commitment,
-        Some([4u8; 32])
-    );
+    data[41..73].copy_from_slice(&[4u8; 32]);
+    data[105] = 1;
+    let answer = BmmAnswer::decode(&data).unwrap();
+    assert_eq!(answer.commitment, Some([4u8; 32]));
+    assert!(answer.recorded);
+    data[105] = 2;
+    assert_eq!(BmmAnswer::decode(&data), None);
+    data[105] = 1;
     data[40] = 2;
     assert_eq!(BmmAnswer::decode(&data), None);
-    assert_eq!(BmmAnswer::decode(&data[..40]), None);
+    assert_eq!(BmmAnswer::decode(&data[..105]), None);
 }
 
 #[test]
-fn a_win_pays_the_whole_treasury_above_the_reserve_to_the_payee() {
+fn a_valid_pair_pays_the_whole_treasury_above_the_reserve_to_the_payee() {
     let mut chain = Chain::start();
     let winner = chain.a_stranger().pubkey();
     let before = chain.balance(&winner);
     chain.pay_fees(3_000_000);
-    chain.answer(BMM_START, BLOCK, Some(winner));
+    chain.win(BMM_START, winner);
 
-    chain
-        .settle(BMM_START, BLOCK, winner)
-        .expect("the height settles");
+    chain.settle(BMM_START, winner).expect("the height settles");
 
     assert_eq!(chain.balance(&winner) - before, 3_000_000);
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE);
@@ -644,32 +684,70 @@ fn a_win_pays_the_whole_treasury_above_the_reserve_to_the_payee() {
 }
 
 #[test]
-fn a_height_with_no_commitment_pays_nobody() {
+fn a_height_with_no_commitment_fails() {
     let mut chain = Chain::start();
     let anyone = chain.a_stranger().pubkey();
     chain.pay_fees(1_000_000);
-    chain.answer(BMM_START, BLOCK, None);
+    chain.answer(BmmAnswer {
+        height: BMM_START,
+        block_hash: BLOCK,
+        commitment: None,
+        solana_block: SOLANA_BLOCK,
+        recorded: true,
+    });
 
-    chain
-        .settle(BMM_START, BLOCK, anyone)
-        .expect("an empty height settles");
-
+    assert!(chain.settle(BMM_START, anyone).is_err());
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
-    assert_eq!(chain.config().bmm_paid_total, 0);
-    assert_eq!(chain.config().bmm_next_height, BMM_START + 1);
+    assert_eq!(chain.config().bmm_next_height, BMM_START);
 }
 
 #[test]
-fn a_payee_account_that_is_not_the_commitment_fails() {
+fn a_payee_that_is_not_in_the_pair_fails() {
     let mut chain = Chain::start();
     let winner = chain.a_stranger().pubkey();
     let thief = chain.a_stranger().pubkey();
     let before = chain.balance(&thief);
     chain.pay_fees(1_000_000);
-    chain.answer(BMM_START, BLOCK, Some(winner));
+    chain.win(BMM_START, winner);
 
-    assert!(chain.settle(BMM_START, BLOCK, thief).is_err());
+    assert!(chain.settle(BMM_START, thief).is_err());
     assert_eq!(chain.balance(&thief), before);
+    assert_eq!(chain.config().bmm_next_height, BMM_START);
+}
+
+#[test]
+fn a_solana_block_that_is_not_in_the_pair_fails() {
+    let mut chain = Chain::start();
+    let winner = chain.a_stranger().pubkey();
+    chain.pay_fees(1_000_000);
+    chain.answer(BmmAnswer {
+        height: BMM_START,
+        block_hash: BLOCK,
+        commitment: Some(commitment_of(&SOLANA_BLOCK, &winner)),
+        solana_block: OTHER_SOLANA_BLOCK,
+        recorded: true,
+    });
+
+    let instruction = chain.settle_ix(BMM_START, OTHER_SOLANA_BLOCK, winner);
+    assert!(chain.send_all(&[instruction]).is_err());
+    assert_eq!(chain.config().bmm_next_height, BMM_START);
+}
+
+#[test]
+fn a_block_that_the_record_does_not_hold_fails() {
+    let mut chain = Chain::start();
+    let winner = chain.a_stranger().pubkey();
+    chain.pay_fees(1_000_000);
+    chain.answer(BmmAnswer {
+        height: BMM_START,
+        block_hash: BLOCK,
+        commitment: Some(commitment_of(&SOLANA_BLOCK, &winner)),
+        solana_block: SOLANA_BLOCK,
+        recorded: false,
+    });
+
+    assert!(chain.settle(BMM_START, winner).is_err());
+    assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
     assert_eq!(chain.config().bmm_next_height, BMM_START);
 }
 
@@ -679,11 +757,9 @@ fn a_payee_that_cannot_hold_the_payout_gets_nothing_and_the_height_settles() {
     // An account that does not exist cannot take less than its rent reserve.
     let empty = Keypair::new().pubkey();
     chain.pay_fees(1_000);
-    chain.answer(BMM_START, BLOCK, Some(empty));
+    chain.win(BMM_START, empty);
 
-    chain
-        .settle(BMM_START, BLOCK, empty)
-        .expect("the height settles");
+    chain.settle(BMM_START, empty).expect("the height settles");
 
     assert_eq!(chain.balance(&empty), 0);
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000);
@@ -695,11 +771,9 @@ fn a_new_payee_account_takes_a_payout_above_its_rent_reserve() {
     let mut chain = Chain::start();
     let fresh = Keypair::new().pubkey();
     chain.pay_fees(2_000_000);
-    chain.answer(BMM_START, BLOCK, Some(fresh));
+    chain.win(BMM_START, fresh);
 
-    chain
-        .settle(BMM_START, BLOCK, fresh)
-        .expect("the height settles");
+    chain.settle(BMM_START, fresh).expect("the height settles");
     assert_eq!(chain.balance(&fresh), 2_000_000);
 }
 
@@ -708,10 +782,10 @@ fn the_treasury_as_the_payee_gets_nothing_and_the_height_settles() {
     let mut chain = Chain::start();
     let treasury = chain.treasury;
     chain.pay_fees(2_000_000);
-    chain.answer(BMM_START, BLOCK, Some(treasury));
+    chain.win(BMM_START, treasury);
 
     chain
-        .settle(BMM_START, BLOCK, treasury)
+        .settle(BMM_START, treasury)
         .expect("the height settles");
     assert_eq!(chain.balance(&treasury), TREASURY_RESERVE + 2_000_000);
     assert_eq!(chain.config().bmm_next_height, BMM_START + 1);
@@ -720,14 +794,13 @@ fn the_treasury_as_the_payee_gets_nothing_and_the_height_settles() {
 #[test]
 fn an_executable_payee_gets_nothing_and_the_height_settles() {
     let mut chain = Chain::start();
-    // The runtime refuses a lamport change on an executable account, so a
-    // settle that paid it would fail and stop every later height.
+    // The runtime refuses a lamport change on an executable account.
     let program = chain.program_id;
     chain.pay_fees(2_000_000);
-    chain.answer(BMM_START, BLOCK, Some(program));
+    chain.win(BMM_START, program);
 
     chain
-        .settle(BMM_START, BLOCK, program)
+        .settle(BMM_START, program)
         .expect("the height settles");
 
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 2_000_000);
@@ -736,29 +809,68 @@ fn an_executable_payee_gets_nothing_and_the_height_settles() {
 }
 
 #[test]
-fn a_height_out_of_order_fails() {
+fn a_later_settle_skips_the_earlier_heights_for_ever() {
     let mut chain = Chain::start();
-    let anyone = chain.a_stranger().pubkey();
-    chain.answer(BMM_START + 1, BLOCK, None);
-    assert!(chain.settle(BMM_START + 1, BLOCK, anyone).is_err());
+    let skipped = chain.a_stranger().pubkey();
+    let later = chain.a_stranger().pubkey();
+    chain.win(BMM_START + 3, later);
+    chain
+        .settle(BMM_START + 3, later)
+        .expect("a later height settles");
+    assert_eq!(chain.config().bmm_next_height, BMM_START + 4);
+
+    chain.win(BMM_START, skipped);
+    assert!(chain.settle(BMM_START, skipped).is_err());
+    chain.win(BMM_START + 3, later);
+    assert!(chain.settle(BMM_START + 3, later).is_err());
+    assert_eq!(chain.config().bmm_next_height, BMM_START + 4);
 }
 
 #[test]
-fn a_height_settles_only_once() {
+fn the_fees_of_skipped_heights_roll_over_to_the_next_payee() {
     let mut chain = Chain::start();
-    let anyone = chain.a_stranger().pubkey();
-    chain.answer(BMM_START, BLOCK, None);
-    chain
-        .settle(BMM_START, BLOCK, anyone)
-        .expect("the height settles");
-    assert!(chain.settle(BMM_START, BLOCK, anyone).is_err());
+    let first = chain.a_stranger().pubkey();
+    let skipped = chain.a_stranger().pubkey();
+    let later = chain.a_stranger().pubkey();
+    let first_before = chain.balance(&first);
+    let later_before = chain.balance(&later);
+
+    chain.pay_fees(1_000_000);
+    chain.win(BMM_START, first);
+    chain.settle(BMM_START, first).expect("height one");
+    chain.pay_fees(2_000_000);
+    // Height two has a commitment, but nobody settles it.
+    chain.pay_fees(500_000);
+    chain.win(BMM_START + 2, later);
+    chain.settle(BMM_START + 2, later).expect("height three");
+
+    assert_eq!(chain.balance(&first) - first_before, 1_000_000);
+    assert_eq!(chain.balance(&later) - later_before, 2_500_000);
+    assert_eq!(chain.config().bmm_paid_total, 3_500_000);
+    chain.win(BMM_START + 1, skipped);
+    assert!(chain.settle(BMM_START + 1, skipped).is_err());
+}
+
+#[test]
+fn the_cursor_takes_heights_in_order() {
+    let mut chain = Chain::start();
+    let payee = chain.a_stranger().pubkey();
+    for height in [BMM_START, BMM_START + 1, BMM_START + 5] {
+        chain.win(height, payee);
+        chain
+            .settle(height, payee)
+            .expect("each higher height settles");
+        assert_eq!(chain.config().bmm_next_height, height + 1);
+    }
+    chain.win(BMM_START + 4, payee);
+    assert!(chain.settle(BMM_START + 4, payee).is_err());
 }
 
 #[test]
 fn a_tx_without_an_answer_fails() {
     let mut chain = Chain::start();
     let anyone = chain.a_stranger().pubkey();
-    assert!(chain.settle(BMM_START, BLOCK, anyone).is_err());
+    assert!(chain.settle(BMM_START, anyone).is_err());
     assert_eq!(chain.config().bmm_next_height, BMM_START);
 }
 
@@ -766,16 +878,22 @@ fn a_tx_without_an_answer_fails() {
 fn an_answer_for_another_height_fails() {
     let mut chain = Chain::start();
     let winner = chain.a_stranger().pubkey();
-    chain.answer(BMM_START + 1, BLOCK, Some(winner));
-    assert!(chain.settle(BMM_START, BLOCK, winner).is_err());
+    chain.win(BMM_START + 1, winner);
+    assert!(chain.settle(BMM_START, winner).is_err());
 }
 
 #[test]
 fn an_answer_for_another_block_fails() {
     let mut chain = Chain::start();
     let winner = chain.a_stranger().pubkey();
-    chain.answer(BMM_START, OTHER_BLOCK, Some(winner));
-    assert!(chain.settle(BMM_START, BLOCK, winner).is_err());
+    chain.answer(BmmAnswer {
+        height: BMM_START,
+        block_hash: [0xb2; 32],
+        commitment: Some(commitment_of(&SOLANA_BLOCK, &winner)),
+        solana_block: SOLANA_BLOCK,
+        recorded: true,
+    });
+    assert!(chain.settle(BMM_START, winner).is_err());
 }
 
 #[test]
@@ -783,39 +901,12 @@ fn a_second_settle_in_the_same_tx_fails_the_tx() {
     let mut chain = Chain::start();
     let winner = chain.a_stranger().pubkey();
     chain.pay_fees(1_000_000);
-    chain.answer(BMM_START, BLOCK, Some(winner));
+    chain.win(BMM_START, winner);
 
-    let first = chain.settle_ix(BMM_START, BLOCK, winner);
-    let second = chain.settle_ix(BMM_START + 1, OTHER_BLOCK, winner);
+    let first = chain.settle_ix(BMM_START, SOLANA_BLOCK, winner);
+    let second = chain.settle_ix(BMM_START + 1, SOLANA_BLOCK, winner);
     assert!(chain.send_all(&[first.clone(), second]).is_err());
-    let repeat = chain.settle_ix(BMM_START, BLOCK, winner);
+    let repeat = chain.settle_ix(BMM_START, SOLANA_BLOCK, winner);
     assert!(chain.send_all(&[first, repeat]).is_err());
     assert_eq!(chain.config().bmm_next_height, BMM_START);
-}
-
-#[test]
-fn each_winner_gets_the_fees_between_two_settles() {
-    let mut chain = Chain::start();
-    let first = chain.a_stranger().pubkey();
-    let second = chain.a_stranger().pubkey();
-    let first_before = chain.balance(&first);
-    let second_before = chain.balance(&second);
-
-    chain.pay_fees(1_000_000);
-    chain.answer(BMM_START, BLOCK, Some(first));
-    chain.settle(BMM_START, BLOCK, first).expect("height one");
-    chain.pay_fees(2_000_000);
-    chain.answer(BMM_START + 1, OTHER_BLOCK, None);
-    chain
-        .settle(BMM_START + 1, OTHER_BLOCK, first)
-        .expect("an empty height");
-    chain.pay_fees(500_000);
-    chain.answer(BMM_START + 2, BLOCK, Some(second));
-    chain
-        .settle(BMM_START + 2, BLOCK, second)
-        .expect("height three");
-
-    assert_eq!(chain.balance(&first) - first_before, 1_000_000);
-    assert_eq!(chain.balance(&second) - second_before, 2_500_000);
-    assert_eq!(chain.config().bmm_paid_total, 3_500_000);
 }
