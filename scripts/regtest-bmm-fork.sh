@@ -9,6 +9,10 @@
 #
 # Each bid commits h* = SHA-256(bank hash ‖ payee) for the newest block in the
 # block record of one node, and the daemon publishes the pair to that node.
+#
+# A credit loop in each namespace credits the deposits of each eCash height on
+# the branch that its node follows. A checkpoint at eCash height H counts only
+# when its bank credited every deposit through H - LAG.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +21,11 @@ REPO="$(cd "$HERE/.." && pwd)"
 ROOT="${ROOT:-$HOME/bmm-fork-regtest}"
 SLOT="${SLOT:-8}"
 K="${BMM_ROOT_DEPTH:-2}"
-L="${BMM_FALLBACK_BLOCKS:-6}"
+L="${BMM_FALLBACK_BLOCKS:-8}"
+# D, the eCash confirmations before a credit, and the lag of rule 3. A short
+# lag lets a censoring branch lose its checkpoints within a few blocks.
+DEPOSIT_D="${DEPOSIT_D:-2}"
+LAG="${DEPOSIT_LAG:-5}"
 # N, the eCash blocks on top of a commitment before its settle.
 N="${BMM_CONFIRMATIONS:-$K}"
 MEMORY_MAX="${MEMORY_MAX:-3G}"
@@ -95,6 +103,44 @@ bridge_value() {
   dn_solana M bridge-state --program-id "$PROGRAM_ID" | awk -v key="$1" '$0 ~ "^"key {print $NF}'
 }
 lamports() { sol M balance "$1" --lamports | awk '{print $1}'; }
+# The lamports of an account on the branch that a node follows.
+lamports_on() { sol "$1" balance "$2" --lamports --commitment processed | awk '{print $1}'; }
+# The highest eCash height that the branch of a node credited in full.
+credited() {
+  dn_solana "$1" bridge-state --program-id "$PROGRAM_ID" --processed \
+    | awk '/^credited height/ {print $NF}'
+}
+wait_credited() {
+  local node=$1 height=$2
+  for _ in $(seq 1 240); do
+    [ "$(credited "$node")" -ge "$height" ] && return 0
+    sleep 1
+  done
+  fail "the branch of node $node credited only through eCash height $(credited "$node"), not $height"
+}
+
+# Starts the credit loop of a node in its namespace. Anyone can credit, and
+# each loop credits on the branch that its node follows. The loop stops when
+# its validator restarts, and the shell starts it again, as systemd does.
+start_credit() {
+  local node=$1
+  in_ns "$(ns_of "$node")" bash -c 'while true; do
+      "$0" credit --enforcer-url "$1" --solana-rpc-url "$2" --slot "$3" \
+        --program-id "$4" --payer "$5"
+      sleep 2
+    done' "$D" "http://$(enforcer_of "$node"):$GRPC_PORT" "$(url_of "$node")" "$SLOT" \
+    "$PROGRAM_ID" "$ROOT/faucet.json" >> "$ROOT/credit-$node.log" 2>&1 &
+  if [ "$node" = M ]; then CREDIT_M=$!; else CREDIT_H=$!; fi
+}
+stop_credit() {
+  local pid children
+  if [ "$1" = M ]; then pid=$CREDIT_M; else pid=$CREDIT_H; fi
+  children="$(pgrep -P "$pid" || true)"
+  kill "$pid"
+  # shellcheck disable=SC2086
+  [ -z "$children" ] || kill $children 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
 lines() { wc -l < "$(log_of "$1")"; }
 # The log lines of a node after a line number.
 log_since() { tail -n +"$(($2 + 1))" "$(log_of "$1")"; }
@@ -158,6 +204,11 @@ wait_recorded_above() {
 bid() {
   local node=$1 first out
   shift
+  # An honest bidder names a block that credited every deposit that the next
+  # eCash height asks for. A bid with --block names its own block.
+  if [[ " $* " != *" --block "* ]] && [ "${CENSOR:-0}" != 1 ]; then
+    wait_credited "$node" $(( $(tip) + 1 - LAG ))
+  fi
   first="$(recorded "$node" | awk '{print $1}')"
   for _ in $(seq 1 120); do
     [ "$(recorded "$node" | awk '{print $1}')" != "$first" ] && break
@@ -197,6 +248,18 @@ settle() {
   dn_solana M settle-bmm --program-id "$PROGRAM_ID" \
     --identity "$ROOT/keys-m/validator-identity.json" --height "$height" \
     --block-hash "$(btc getblockhash "$height")" --solana-block "$block" --payee "$PAYEE"
+}
+
+# The enforcer follows the node. Right after a reorg its block template still
+# names the old tip, and a mine call then fails. So every reorg waits here.
+wait_for_enforcer() {
+  for _ in $(seq 1 60); do
+    if [ "$(btc getbestblockhash)" = "$(d ecash-tip "${E[@]}" | awk '{print $2}')" ]; then
+      return 0
+    fi
+    sleep 2
+  done
+  fail "the enforcer did not reach the node tip"
 }
 
 partition() { ip -n "$NS_M" link set vm0 down; }
@@ -390,8 +453,14 @@ done
 [ $((M_SLOT - H_SLOT)) -lt 10 ] || fail "H did not catch up: M at $M_SLOT, H at $H_SLOT"
 sol M validators | grep -E "$M_ID|$H_ID" || fail "the validators are not active"
 dn_solana M initialize --program-id "$PROGRAM_ID" --payer "$ROOT/oracle.json" \
-  --oracle "$ROOT/oracle.json" --bmm-start-height "$(tip)" >/dev/null
-pass "M at slot $M_SLOT and H at slot $H_SLOT; the bridge settles from eCash height $(bridge_value "bmm next height")"
+  --oracle "$ROOT/oracle.json" --bmm-start-height "$(tip)" \
+  --deposit-confirmations "$DEPOSIT_D" --deposit-lag "$LAG" >/dev/null
+start_credit M
+start_credit H
+mine "$DEPOSIT_D"
+wait_credited M "$(( $(tip) - DEPOSIT_D ))"
+wait_credited H "$(( $(tip) - DEPOSIT_D ))"
+pass "M at slot $M_SLOT and H at slot $H_SLOT; the bridge settles from eCash height $(bridge_value "bmm next height"), and both credit loops run"
 
 # ---------------------------------------------------------------------------
 step "1. normal: a checkpoint anchors, and the root follows it after K blocks"
@@ -533,6 +602,8 @@ sleep 5
 MARK_M=$(lines M)
 start_validator M
 wait_rpc M
+# The stop took every process of the namespace, the credit loop too.
+start_credit M
 wait_log M "BMM fork choice is on" "$MARK_M" 60
 if tail -n +"$((MARK_M + 1))" "$(log_of M)" | grep -aq "found new cluster confirmed root"; then
   fail "M took a root from the stake votes at start"
@@ -610,5 +681,101 @@ fi
 [ "$(bridge_value "bmm next height")" = $((HN + 1)) ] || fail "the late settle moved the cursor"
 pass "the withheld pair stayed pending, the settle of height $HN took the rolled-over fees, and height $HW cannot settle later"
 
+# ---------------------------------------------------------------------------
+step "9. a censoring stake majority loses: its checkpoints fail rule 3"
+stop_credit M
+MARK_M=$(lines M) MARK_H=$(lines H)
+read -r T9 C9 _ < <(checkpoint H)
+wait_log M "head Some\($C9\)" "$MARK_M" >/dev/null
+wait_log H "head Some\($C9\)" "$MARK_H" >/dev/null
+partition
+echo "the link is down at eCash height $T9, and M credits nothing from here on"
+mine 3
+read -r X1 M1 _ < <(CENSOR=1 checkpoint M)
+read -r X2 M2 _ < <(CENSOR=1 checkpoint M)
+echo "M commits slots $M1 and $M2 at eCash heights $X1 and $X2; its branch credited only through $(credited M)"
+wait_log M "the checkpoint at eCash height $X1 fails rule 3" "$MARK_M" 60
+wait_log M "the checkpoint at eCash height $X2 fails rule 3" "$MARK_M" 60
+read -r B9 _ < <(bid H)
+heal
+echo "the link is up; H bid for slot $B9 on its branch, which credited through $(credited H)"
+sleep 10
+MARK_M=$(lines M) MARK_H=$(lines H)
+mine 1
+Y9="$(tip)"
+wait_log H "head Some\($B9\)" "$MARK_H" >/dev/null
+wait_log M "head Some\($B9\)" "$MARK_M" 240
+wait_log M "resets the tower" "$MARK_M" 60
+mine "$K"
+wait_log M "moves the root from [0-9]+ to anchor $B9\$" "$MARK_M"
+wait_log H "moves the root from [0-9]+ to anchor $B9\$" "$MARK_H"
+for slot in "$M1" "$M2"; do
+  if grep -aqE "head Some\($slot\)" "$(log_of M)" "$(log_of H)"; then
+    fail "a node counted the checkpoint of the censoring branch at slot $slot"
+  fi
+done
+grep -aE "checkpoint at eCash height ($X1|$X2) fails rule 3" "$(log_of H)" | tail -2 || true
+start_credit M
+sleep 10
+read -r C9B C9B_HASH < <(confirmed_frozen M)
+[ "$(frozen_hash H "$C9B")" = "$C9B_HASH" ] || fail "M and H froze slot $C9B with other hashes"
+pass "two checkpoints of the censoring branch failed rule 3; one honest checkpoint at eCash height $Y9 won, and M follows H at slot $C9B"
+
+# ---------------------------------------------------------------------------
+step "10. an eCash reorg deeper than D drops a credited deposit, and the nodes leave its branch"
+"$SOLANA_KEYGEN" new --no-bip39-passphrase --silent -o "$ROOT/target.json"
+TARGET="$("$SOLANA_KEYGEN" pubkey "$ROOT/target.json")"
+DEPOSIT_SATS=2000000
+read -r T10 C10 _ < <(checkpoint M)
+mine 1
+d deposit "${E[@]}" --pubkey "$TARGET" --sats "$DEPOSIT_SATS" >/dev/null
+mine 1
+H10="$(tip)"
+mine "$DEPOSIT_D"
+wait_credited M "$H10"
+wait_credited H "$H10"
+[ "$(lamports_on M "$TARGET")" = $((DEPOSIT_SATS * 10)) ] || fail "M did not credit the deposit"
+[ "$(lamports_on H "$TARGET")" = $((DEPOSIT_SATS * 10)) ] || fail "H did not credit the deposit"
+wait_recorded_above M "$(sol M slot --commitment processed)"
+read -r OLD10_SLOT OLD10 < <(recorded M)
+echo "eCash height $H10 holds the deposit; both branches credited it, and slot $OLD10_SLOT ($OLD10) holds the credit"
+MARK_M=$(lines M) MARK_H=$(lines H)
+REORG_FROM=$((H10 - 1))
+btc invalidateblock "$(btc getblockhash "$REORG_FROM")" >/dev/null
+for _ in $(seq 1 $((DEPOSIT_D + 2))); do
+  btc generateblock "$COINBASE" '[]' >/dev/null
+done
+wait_for_enforcer
+echo "eCash reorged $((DEPOSIT_D + 2)) blocks from height $REORG_FROM, deeper than D = $DEPOSIT_D; the new blocks hold no deposit"
+wait_log M "credit deposits of eCash blocks that the active chain dropped" "$MARK_M" 60
+wait_log H "credit deposits of eCash blocks that the active chain dropped" "$MARK_H" 60
+wait_log M "BMM fork choice selects slot [0-9]+ over slot" "$MARK_M" 60
+for node in M H; do
+  for _ in $(seq 1 60); do
+    [ "$(lamports_on "$node" "$TARGET")" = 0 ] && break
+    sleep 1
+  done
+  [ "$(lamports_on "$node" "$TARGET")" = 0 ] || fail "node $node still follows the branch with the credit"
+done
+bid H --block "$OLD10" >/dev/null
+mine 1
+Z10="$(tip)"
+wait_log M "the checkpoint at eCash height $Z10 fails rule 3: block $OLD10 credited deposits of an eCash block that the active chain dropped" "$MARK_M" 60
+wait_log H "the checkpoint at eCash height $Z10 fails rule 3: block $OLD10" "$MARK_H" 60
+read -r Y10 S10 _ < <(checkpoint M)
+wait_log M "head Some\($S10\)" "$MARK_M" 120 >/dev/null
+wait_log H "head Some\($S10\)" "$MARK_H" 120 >/dev/null
+mine "$K"
+wait_log M "moves the root from [0-9]+ to anchor $S10\$" "$MARK_M"
+wait_log H "moves the root from [0-9]+ to anchor $S10\$" "$MARK_H"
+sleep 10
+read -r C10B C10B_HASH < <(confirmed_frozen H)
+[ "$(frozen_hash M "$C10B")" = "$C10B_HASH" ] || fail "M and H froze slot $C10B with other hashes"
+# The new branch credits the new eCash blocks at the same heights, and the
+# dropped deposit stays out of it.
+wait_credited M "$H10"
+[ "$(lamports_on M "$TARGET")" = 0 ] || fail "the new branch holds the dropped deposit"
+pass "the reorg dropped the credit at slot $OLD10_SLOT; a checkpoint to it at eCash height $Z10 failed rule 3; both nodes rooted slot $S10 on a branch without it, which credited the new eCash height $H10 with no deposit"
+
 echo
-echo "PASS: BMM checkpoints select the fork and move the root in all eight cases."
+echo "PASS: BMM checkpoints select the fork and move the root in all ten cases."

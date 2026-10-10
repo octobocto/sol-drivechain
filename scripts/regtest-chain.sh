@@ -224,7 +224,7 @@ up() {
   echo "== the peg, the BMM loop, and the miner"
   start_process peg "$D" run --network regtest --enforcer-url "$ENFORCER_URL" \
     --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$(program_id)" \
-    --oracle "$ROOT/keys/oracle.json" --confirmations 1 --bundle-interval-secs 10
+    --oracle "$ROOT/keys/oracle.json" --bundle-interval-secs 10
   start_process bmm "$D" bmm --enforcer-url "$ENFORCER_URL" \
     --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$(program_id)" \
     --identity "$ROOT/keys/validator-identity.json" \

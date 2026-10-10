@@ -18,6 +18,9 @@ WITHDRAW_FEE_SATS="${WITHDRAW_FEE_SATS:-10000}"
 # N: the eCash blocks on top of a block before its settle. The validators and
 # the BMM loop must use the same value.
 BMM_CONFIRMATIONS="${BMM_CONFIRMATIONS:-6}"
+# D: the eCash confirmations before a credit. It stays above the deepest
+# reorg of this test, 9 blocks, so no reorg here drops a credited deposit.
+DEPOSIT_CONFIRMATIONS="${DEPOSIT_CONFIRMATIONS:-10}"
 # The eCash builds keep an OP_DRIVECHAIN deposit out of the regtest mempool
 # under the standard policy, so the node takes a nonstandard tx.
 export ACCEPT_NONSTD="${ACCEPT_NONSTD:-1}"
@@ -132,7 +135,7 @@ step "the bridge"
 BMM_START="$(btc getblockcount)"
 "$D" initialize --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
   --payer "$ROOT/keys/oracle.json" --oracle "$ROOT/keys/oracle.json" \
-  --bmm-start-height "$BMM_START"
+  --bmm-start-height "$BMM_START" --deposit-confirmations "$DEPOSIT_CONFIRMATIONS"
 
 step "claim sidechain slot $SLOT"
 "$D" propose-slot $E >/dev/null
@@ -166,7 +169,7 @@ step "peg in $DEPOSIT_SATS sats"
 start_peg() {
   nohup "$D" run --network regtest --enforcer-url "$ENFORCER_URL" \
     --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$PROGRAM_ID" \
-    --oracle "$ROOT/keys/oracle.json" --confirmations 1 --bundle-interval-secs 10 \
+    --oracle "$ROOT/keys/oracle.json" --bundle-interval-secs 10 \
     >> "$ROOT/peg.log" 2>&1 &
   PEG_PID=$!
   PIDS+=("$PEG_PID")
@@ -180,10 +183,12 @@ lamports_of() {
 start_peg
 
 "$D" deposit $E --pubkey "$USER_PUBKEY" --sats "$DEPOSIT_SATS"
-"$D" mine $E --blocks 2 --address "$COINBASE" >/dev/null
+"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
 
+# The credit loop credits every eCash height in order, and the empty heights
+# since the bridge start come first.
 WANT_LAMPORTS=$((DEPOSIT_SATS * 10))
-for _ in $(seq 1 30); do
+for _ in $(seq 1 120); do
   GOT="$("$SOLANA" -u "$SOLANA_URL" balance "$USER_PUBKEY" --lamports 2>/dev/null | awk '{print $1}')"
   [ "${GOT:-0}" = "$WANT_LAMPORTS" ] && break
   sleep 3
@@ -193,30 +198,29 @@ echo "PASS: the peg in credited $GOT lamports for $DEPOSIT_SATS sats"
 "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID"
 
 step "peg in while the daemon is down"
-# The event stream starts at the next block, so without a replay this deposit
-# would sit in the treasury and nobody could claim it.
+# The credits follow the cursor in the bridge config, so a restart misses no
+# deposit.
 kill "$PEG_PID"
 wait "$PEG_PID" 2>/dev/null || true
 DOWN_SATS=1500000
 DOWN_PUBKEY="$("$D" seed-pubkey --mnemonic-file "$MNEMONIC_FILE" --account 1 | awk '{print $2}')"
 "$D" deposit $E --pubkey "$DOWN_PUBKEY" --sats "$DOWN_SATS"
-"$D" mine $E --blocks 2 --address "$COINBASE" >/dev/null
+"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
 start_peg
 
 WANT_DOWN=$((DOWN_SATS * 10))
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
   GOT_DOWN="$(lamports_of "$DOWN_PUBKEY")"
   [ "${GOT_DOWN:-0}" = "$WANT_DOWN" ] && break
   sleep 3
 done
 [ "${GOT_DOWN:-0}" = "$WANT_DOWN" ] || fail "the downtime deposit gave ${GOT_DOWN:-0} lamports, not $WANT_DOWN"
-echo "PASS: the replay credited $GOT_DOWN lamports that landed while the daemon was down"
+echo "PASS: the restarted loop credited $GOT_DOWN lamports that landed while the daemon was down"
 
-# The replay also walks the first deposit. The bridge credited it before, so
-# the daemon must skip it, and stay up.
-[ "$(lamports_of "$USER_PUBKEY")" = "$WANT_LAMPORTS" ] || fail "the replay credited the first deposit twice"
-kill -0 "$PEG_PID" 2>/dev/null || fail "the daemon stopped on the replay"
-echo "PASS: the replay skipped the deposit it credited before, and the daemon runs"
+# The cursor never goes back, so the first deposit stays credited one time.
+[ "$(lamports_of "$USER_PUBKEY")" = "$WANT_LAMPORTS" ] || fail "the first deposit got credited twice"
+kill -0 "$PEG_PID" 2>/dev/null || fail "the daemon stopped after the restart"
+echo "PASS: the first deposit stayed credited one time, and the daemon runs"
 
 step "lose the wallet, then recover it from the seed phrase alone"
 rm -f "$USER_KEY"
@@ -283,10 +287,12 @@ echo "the treasury holds $TREASURY_BEFORE lamports of fees and reserve"
 # A bid offers a part of the fee income, so the chain must earn fees. Ten
 # transfers pay 100 lamports, which is 10 satoshis.
 ORACLE_PUBKEY="$("$SOLANA_KEYGEN" pubkey "$ROOT/keys/oracle.json")"
+# Each transfer takes another amount, so two of them under one blockhash are
+# not the same tx.
 earn_fees() {
-  for _ in $(seq 1 10); do
-    "$SOLANA" -u "$SOLANA_URL" transfer --keypair "$USER_KEY" "$ORACLE_PUBKEY" 0.000001 \
-      --no-wait >/dev/null
+  for index in $(seq 0 9); do
+    "$SOLANA" -u "$SOLANA_URL" transfer --keypair "$USER_KEY" "$ORACLE_PUBKEY" \
+      "0.00000100$index" --no-wait >/dev/null
   done
 }
 
