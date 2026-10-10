@@ -50,6 +50,9 @@ jobs:
       - name: Build the patched solana-genesis and agave-validator
         run: bash patches/build-agave.sh
 
+      - name: Test the BMM crate of the patched Agave
+        run: cd ~/src/agave && cargo test --release -p sol-drivechain-bmm --features poller
+
       - name: Cache the enforcer build
         uses: actions/cache@v4
         with:
