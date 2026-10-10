@@ -20,6 +20,34 @@ pub const TREASURY_SEED: &[u8] = b"treasury";
 pub const BMM_ANSWER_ID: Pubkey =
     Pubkey::from_str_const("BmmAnswer1111111111111111111111111111111111");
 
+/// The block record of the patched validator: the bank hash of the last block
+/// of each stride of slots on the fork. A settle pays only a commitment to a
+/// block in it. It must match `BMM_BLOCKS_ID` in the Agave patch.
+pub const BMM_BLOCKS_ID: Pubkey =
+    Pubkey::from_str_const("BmmB1ocks1111111111111111111111111111111111");
+
+/// One record entry: the slot, then the bank hash.
+const BLOCK_RECORD_ENTRY_LEN: usize = 8 + 32;
+
+/// The newest block in a block record: its slot and its bank hash.
+pub fn newest_recorded_block(record: &[u8]) -> Option<(u64, [u8; 32])> {
+    record
+        .chunks_exact(BLOCK_RECORD_ENTRY_LEN)
+        .filter_map(|entry| {
+            let (slot, hash) = entry.split_first_chunk::<8>()?;
+            let hash: [u8; 32] = hash.try_into().ok()?;
+            (hash != [0u8; 32]).then_some((u64::from_le_bytes(*slot), hash))
+        })
+        .max_by_key(|(slot, _)| *slot)
+}
+
+/// h* of a BMM bid: SHA-256(Solana bank hash ‖ payee).
+pub fn commitment_of(solana_block: &[u8; 32], payee: &Pubkey) -> [u8; 32] {
+    let mut bytes = solana_block.to_vec();
+    bytes.extend_from_slice(payee.as_ref());
+    sha256::Hash::hash(&bytes).to_byte_array()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error("the account holds {found} bytes, but `{name}` asks for at least {want}")]
@@ -253,18 +281,20 @@ pub fn mark_paid_ix(
     }
 }
 
-/// Settles eCash height `height`, which `block_hash` holds on the active
-/// chain. `payee` must be the key in its BMM commitment, or any account when
-/// the coinbase holds none. `block_hash` is in the internal byte order.
+/// Settles the commitment at eCash height `height`, which `block_hash` holds on
+/// the active chain. The commitment must be SHA-256(`solana_block` ‖ `payee`).
+/// `block_hash` is in the internal byte order.
 pub fn settle_bmm_ix(
     program_id: &Pubkey,
     height: u64,
     block_hash: &[u8; 32],
+    solana_block: &[u8; 32],
     payee: &Pubkey,
 ) -> Instruction {
     let mut data = discriminator("global", "settle_bmm").to_vec();
     data.extend_from_slice(&height.to_le_bytes());
     data.extend_from_slice(block_hash);
+    data.extend_from_slice(solana_block);
     Instruction {
         program_id: *program_id,
         accounts: vec![
@@ -577,13 +607,14 @@ mod tests {
     }
 
     #[test]
-    fn the_settle_instruction_carries_the_height_and_the_block_hash() {
+    fn the_settle_instruction_carries_the_height_the_block_hash_and_the_solana_block() {
         let program_id = a_program_id();
         let payee = Pubkey::new_from_array([8u8; 32]);
-        let ix = settle_bmm_ix(&program_id, 77, &[5u8; 32], &payee);
+        let ix = settle_bmm_ix(&program_id, 77, &[5u8; 32], &[6u8; 32], &payee);
         assert_eq!(&ix.data[..8], discriminator("global", "settle_bmm"));
         assert_eq!(&ix.data[8..16], &77u64.to_le_bytes());
-        assert_eq!(&ix.data[16..], &[5u8; 32]);
+        assert_eq!(&ix.data[16..48], &[5u8; 32]);
+        assert_eq!(&ix.data[48..], &[6u8; 32]);
         assert_eq!(ix.accounts[2].pubkey, payee);
         assert!(ix.accounts[2].is_writable);
         assert_eq!(ix.accounts[3].pubkey, BMM_ANSWER_ID);
@@ -591,10 +622,37 @@ mod tests {
     }
 
     #[test]
+    fn the_newest_recorded_block_has_the_highest_slot() {
+        let mut record = vec![0u8; 4 * BLOCK_RECORD_ENTRY_LEN];
+        for (index, slot) in [(0usize, 70u64), (1, 130), (2, 99)] {
+            let at = index * BLOCK_RECORD_ENTRY_LEN;
+            record[at..at + 8].copy_from_slice(&slot.to_le_bytes());
+            record[at + 8..at + BLOCK_RECORD_ENTRY_LEN].copy_from_slice(&[slot as u8; 32]);
+        }
+        assert_eq!(newest_recorded_block(&record), Some((130, [130u8; 32])));
+        assert_eq!(newest_recorded_block(&[0u8; 80]), None);
+    }
+
+    #[test]
+    fn the_commitment_is_sha256_of_the_solana_block_then_the_payee() {
+        let payee = Pubkey::new_from_array([2u8; 32]);
+        let mut bytes = [1u8; 32].to_vec();
+        bytes.extend_from_slice(&[2u8; 32]);
+        assert_eq!(
+            commitment_of(&[1u8; 32], &payee),
+            sha256::Hash::hash(&bytes).to_byte_array()
+        );
+    }
+
+    #[test]
     fn the_answer_address_is_the_one_the_validator_builds() {
         assert_eq!(
             BMM_ANSWER_ID.to_string(),
             "BmmAnswer1111111111111111111111111111111111"
+        );
+        assert_eq!(
+            BMM_BLOCKS_ID.to_string(),
+            "BmmB1ocks1111111111111111111111111111111111"
         );
         assert_ne!(
             treasury_pda(&a_program_id()).0,

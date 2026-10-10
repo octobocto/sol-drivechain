@@ -1,15 +1,18 @@
-//! The BMM loop of a validator: it bids on eCash, and it settles each eCash
-//! height on Solana in order.
+//! The BMM loop of a validator: it bids on eCash, it publishes the pair of
+//! each bid to the validators, and it settles the commitments on Solana in
+//! eCash height order.
 //!
-//! The commitment is the payee pubkey, so a win needs no later step from the
-//! winner. Any settle of that height pays the payee.
+//! A bid commits h* = SHA-256(Solana bank hash ‖ payee) for the newest block in
+//! the block record of the branch that the validator follows. The pair goes to
+//! the validators outside any transaction, so a leader cannot hide it.
 
 use std::{collections::BTreeMap, time::Duration};
 
 use bitcoin::{hashes::Hash as _, BlockHash};
+use serde_json::json;
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use solana_rpc_client_api::client_error::ErrorKind;
+use solana_rpc_client_api::{client_error::ErrorKind, request::RpcRequest};
 use solana_sdk::{
     instruction::Instruction,
     pubkey::Pubkey,
@@ -53,6 +56,31 @@ pub enum BmmError {
     BadBidPercent(u64),
     #[error("eCash height {0} does not fit a u32")]
     HeightTooLarge(u64),
+    #[error("the validator gave a pair with a bad key: {0}")]
+    BadPair(String),
+}
+
+/// A published pair: the eCash height of the bid, the Solana bank hash, and
+/// the payee.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pair {
+    pub height: u64,
+    pub block: [u8; 32],
+    pub payee: Pubkey,
+}
+
+impl Pair {
+    pub fn commitment(&self) -> [u8; 32] {
+        bridge::commitment_of(&self.block, &self.payee)
+    }
+}
+
+/// The pair whose hash is the commitment at `height`.
+pub fn pair_for(pairs: &[Pair], height: u64, commitment: &[u8; 32]) -> Option<Pair> {
+    pairs
+        .iter()
+        .find(|pair| pair.height == height && &pair.commitment() == commitment)
+        .copied()
 }
 
 /// The gross fee income that the loop saw at each eCash tip: the treasury
@@ -125,6 +153,7 @@ pub async fn run(settings: Settings, identity: Keypair) -> Result<(), BmmError> 
 
     let mut history = FeeHistory::default();
     let mut last_bid_tip: Option<BlockHash> = None;
+    let mut own_pairs: Vec<Pair> = Vec::new();
     loop {
         let tip = enforcer.tip().await?;
         let tip_height = u64::from(tip.1);
@@ -144,16 +173,21 @@ pub async fn run(settings: Settings, identity: Keypair) -> Result<(), BmmError> 
                     &config,
                     &history,
                     gross,
+                    &rpc,
                 )
                 .await;
-                if let Err(error) = result {
-                    if bid_error_is_fatal(&error) {
-                        return Err(error);
+                match result {
+                    Ok(Some(pair)) => own_pairs.push(pair),
+                    Ok(None) => (),
+                    Err(error) => {
+                        if bid_error_is_fatal(&error) {
+                            return Err(error);
+                        }
+                        // A bid is an offer, not a duty. The loop must keep the
+                        // settles going when the eCash wallet or the enforcer
+                        // refuses one bid.
+                        tracing::warn!(%error, "the bid failed, and the loop goes on");
                     }
-                    // A bid is an offer, not a duty. The loop must keep the
-                    // settles going when the eCash wallet or the enforcer
-                    // refuses one bid.
-                    tracing::warn!(%error, "the bid failed, and the loop goes on");
                 }
             } else {
                 tracing::info!(
@@ -162,6 +196,14 @@ pub async fn run(settings: Settings, identity: Keypair) -> Result<(), BmmError> 
                 );
             }
             last_bid_tip = Some(tip.0);
+        }
+        own_pairs.retain(|pair| {
+            pair.height >= config.bmm_next_height
+                && pair.height + settings.confirmations + 2 >= tip_height
+        });
+        // A validator that was away when the loop published gets the pair now.
+        if let Err(error) = publish_pairs(&rpc, &own_pairs).await {
+            tracing::warn!(%error, "the loop cannot publish its pairs");
         }
         settle(&rpc, &mut enforcer, &settings, &identity, tip, &config).await?;
         history.forget_below(tip_height.saturating_sub(settings.confirmations + 1));
@@ -177,6 +219,7 @@ async fn slot_is_active(enforcer: &mut Enforcer, sidechain_id: u8) -> Result<boo
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn bid(
     enforcer: &mut Enforcer,
     settings: &Settings,
@@ -185,7 +228,8 @@ async fn bid(
     config: &Config,
     history: &FeeHistory,
     gross: u64,
-) -> Result<(), BmmError> {
+    rpc: &RpcClient,
+) -> Result<Option<Pair>, BmmError> {
     let height = u64::from(tip.1) + 1;
     if height < config.bmm_next_height {
         // Solana settled this height already, on a branch that eCash left.
@@ -193,7 +237,7 @@ async fn bid(
             height,
             "Solana settled the height, so the loop does not bid"
         );
-        return Ok(());
+        return Ok(None);
     }
     let span = settings.confirmations + 1;
     let Some(income) = history.income_per_block(u64::from(tip.1), gross, span) else {
@@ -201,7 +245,7 @@ async fn bid(
             height,
             "the loop has not watched the fees long enough to bid"
         );
-        return Ok(());
+        return Ok(None);
     };
     let Some(bid) = bid_sats(income, settings.bid_percent, settings.min_bid_sats) else {
         tracing::debug!(
@@ -209,15 +253,30 @@ async fn bid(
             income,
             "the fees of one block are too small for a bid"
         );
-        return Ok(());
+        return Ok(None);
+    };
+    let Some((slot, block)) = newest_recorded_block(rpc).await? else {
+        tracing::info!(
+            height,
+            "the block record is empty, so the loop does not bid"
+        );
+        return Ok(None);
+    };
+    let pair = Pair {
+        height,
+        block,
+        payee: identity.pubkey(),
     };
     match enforcer
-        .create_bmm_request(bid, tip, &identity.pubkey().to_bytes())
+        .create_bmm_request(bid, tip, &pair.commitment())
         .await
     {
         Ok(txid) => {
-            tracing::info!(height, bid, %txid, "the loop bid for an eCash block");
-            Ok(())
+            tracing::info!(height, bid, slot, %txid, "the loop bid for an eCash block");
+            if let Err(error) = publish_pairs(rpc, &[pair]).await {
+                tracing::warn!(%error, height, "the loop cannot publish its pair yet");
+            }
+            Ok(Some(pair))
         }
         Err(error) if tip_moved(&error) => {
             // eCash found a block between the tip call and the bid. A BIP301
@@ -226,7 +285,7 @@ async fn bid(
                 height,
                 "the eCash tip moved, so the bid waits for the new tip"
             );
-            Ok(())
+            Ok(None)
         }
         Err(error) => Err(error.into()),
     }
@@ -249,6 +308,9 @@ pub fn tip_moved(error: &crate::enforcer::EnforcerError) -> bool {
     }
 }
 
+/// Settles each commitment with a known pair from the cursor up, in eCash
+/// height order. A commitment without a pair stays unsettled, and a later
+/// settle moves the cursor past it.
 async fn settle(
     rpc: &RpcClient,
     enforcer: &mut Enforcer,
@@ -257,18 +319,30 @@ async fn settle(
     tip: (BlockHash, u32),
     config: &Config,
 ) -> Result<(), BmmError> {
-    let mut next = config.bmm_next_height;
-    while settle_is_ready(next, u64::from(tip.1), settings.confirmations) {
-        let height = u32::try_from(next).map_err(|_| BmmError::HeightTooLarge(next))?;
-        let (block_hash, commitment) = enforcer.active_block(tip, height).await?;
-        let winner = commitment.map(Pubkey::new_from_array);
-        let payee = winner.unwrap_or_else(|| identity.pubkey());
+    let tip_height = u64::from(tip.1);
+    if !settle_is_ready(config.bmm_next_height, tip_height, settings.confirmations) {
+        return Ok(());
+    }
+    let pairs = fetch_pairs(rpc, config.bmm_next_height).await?;
+    let mut heights: Vec<u64> = pairs.iter().map(|pair| pair.height).collect();
+    heights.dedup();
+    for height in heights {
+        if !settle_is_ready(height, tip_height, settings.confirmations) {
+            break;
+        }
+        let height_u32 = u32::try_from(height).map_err(|_| BmmError::HeightTooLarge(height))?;
+        let (block_hash, commitment) = enforcer.active_block(tip, height_u32).await?;
+        let Some(pair) = commitment.and_then(|commitment| pair_for(&pairs, height, &commitment))
+        else {
+            continue;
+        };
         let before = read_config(rpc, &settings.program_id).await?.bmm_paid_total;
         let instruction = bridge::settle_bmm_ix(
             &settings.program_id,
-            next,
+            height,
             &block_hash.to_byte_array(),
-            &payee,
+            &pair.block,
+            &pair.payee,
         );
         match send(rpc, identity, instruction, "settle_bmm").await {
             Ok(()) => {
@@ -276,34 +350,99 @@ async fn settle(
                     .await?
                     .bmm_paid_total
                     .saturating_sub(before);
-                if winner == Some(identity.pubkey()) {
-                    tracing::info!(height = next, paid, "the loop settled its own win");
+                if pair.payee == identity.pubkey() {
+                    tracing::info!(height, paid, "the loop settled its own win");
                 } else {
-                    tracing::info!(height = next, paid, ?winner, "the loop settled a height");
+                    tracing::info!(height, paid, payee = %pair.payee, "the loop settled a height");
                 }
             }
             Err(BmmError::Rpc { source, .. }) if is_not_ready(&source) => {
-                tracing::debug!(
-                    height = next,
-                    "the leader does not see the block deep enough yet"
-                );
+                tracing::debug!(height, "the leader does not see the block deep enough yet");
                 return Ok(());
             }
             Err(error) => {
-                if read_config(rpc, &settings.program_id)
-                    .await?
-                    .bmm_next_height
-                    <= next
-                {
-                    return Err(error);
-                }
-                // Another settler got there first, which is the same result.
-                tracing::debug!(height = next, %error, "another settler settled the height");
+                // The Solana block is not on this branch, or another settler
+                // moved the cursor first.
+                tracing::info!(height, %error, "the settle did not land");
             }
         }
-        next += 1;
     }
     Ok(())
+}
+
+/// The newest block in the block record of the branch that the validator
+/// follows now, read at `processed`, because `confirmed` follows the stake
+/// votes and can name a branch that BMM leaves.
+pub async fn newest_recorded_block(rpc: &RpcClient) -> Result<Option<(u64, [u8; 32])>, BmmError> {
+    let account = rpc
+        .get_account_with_commitment(&bridge::BMM_BLOCKS_ID, CommitmentConfig::processed())
+        .await
+        .map_err(|source| BmmError::Rpc {
+            call: "getAccountInfo(block record)",
+            source,
+        })?
+        .value;
+    Ok(account.and_then(|account| bridge::newest_recorded_block(&account.data)))
+}
+
+/// Sends pairs to the validator. It gives one result per pair: "new",
+/// "known", or the reason of a refusal.
+pub async fn publish_pairs(rpc: &RpcClient, pairs: &[Pair]) -> Result<Vec<String>, BmmError> {
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list: Vec<serde_json::Value> = pairs
+        .iter()
+        .map(|pair| {
+            json!([
+                pair.height,
+                Pubkey::new_from_array(pair.block).to_string(),
+                pair.payee.to_string()
+            ])
+        })
+        .collect();
+    rpc.send(
+        RpcRequest::Custom {
+            method: "bmmPublishPairs",
+        },
+        json!([list]),
+    )
+    .await
+    .map_err(|source| BmmError::Rpc {
+        call: "bmmPublishPairs",
+        source,
+    })
+}
+
+/// The pairs that the validator holds at or above `from_height`.
+pub async fn fetch_pairs(rpc: &RpcClient, from_height: u64) -> Result<Vec<Pair>, BmmError> {
+    let list: Vec<(u64, String, String)> = rpc
+        .send(
+            RpcRequest::Custom {
+                method: "bmmGetPairs",
+            },
+            json!([from_height]),
+        )
+        .await
+        .map_err(|source| BmmError::Rpc {
+            call: "bmmGetPairs",
+            source,
+        })?;
+    list.into_iter()
+        .map(|(height, block, payee)| {
+            let block = block
+                .parse::<Pubkey>()
+                .map_err(|_| BmmError::BadPair(block.clone()))?;
+            let payee = payee
+                .parse::<Pubkey>()
+                .map_err(|_| BmmError::BadPair(payee.clone()))?;
+            Ok(Pair {
+                height,
+                block: block.to_bytes(),
+                payee,
+            })
+        })
+        .collect()
 }
 
 /// True when the validator did not take the settle because its enforcer does
@@ -399,6 +538,26 @@ mod tests {
         assert!(!tip_moved(&crate::enforcer::EnforcerError::MissingField(
             "tip"
         )));
+    }
+
+    #[test]
+    fn the_pair_for_a_commitment_has_its_height_and_its_hash() {
+        let payee = Pubkey::new_from_array([7u8; 32]);
+        let pair = Pair {
+            height: 105,
+            block: [3u8; 32],
+            payee,
+        };
+        let other = Pair {
+            height: 105,
+            block: [4u8; 32],
+            payee,
+        };
+        let pairs = [other, pair];
+        assert_eq!(pair_for(&pairs, 105, &pair.commitment()), Some(pair));
+        assert_eq!(pair_for(&pairs, 106, &pair.commitment()), None);
+        assert_eq!(pair_for(&pairs, 105, &[0u8; 32]), None);
+        assert_eq!(pair.commitment(), bridge::commitment_of(&[3u8; 32], &payee));
     }
 
     #[test]

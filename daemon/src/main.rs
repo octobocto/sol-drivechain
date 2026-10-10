@@ -268,18 +268,47 @@ enum Command {
         #[command(flatten)]
         enforcer: EnforcerArgs,
     },
-    /// Sends one BIP301 bid for the next eCash block. The payee takes the
-    /// treasury if the bid wins. An operator or a test uses it.
+    /// Sends one BIP301 bid for the next eCash block, for the newest block in
+    /// the block record of the validator, and publishes the pair to the
+    /// validator. The payee takes the treasury if the bid settles. An operator
+    /// or a test uses it.
     BidBmm {
         #[command(flatten)]
         enforcer: EnforcerArgs,
-        /// The pubkey that takes the payout. It is the whole h*.
-        #[arg(long)]
-        payee: String,
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+        /// The pubkey that takes the payout.
+        #[arg(long, required_unless_present = "commitment")]
+        payee: Option<String>,
         #[arg(long)]
         sats: u64,
+        /// Bids this h*, in hex, and publishes no pair. A test uses it for a
+        /// commitment that no pair matches.
+        #[arg(long, conflicts_with = "payee")]
+        commitment: Option<String>,
+        /// Bids, but keeps the pair back.
+        #[arg(long)]
+        withhold: bool,
     },
-    /// Settles one eCash height by hand. A test or an operator uses it.
+    /// Publishes one BMM pair to a validator.
+    PublishPair {
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+        #[arg(long)]
+        height: u64,
+        /// The Solana bank hash, in base58.
+        #[arg(long)]
+        block: String,
+        #[arg(long)]
+        payee: String,
+    },
+    /// Prints the slot and the bank hash of the newest block in the block
+    /// record of the validator.
+    BmmBlock {
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+    },
+    /// Settles one BMM commitment by hand. A test or an operator uses it.
     SettleBmm {
         #[arg(long, default_value = "http://127.0.0.1:8899")]
         solana_rpc_url: String,
@@ -290,10 +319,13 @@ enum Command {
         identity: PathBuf,
         #[arg(long)]
         height: u64,
-        /// The block hash in the hex that the explorers show.
+        /// The eCash block hash in the hex that the explorers show.
         #[arg(long)]
         block_hash: String,
-        /// The payee in the BMM commitment. It defaults to the signer.
+        /// The Solana bank hash of the pair, in base58.
+        #[arg(long)]
+        solana_block: String,
+        /// The payee of the pair. It defaults to the signer.
         #[arg(long)]
         payee: Option<String>,
     },
@@ -307,8 +339,8 @@ enum Command {
         slot: u8,
         #[arg(long)]
         program_id: String,
-        /// The keypair that signs, and whose pubkey is the BMM commitment and
-        /// the payee. Normally the validator identity.
+        /// The keypair that signs, and whose pubkey is the payee of each bid.
+        /// Normally the validator identity.
         #[arg(long)]
         identity: PathBuf,
         /// N. It must match `--bmm-confirmations` on the validators.
@@ -378,6 +410,10 @@ enum CliError {
     },
     #[error("the daemon cannot start its runtime")]
     NoRuntime(#[source] std::io::Error),
+    #[error("the block record of the validator is empty")]
+    EmptyBlockRecord,
+    #[error("a bid needs a payee or a commitment")]
+    NoCommitment,
     #[error(transparent)]
     Enforcer(#[from] sol_drivechain_daemon::enforcer::EnforcerError),
     #[error("the Solana rpc call `{call}` failed")]
@@ -850,17 +886,72 @@ fn main() -> Result<(), CliError> {
         }),
         Command::BidBmm {
             enforcer,
+            solana_rpc_url,
             payee,
             sats,
+            commitment,
+            withhold,
         } => runtime.block_on(async {
-            let payee = parse_pubkey(&payee)?;
+            let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
             let mut enforcer = enforcer.open().await?;
             let tip = enforcer.tip().await?;
-            let txid = enforcer
-                .create_bmm_request(sats, tip, &payee.to_bytes())
-                .await?;
-            println!("bid {sats} sats for eCash height {} as {txid}", tip.1 + 1);
-            println!("the payee is {payee}");
+            let height = u64::from(tip.1) + 1;
+            let pair = match payee {
+                Some(payee) => {
+                    let (slot, block) = bmm::newest_recorded_block(&rpc)
+                        .await?
+                        .ok_or(CliError::EmptyBlockRecord)?;
+                    println!("slot {slot}");
+                    Some(bmm::Pair {
+                        height,
+                        block,
+                        payee: parse_pubkey(&payee)?,
+                    })
+                }
+                None => None,
+            };
+            let h_star = match (&pair, &commitment) {
+                (Some(pair), _) => pair.commitment(),
+                (None, Some(commitment)) => fixed_hash::<32>(commitment, "commitment")?,
+                (None, None) => return Err(CliError::NoCommitment),
+            };
+            let txid = enforcer.create_bmm_request(sats, tip, &h_star).await?;
+            println!("bid {sats} sats for eCash height {height} as {txid}");
+            println!("commitment {}", sol_drivechain_daemon::hex::encode(&h_star));
+            if let Some(pair) = pair {
+                println!("block {}", Pubkey::new_from_array(pair.block));
+                println!("payee {}", pair.payee);
+                if !withhold {
+                    for outcome in bmm::publish_pairs(&rpc, &[pair]).await? {
+                        println!("pair {outcome}");
+                    }
+                }
+            }
+            Ok(())
+        }),
+        Command::PublishPair {
+            solana_rpc_url,
+            height,
+            block,
+            payee,
+        } => runtime.block_on(async {
+            let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
+            let pair = bmm::Pair {
+                height,
+                block: parse_pubkey(&block)?.to_bytes(),
+                payee: parse_pubkey(&payee)?,
+            };
+            for outcome in bmm::publish_pairs(&rpc, &[pair]).await? {
+                println!("pair {outcome}");
+            }
+            Ok(())
+        }),
+        Command::BmmBlock { solana_rpc_url } => runtime.block_on(async {
+            let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
+            let (slot, block) = bmm::newest_recorded_block(&rpc)
+                .await?
+                .ok_or(CliError::EmptyBlockRecord)?;
+            println!("{slot} {}", Pubkey::new_from_array(block));
             Ok(())
         }),
         Command::SettleBmm {
@@ -869,6 +960,7 @@ fn main() -> Result<(), CliError> {
             identity,
             height,
             block_hash,
+            solana_block,
             payee,
         } => {
             let program_id = parse_pubkey(&program_id)?;
@@ -883,8 +975,10 @@ fn main() -> Result<(), CliError> {
                 Some(payee) => parse_pubkey(&payee)?,
                 None => signer.pubkey(),
             };
+            let solana_block = parse_pubkey(&solana_block)?.to_bytes();
             let rpc = blocking_rpc(&solana_rpc_url);
-            let instruction = bridge::settle_bmm_ix(&program_id, height, &internal, &payee);
+            let instruction =
+                bridge::settle_bmm_ix(&program_id, height, &internal, &solana_block, &payee);
             send_one(&rpc, &signer, instruction, "settle_bmm")?;
             println!("eCash height {height} settled, and the payee is {payee}");
             Ok(())
