@@ -225,9 +225,27 @@ lamports_of() {
   "$SOLANA" -u "$SOLANA_URL" balance "$1" --lamports 2>/dev/null | awk '{print $1}'
 }
 
+# After a reorg the enforcer wallet can still pick a coin that the reorg spent.
+# One more block brings its view up to date.
+deposit() {
+  local out
+  for _ in 1 2 3 4 5; do
+    if out="$("$D" deposit $E "$@" 2>&1)"; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    case "$out" in
+      *bad-txns-inputs-missingorspent*) "$D" mine $E --blocks 1 --address "$(new_address)" >/dev/null; sleep 3 ;;
+      *) printf '%s\n' "$out" >&2; return 1 ;;
+    esac
+  done
+  printf '%s\n' "$out" >&2
+  return 1
+}
+
 start_peg
 
-"$D" deposit $E --pubkey "$USER_PUBKEY" --sats "$DEPOSIT_SATS"
+deposit --pubkey "$USER_PUBKEY" --sats "$DEPOSIT_SATS"
 "$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
 
 # The credit loop credits every eCash height in order, and the empty heights
@@ -249,7 +267,7 @@ kill "$PEG_PID"
 wait "$PEG_PID" 2>/dev/null || true
 DOWN_SATS=1500000
 DOWN_PUBKEY="$("$D" seed-pubkey --mnemonic-file "$MNEMONIC_FILE" --account 1 | awk '{print $2}')"
-"$D" deposit $E --pubkey "$DOWN_PUBKEY" --sats "$DOWN_SATS"
+deposit --pubkey "$DOWN_PUBKEY" --sats "$DOWN_SATS"
 "$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
 start_peg
 
@@ -605,7 +623,7 @@ PEGGED_BEFORE="$(bridge_value "pegged lamports")"
 start_peg
 NEW_SATS=700000
 NEW_PUBKEY="$("$D" seed-pubkey --mnemonic-file "$MNEMONIC_FILE" --account 2 | awk '{print $2}')"
-"$D" deposit $E --pubkey "$NEW_PUBKEY" --sats "$NEW_SATS"
+deposit --pubkey "$NEW_PUBKEY" --sats "$NEW_SATS"
 "$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
 for _ in $(seq 1 60); do
   [ "$(lamports_of "$NEW_PUBKEY")" = $((NEW_SATS * 10)) ] && break
