@@ -432,7 +432,7 @@ Pass `wsEndpoint`, because a wallet guesses the websocket address from the
 http one, and a path proxy breaks that guess.
 
 The genesis hash names the cluster:
-`8NTWVHTE4g91yyKffovVujcoUhZta9jhmrhPv35H44HU`.
+`CdMqfpSXrZwJt5ckZmzQ6CtHGrwE3AsURa8uueYQMvcQ`.
 
 Every wallet prints the unit as SOL. One SOL is one BTC here.
 
