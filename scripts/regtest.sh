@@ -12,6 +12,9 @@ P2P_PORT="${P2P_PORT:-19444}"
 ZMQ_PORT="${ZMQ_PORT:-19445}"
 GRPC_PORT="${GRPC_PORT:-19551}"
 ENFORCER_RPC_PORT="${ENFORCER_RPC_PORT:-19552}"
+# A test that runs the stack in its own network namespace serves the grpc on
+# every address of that namespace.
+GRPC_BIND="${GRPC_BIND:-127.0.0.1}"
 RPC_USER="${RPC_USER:-peg}"
 RPC_PASS="${RPC_PASS:-peg}"
 # Stock Core does not relay an OP_DRIVECHAIN output. Set this to 1 when the
@@ -106,7 +109,7 @@ start_enforcer() {
     --node-rpc-user="$RPC_USER" \
     --node-rpc-pass="$RPC_PASS" \
     --node-zmq-addr-sequence=tcp://127.0.0.1:"$ZMQ_PORT" \
-    --serve-grpc-addr=127.0.0.1:"$GRPC_PORT" \
+    --serve-grpc-addr="$GRPC_BIND:$GRPC_PORT" \
     --serve-rpc-addr=127.0.0.1:"$ENFORCER_RPC_PORT" \
     --enable-wallet \
     --wallet-auto-create \

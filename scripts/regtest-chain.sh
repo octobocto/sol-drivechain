@@ -200,7 +200,8 @@ up() {
 
   echo "== the Solana chain"
   if [ ! -d "$ROOT/ledger" ]; then
-    LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" bash "$REPO/genesis/build-genesis.sh" >/dev/null
+    LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$(btc getblockcount)" \
+      bash "$REPO/genesis/build-genesis.sh" >/dev/null
   fi
   start_process validator env \
     LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
@@ -213,18 +214,10 @@ up() {
   wait_for_solana
   echo "the Solana chain runs at slot $("$SOLANA" -u "$SOLANA_URL" slot)"
 
-  echo "== the bridge"
-  if ! "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$(program_id)" \
-      >/dev/null 2>&1; then
-    "$D" initialize --solana-rpc-url "$SOLANA_URL" --program-id "$(program_id)" \
-      --payer "$ROOT/keys/oracle.json" --oracle "$ROOT/keys/oracle.json" \
-      --bmm-start-height "$(btc getblockcount)"
-  fi
-
   echo "== the peg, the BMM loop, and the miner"
   start_process peg "$D" run --network regtest --enforcer-url "$ENFORCER_URL" \
     --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$(program_id)" \
-    --oracle "$ROOT/keys/oracle.json" --confirmations 1 --bundle-interval-secs 10
+    --oracle "$ROOT/keys/oracle.json" --bundle-interval-secs 10
   start_process bmm "$D" bmm --enforcer-url "$ENFORCER_URL" \
     --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$(program_id)" \
     --identity "$ROOT/keys/validator-identity.json" \

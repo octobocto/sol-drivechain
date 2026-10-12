@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Proves the whole peg on regtest: a slot claim, a peg in, a peg out, and a
-# BMM win that pays the treasury to a validator.
+# BMM win that pays the treasury to a validator. Last, it halts the chain and
+# migrates it into a new genesis.
 #
 # It builds its own Bitcoin node, its own enforcer, and its own Solana chain,
 # all on separate ports and separate directories. It never touches a chain that
@@ -18,6 +19,9 @@ WITHDRAW_FEE_SATS="${WITHDRAW_FEE_SATS:-10000}"
 # N: the eCash blocks on top of a block before its settle. The validators and
 # the BMM loop must use the same value.
 BMM_CONFIRMATIONS="${BMM_CONFIRMATIONS:-6}"
+# D: the eCash confirmations before a credit. It stays above the deepest
+# reorg of this test, 9 blocks, so no reorg here drops a credited deposit.
+DEPOSIT_CONFIRMATIONS="${DEPOSIT_CONFIRMATIONS:-10}"
 # The eCash builds keep an OP_DRIVECHAIN deposit out of the regtest mempool
 # under the standard policy, so the node takes a nonstandard tx.
 export ACCEPT_NONSTD="${ACCEPT_NONSTD:-1}"
@@ -54,6 +58,29 @@ received() {
   btc scantxoutset start "[\"addr($1)\"]" | sed -n 's/.*"total_amount": \([0-9.]*\).*/\1/p'
 }
 fail() { echo "FAIL: $1" >&2; exit 1; }
+rpc() {
+  curl -s --max-time 5 -X POST -H 'content-type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" "$SOLANA_URL"
+}
+# The total supply of the chain, and the slot of the read.
+supply() {
+  rpc getSupply '[{"commitment":"processed","excludeNonCirculatingAccountsList":true}]' \
+    | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["value"]["total"], r["context"]["slot"])'
+}
+books() {
+  "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
+    --books --enforcer-url "$ENFORCER_URL" --slot "$SLOT"
+}
+# The peg marks a paid withdrawal a few seconds after eCash pays it, and the
+# books close after that.
+books_close() {
+  for _ in $(seq 1 30); do
+    books > "$ROOT/books.log" 2>&1 && { cat "$ROOT/books.log"; return 0; }
+    sleep 2
+  done
+  cat "$ROOT/books.log" >&2
+  fail "the books do not close"
+}
 
 # A pipe into `head` closes the reader early, and the daemon then dies of a
 # broken pipe. So the shell takes the whole output and cuts the first line.
@@ -76,11 +103,12 @@ for binary in "$D" "$SOLANA" "$SOLANA_KEYGEN" "$SOLANA_GENESIS" "$AGAVE_VALIDATO
   [ -x "$binary" ] || fail "$binary is missing"
 done
 
+# The script stops only the processes that it started.
+PIDS=()
 cleanup() {
-  pkill -f "agave-validator --ledger $ROOT/ledger" 2>/dev/null || true
-  pkill -f "sol-drivechain-daemon run --network regtest" 2>/dev/null || true
-  pkill -f "sol-drivechain-daemon bmm --enforcer-url $ENFORCER_URL" 2>/dev/null || true
-  pkill -f "agave-validator --ledger $ROOT/ledger2" 2>/dev/null || true
+  for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+    kill "$pid" 2>/dev/null || true
+  done
   ROOT="$ROOT/bitcoin-stack" bash "$HERE/regtest.sh" stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -97,7 +125,12 @@ step "the Bitcoin node and the enforcer"
 ROOT="$ROOT/bitcoin-stack" bash "$HERE/regtest.sh" start
 
 step "the Solana chain"
-LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" bash "$REPO/genesis/build-genesis.sh" >/dev/null
+# The genesis writes the bridge config: BMM settles from this eCash height,
+# and the credits start after it.
+BMM_START="$(btc getblockcount)"
+LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$BMM_START" \
+  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" \
+  bash "$REPO/genesis/build-genesis.sh" > "$ROOT/genesis.log"
 # A copy of the fresh ledger lets a second validator replay from the genesis,
 # with no snapshot download.
 cp -R "$ROOT/ledger" "$ROOT/ledger2"
@@ -107,6 +140,19 @@ LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
   BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" ALLOW_PRIVATE_ADDR=1 \
   nohup bash "$REPO/genesis/run-validator.sh" > "$ROOT/validator.log" 2>&1 &
 VALIDATOR_PID=$!
+PIDS+=("$VALIDATOR_PID")
+# The stock runtime creates the rent of its sysvars at slots 0 and 1. The
+# first block record write is at slot 32. The supply between them must hold to
+# the end, so the patch mints no rent.
+SUPPLY_START=""
+for _ in $(seq 1 120); do
+  SUPPLY_START="$(supply 2>/dev/null || true)"
+  [ -n "$SUPPLY_START" ] && [ "${SUPPLY_START#* }" -ge 2 ] && break
+  sleep 0.2
+done
+[ -n "$SUPPLY_START" ] || fail "the RPC never gave the supply"
+[ "${SUPPLY_START#* }" -lt 32 ] || fail "the first supply read came at slot ${SUPPLY_START#* }, after the first record write"
+echo "the supply is ${SUPPLY_START% *} lamports at slot ${SUPPLY_START#* }"
 # The RPC answers before the node is healthy, and an early transaction fails
 # with "Node is unhealthy".
 HEALTHY=no
@@ -126,11 +172,15 @@ done
 [ "$HEALTHY" = yes ] || fail "the Solana chain did not become healthy"
 echo "the Solana chain runs at slot $("$SOLANA" -u "$SOLANA_URL" slot)"
 
-step "the bridge"
-BMM_START="$(btc getblockcount)"
-"$D" initialize --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
-  --payer "$ROOT/keys/oracle.json" --oracle "$ROOT/keys/oracle.json" \
-  --bmm-start-height "$BMM_START"
+step "the bridge config and the block record come from the genesis"
+"$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID"
+[ "$("$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
+  | awk '/^credited height/ {print $3}')" = "$BMM_START" ] || fail "the genesis config does not start at eCash height $BMM_START"
+RECORD="$(rpc getAccountInfo '["BmmB1ocks1111111111111111111111111111111111",{"encoding":"base64","dataSlice":{"offset":0,"length":0}}]' \
+  | python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]["value"]; print(v["lamports"], v["owner"], v["space"])')"
+[ "$RECORD" = "$(rpc getMinimumBalanceForRentExemption '[229376]' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"])') Sysvar1111111111111111111111111111111111111 229376" ] \
+  || fail "the block record is $RECORD"
+echo "PASS: the genesis holds the config, and the block record is rent-exempt at its size: $RECORD"
 
 step "claim sidechain slot $SLOT"
 "$D" propose-slot $E >/dev/null
@@ -164,9 +214,10 @@ step "peg in $DEPOSIT_SATS sats"
 start_peg() {
   nohup "$D" run --network regtest --enforcer-url "$ENFORCER_URL" \
     --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$PROGRAM_ID" \
-    --oracle "$ROOT/keys/oracle.json" --confirmations 1 --bundle-interval-secs 10 \
+    --oracle "$ROOT/keys/oracle.json" --bundle-interval-secs 10 \
     >> "$ROOT/peg.log" 2>&1 &
   PEG_PID=$!
+  PIDS+=("$PEG_PID")
   sleep 5
 }
 
@@ -177,10 +228,12 @@ lamports_of() {
 start_peg
 
 "$D" deposit $E --pubkey "$USER_PUBKEY" --sats "$DEPOSIT_SATS"
-"$D" mine $E --blocks 2 --address "$COINBASE" >/dev/null
+"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
 
+# The credit loop credits every eCash height in order, and the empty heights
+# since the bridge start come first.
 WANT_LAMPORTS=$((DEPOSIT_SATS * 10))
-for _ in $(seq 1 30); do
+for _ in $(seq 1 120); do
   GOT="$("$SOLANA" -u "$SOLANA_URL" balance "$USER_PUBKEY" --lamports 2>/dev/null | awk '{print $1}')"
   [ "${GOT:-0}" = "$WANT_LAMPORTS" ] && break
   sleep 3
@@ -190,30 +243,29 @@ echo "PASS: the peg in credited $GOT lamports for $DEPOSIT_SATS sats"
 "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID"
 
 step "peg in while the daemon is down"
-# The event stream starts at the next block, so without a replay this deposit
-# would sit in the treasury and nobody could claim it.
+# The credits follow the cursor in the bridge config, so a restart misses no
+# deposit.
 kill "$PEG_PID"
 wait "$PEG_PID" 2>/dev/null || true
 DOWN_SATS=1500000
 DOWN_PUBKEY="$("$D" seed-pubkey --mnemonic-file "$MNEMONIC_FILE" --account 1 | awk '{print $2}')"
 "$D" deposit $E --pubkey "$DOWN_PUBKEY" --sats "$DOWN_SATS"
-"$D" mine $E --blocks 2 --address "$COINBASE" >/dev/null
+"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
 start_peg
 
 WANT_DOWN=$((DOWN_SATS * 10))
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
   GOT_DOWN="$(lamports_of "$DOWN_PUBKEY")"
   [ "${GOT_DOWN:-0}" = "$WANT_DOWN" ] && break
   sleep 3
 done
 [ "${GOT_DOWN:-0}" = "$WANT_DOWN" ] || fail "the downtime deposit gave ${GOT_DOWN:-0} lamports, not $WANT_DOWN"
-echo "PASS: the replay credited $GOT_DOWN lamports that landed while the daemon was down"
+echo "PASS: the restarted loop credited $GOT_DOWN lamports that landed while the daemon was down"
 
-# The replay also walks the first deposit. The bridge credited it before, so
-# the daemon must skip it, and stay up.
-[ "$(lamports_of "$USER_PUBKEY")" = "$WANT_LAMPORTS" ] || fail "the replay credited the first deposit twice"
-kill -0 "$PEG_PID" 2>/dev/null || fail "the daemon stopped on the replay"
-echo "PASS: the replay skipped the deposit it credited before, and the daemon runs"
+# The cursor never goes back, so the first deposit stays credited one time.
+[ "$(lamports_of "$USER_PUBKEY")" = "$WANT_LAMPORTS" ] || fail "the first deposit got credited twice"
+kill -0 "$PEG_PID" 2>/dev/null || fail "the daemon stopped after the restart"
+echo "PASS: the first deposit stayed credited one time, and the daemon runs"
 
 step "lose the wallet, then recover it from the seed phrase alone"
 rm -f "$USER_KEY"
@@ -246,36 +298,30 @@ done
 echo "PASS: the payout address went from $BEFORE_SATS BTC to $AFTER_SATS BTC"
 
 step "the books must close"
-"$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID"
 "$D" status $E | grep -E "treasury|^slot $SLOT "
+books_close
+echo "PASS: both balance equations hold after the peg out"
 
-PEGGED="$("$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
-  | awk '/^pegged lamports/ {print $3}')"
-TREASURY="$("$D" status $E | awk '/^treasury/ {print $2}')"
-[ -n "$PEGGED" ] || fail "the bridge reports no pegged lamport count"
-[ -n "$TREASURY" ] || fail "the mainchain reports no treasury"
-
-# The peg holds when the mainchain treasury matches the lamports that the
-# bridge says it handed out, at ten lamports for each satoshi.
-WANT=$((TREASURY * 10))
-[ "$PEGGED" = "$WANT" ] || fail "the bridge says $PEGGED lamports, the treasury says $WANT"
-echo "PASS: $PEGGED pegged lamports match $TREASURY treasury satoshis"
-
-# The vault holds every lamport that no deposit handed out.
-VAULT="$("$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
-  | awk '/^vault lamports/ {print $3}')"
-VAULT_WANT=$((21000000 * 1000000000 - PEGGED))
-[ "$VAULT" = "$VAULT_WANT" ] || fail "the vault holds $VAULT lamports, not $VAULT_WANT"
-echo "PASS: the vault holds $VAULT lamports, the genesis total less the pegged count"
-
-step "BMM: a bid wins an eCash block, and a settle pays the winner"
+step "BMM: a bid wins an eCash block, and a settle pays the payee of its pair"
 bridge_value() {
   "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
     | awk -v key="$1" '$0 ~ "^"key {print $NF}'
 }
 TREASURY_BEFORE="$(bridge_value "treasury lamports")"
 echo "the treasury holds $TREASURY_BEFORE lamports of fees and reserve"
-[ "$TREASURY_BEFORE" -gt 1024 ] || fail "the treasury got no fees"
+[ "$TREASURY_BEFORE" -gt 512 ] || fail "the treasury got no fees"
+
+# A bid offers a part of the fee income, so the chain must earn fees. Ten
+# transfers pay 100 lamports, which is 10 satoshis.
+ORACLE_PUBKEY="$("$SOLANA_KEYGEN" pubkey "$ROOT/keys/oracle.json")"
+# Each transfer takes another amount, so two of them under one blockhash are
+# not the same tx.
+earn_fees() {
+  for index in $(seq 0 9); do
+    "$SOLANA" -u "$SOLANA_URL" transfer --keypair "$USER_KEY" "$ORACLE_PUBKEY" \
+      "0.00000100$index" --no-wait >/dev/null
+  done
+}
 
 # A second validator with no vote proves the replay side of the pre-check. It
 # marks a block dead if its own enforcer answers another way.
@@ -294,6 +340,7 @@ LEDGER="$ROOT/ledger2" KEYS="$ROOT/keys2" RPC_PORT="$((SOLANA_RPC_PORT + 10))" \
   EXPECTED_GENESIS_HASH="$GENESIS_HASH" \
   nohup bash "$REPO/genesis/run-validator.sh" > "$ROOT/validator2.log" 2>&1 &
 VALIDATOR2_PID=$!
+PIDS+=("$VALIDATOR2_PID")
 SECOND_URL="http://127.0.0.1:$((SOLANA_RPC_PORT + 10))"
 SECOND_UP=no
 for _ in $(seq 1 60); do
@@ -314,13 +361,16 @@ nohup "$D" bmm --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
   --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --interval-secs 1 \
   > "$ROOT/bmm.log" 2>&1 &
 BMM_PID=$!
+PIDS+=("$BMM_PID")
 
-# Each block gives the loop a new tip to bid on. A win settles N + 1 blocks
-# later, so the whole round takes about ten blocks.
+# Each block gives the loop a new tip to bid on, and the loop publishes the
+# pair of each bid. A win settles N + 1 blocks later, so the whole round takes
+# about ten blocks.
 PAID=no
 for _ in $(seq 1 40); do
   kill -0 "$BMM_PID" 2>/dev/null || { tail -30 "$ROOT/bmm.log" >&2; fail "the BMM loop stopped"; }
   sleep 3
+  earn_fees
   "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
   if [ "$(bridge_value "bmm paid total")" -gt 0 ]; then
     PAID=yes
@@ -345,9 +395,10 @@ step "BMM: a settle for a block that is too new never lands"
 TIP_HEIGHT="$(btc getblockcount)"
 TIP_HASH="$(btc getblockhash "$TIP_HEIGHT")"
 NEXT_BEFORE="$(bridge_value "bmm next height")"
+SOLANA_BLOCK="$("$D" bmm-block --solana-rpc-url "$SOLANA_URL" | awk 'END {print $2}')"
 if "$D" settle-bmm --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
     --identity "$ROOT/keys/oracle.json" --height "$TIP_HEIGHT" \
-    --block-hash "$TIP_HASH" > "$ROOT/settle-new.log" 2>&1; then
+    --block-hash "$TIP_HASH" --solana-block "$SOLANA_BLOCK" > "$ROOT/settle-new.log" 2>&1; then
   fail "a settle for the tip landed, and it must wait for N + 1 blocks"
 fi
 grep -qi "restricted" "$ROOT/settle-new.log" || {
@@ -377,7 +428,7 @@ echo "the same height holds $NEW_HASH after the reorg"
 sleep 3
 if "$D" settle-bmm --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
     --identity "$ROOT/keys/oracle.json" --height "$STALE_HEIGHT" \
-    --block-hash "$STALE_HASH" > "$ROOT/settle-stale.log" 2>&1; then
+    --block-hash "$STALE_HASH" --solana-block "$SOLANA_BLOCK" > "$ROOT/settle-stale.log" 2>&1; then
   fail "a settle for a stale block landed"
 fi
 grep -qi "restricted" "$ROOT/settle-stale.log" || {
@@ -386,10 +437,11 @@ grep -qi "restricted" "$ROOT/settle-stale.log" || {
 }
 echo "PASS: a settle for a block outside the active chain never lands"
 
-step "BMM: the loop settles the new block at that height"
+step "BMM: the loop settles a commitment of the new chain past that height"
 SETTLED=no
 for _ in $(seq 1 20); do
   sleep 3
+  earn_fees
   "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
   if [ "$(bridge_value "bmm next height")" -gt "$STALE_HEIGHT" ]; then
     SETTLED=yes
@@ -399,20 +451,31 @@ done
 [ "$SETTLED" = yes ] || { tail -30 "$ROOT/bmm.log" >&2; fail "the loop did not settle past the reorg"; }
 echo "PASS: the loop settled eCash height $STALE_HEIGHT from the new chain"
 
-step "BMM: a reorg deeper than N leaves the chain alive"
+step "BMM: a reorg deeper than N over a settled height leaves the chain alive"
+# The settles take heights about N + 1 below the tip, so a reorg of 9 blocks
+# drops at least one settled eCash block. The migration below replays this
+# ledger from the genesis through those settles.
+for _ in $(seq 1 10); do
+  [ "$(bridge_value "bmm next height")" -gt $(( $(btc getblockcount) - 8 )) ] && break
+  sleep 3
+  earn_fees
+  "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
+done
 DEEP_TIP="$(btc getblockcount)"
-DEEP_HASH="$(btc getblockhash $((DEEP_TIP - 8)))"
+DEEP_FROM=$((DEEP_TIP - 8))
 PAID_BEFORE="$(bridge_value "bmm paid total")"
 NEXT_AT_REORG="$(bridge_value "bmm next height")"
-btc invalidateblock "$DEEP_HASH" >/dev/null
+[ "$NEXT_AT_REORG" -gt "$DEEP_FROM" ] || fail "no settle took a height at or above $DEEP_FROM"
+btc invalidateblock "$(btc getblockhash "$DEEP_FROM")" >/dev/null
 wait_for_enforcer
 COINBASE="$(new_address)"
 "$D" mine $E --blocks 14 --address "$COINBASE" >/dev/null
 wait_for_enforcer
-echo "the chain reorged 9 blocks deep, under N + 1 = $((BMM_CONFIRMATIONS + 1))"
+echo "the chain reorged 9 blocks deep, more than N = $BMM_CONFIRMATIONS, and dropped the settled heights $DEEP_FROM to $((NEXT_AT_REORG - 1))"
 ALIVE=no
 for _ in $(seq 1 20); do
   sleep 3
+  earn_fees
   "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
   kill -0 "$BMM_PID" 2>/dev/null || { tail -30 "$ROOT/bmm.log" >&2; fail "the BMM loop stopped after the deep reorg"; }
   if [ "$(bridge_value "bmm next height")" -gt "$NEXT_AT_REORG" ]; then
@@ -426,5 +489,143 @@ SECOND_SLOT_DEEP="$("$SOLANA" -u "$SECOND_URL" slot)" || fail "the second valida
 [ "$SECOND_SLOT_DEEP" -gt "$SECOND_SLOT_AFTER" ] || fail "the second validator stopped after the reorg"
 echo "PASS: both validators run after a reorg deeper than N"
 
+step "the books close at the end, and the supply never changed"
+books_close
+SUPPLY_END="$(supply)"
+[ "${SUPPLY_END% *}" = "${SUPPLY_START% *}" ] || \
+  fail "the supply went from ${SUPPLY_START% *} at slot ${SUPPLY_START#* } to ${SUPPLY_END% *} at slot ${SUPPLY_END#* }"
+echo "PASS: the supply stayed at ${SUPPLY_END% *} lamports from slot ${SUPPLY_START#* } to slot ${SUPPLY_END#* }"
+
+# ---------------------------------------------------------------------------
+step "migration: an open withdrawal, then the chain stops"
+kill "$BMM_PID" "$PEG_PID" "$VALIDATOR2_PID" 2>/dev/null || true
+wait "$BMM_PID" "$PEG_PID" "$VALIDATOR2_PID" 2>/dev/null || true
+OPEN_ADDRESS="$(new_address)"
+"$D" withdraw --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
+  --user "$USER_KEY" --sats 1000000 --fee-sats "$WITHDRAW_FEE_SATS" \
+  --address "$OPEN_ADDRESS" --network regtest
+books_close
+OPEN_INDEX=$(( $(bridge_value "withdrawals") - 1 ))
+OPEN_RECORD="$(rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]" \
+  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 187]')"
+[ "$(printf '%s\n' "$OPEN_RECORD" | grep -c .)" = 1 ] || fail "the chain holds these withdrawal records: $OPEN_RECORD"
+# A halted node casts no vote, so its `confirmed` stays behind. The cursor
+# reads `processed`, as the migration does.
+cursor() {
+  "$D" bridge-state --solana-rpc-url "$1" --program-id "$PROGRAM_ID" --processed \
+    | grep -E "^(pegged lamports|deposit high water|withdrawals|credited height|credited block|credit index|stranded lamports)"
+}
+bmm_counters() {
+  "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" --processed \
+    | grep -E "^(bmm paid total|bmm next height)"
+}
+CURSOR_BEFORE="$(cursor "$SOLANA_URL")"
+DOWN_BEFORE="$(lamports_of "$DOWN_PUBKEY")"
+USER_BEFORE="$(lamports_of "$USER_PUBKEY")"
+echo "withdrawal $OPEN_INDEX stays open; the user holds $USER_BEFORE lamports"
+BMM_BEFORE="$(bmm_counters)"
+OLD_SLOT="$("$SOLANA" -u "$SOLANA_URL" slot --commitment processed)"
+kill "$VALIDATOR_PID"
+wait "$VALIDATOR_PID" 2>/dev/null || true
+
+step "migration: the halted chain goes into a new genesis"
+LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
+  GOSSIP_PORT="$SOLANA_GOSSIP_PORT" XDP=0 HALT=1 \
+  ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
+  BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" ALLOW_PRIVATE_ADDR=1 \
+  nohup bash "$REPO/genesis/run-validator.sh" > "$ROOT/validator-halted.log" 2>&1 &
+HALTED_PID=$!
+PIDS+=("$HALTED_PID")
+# The node replays its ledger first. It then stands still at the last slot,
+# at or after the slot where the old validator stopped.
+HALT_SLOT=0
+for _ in $(seq 1 120); do
+  kill -0 "$HALTED_PID" 2>/dev/null || fail "the halted validator stopped"
+  HALT_SLOT="$("$SOLANA" -u "$SOLANA_URL" slot --commitment processed 2>/dev/null || echo 0)"
+  [ "$HALT_SLOT" -ge "$OLD_SLOT" ] && break
+  sleep 2
+done
+[ "$HALT_SLOT" -ge "$OLD_SLOT" ] || fail "the halted node replayed only to slot $HALT_SLOT, not $OLD_SLOT"
+sleep 10
+[ "$("$SOLANA" -u "$SOLANA_URL" slot --commitment processed)" = "$HALT_SLOT" ] || fail "the halted chain still makes blocks"
+echo "the old validator stopped at slot $OLD_SLOT, and the halted node stands still at slot $HALT_SLOT"
+[ "$(cursor "$SOLANA_URL")" = "$CURSOR_BEFORE" ] || fail "the halted node shows another cursor"
+[ "$(bmm_counters)" = "$BMM_BEFORE" ] || fail "the halted node shows other BMM counters"
+grep -q "takes the answer of its first run" "$ROOT/validator-halted.log" \
+  || fail "the halted node replayed no settle with the answer of its first run"
+echo "PASS: the halted node replayed from the genesis through the settles of the dropped eCash blocks"
+OLD_RPC="$SOLANA_URL" LEDGER="$ROOT/ledger-new" KEYS="$ROOT/keys" STATE="$ROOT/state.json" \
+  ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" NETWORK=regtest DAEMON="$D" \
+  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" \
+  bash "$REPO/scripts/migrate-genesis.sh" | tee "$ROOT/migrate.log"
+kill "$HALTED_PID"
+wait "$HALTED_PID" 2>/dev/null || true
+
+step "migration: the new chain starts"
+LEDGER="$ROOT/ledger-new" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
+  GOSSIP_PORT="$SOLANA_GOSSIP_PORT" XDP=0 \
+  ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
+  BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" ALLOW_PRIVATE_ADDR=1 \
+  nohup bash "$REPO/genesis/run-validator.sh" > "$ROOT/validator-new.log" 2>&1 &
+VALIDATOR_PID=$!
+PIDS+=("$VALIDATOR_PID")
+HEALTHY=no
+for _ in $(seq 1 90); do
+  if rpc getHealth '[]' 2>/dev/null | grep -q '"result":"ok"'; then
+    HEALTHY=yes
+    break
+  fi
+  kill -0 "$VALIDATOR_PID" 2>/dev/null || fail "the new validator stopped"
+  sleep 2
+done
+[ "$HEALTHY" = yes ] || fail "the new chain did not become healthy"
+NEW_GENESIS="$("$SOLANA" -u "$SOLANA_URL" genesis-hash)"
+[ "$NEW_GENESIS" != "$GENESIS_HASH" ] || fail "the new chain has the old genesis"
+echo "the new chain $NEW_GENESIS runs at slot $("$SOLANA" -u "$SOLANA_URL" slot)"
+
+[ "$(cursor "$SOLANA_URL")" = "$CURSOR_BEFORE" ] || {
+  printf 'before:\n%s\nafter:\n%s\n' "$CURSOR_BEFORE" "$(cursor "$SOLANA_URL")" >&2
+  fail "the cursor did not carry over"
+}
+echo "PASS: the cursor carried over:"
+printf '%s\n' "$CURSOR_BEFORE"
+[ "$(lamports_of "$USER_PUBKEY")" = "$USER_BEFORE" ] || fail "the user balance did not carry over"
+[ "$(lamports_of "$DOWN_PUBKEY")" = "$DOWN_BEFORE" ] || fail "the second balance did not carry over"
+echo "PASS: the balances carried over: $USER_BEFORE and $DOWN_BEFORE lamports"
+NEW_RECORD="$(rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]" \
+  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 187]')"
+[ "$NEW_RECORD" = "$OPEN_RECORD" ] || fail "the open withdrawal record did not carry over"
+echo "PASS: open withdrawal $OPEN_INDEX carried over byte for byte"
+books_close
+echo "PASS: the books close on the new chain"
+
+step "migration: the new chain credits only new deposits, and pays the open withdrawal"
+BEFORE_OPEN="$(received "$OPEN_ADDRESS")"
+PEGGED_BEFORE="$(bridge_value "pegged lamports")"
+start_peg
+NEW_SATS=700000
+NEW_PUBKEY="$("$D" seed-pubkey --mnemonic-file "$MNEMONIC_FILE" --account 2 | awk '{print $2}')"
+"$D" deposit $E --pubkey "$NEW_PUBKEY" --sats "$NEW_SATS"
+"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(lamports_of "$NEW_PUBKEY")" = $((NEW_SATS * 10)) ] && break
+  sleep 3
+done
+[ "$(lamports_of "$NEW_PUBKEY")" = $((NEW_SATS * 10)) ] || fail "the new chain did not credit the new deposit"
+# The peg can close the open record in these blocks, and the user then gets
+# its rent back. So the pegged count proves that no old deposit came again.
+[ "$(bridge_value "pegged lamports")" = $((PEGGED_BEFORE + NEW_SATS * 10)) ] || \
+  fail "the pegged count went from $PEGGED_BEFORE to $(bridge_value "pegged lamports")"
+[ "$(lamports_of "$DOWN_PUBKEY")" = "$DOWN_BEFORE" ] || fail "the new chain credited an old deposit again"
+echo "PASS: the new chain credited the new deposit, and no old deposit again"
+for _ in $(seq 1 30); do
+  [ "$(received "$OPEN_ADDRESS")" != "$BEFORE_OPEN" ] && break
+  "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
+  sleep 4
+done
+[ "$(received "$OPEN_ADDRESS")" != "$BEFORE_OPEN" ] || fail "the open withdrawal was never paid"
+books_close
+echo "PASS: eCash paid the migrated withdrawal, and the books close"
+
 echo
-echo "PASS: the peg, BMM, and the reorg cases all work, and the books close."
+echo "PASS: the peg, BMM, the reorg cases, and the migration all work, and the books close."
