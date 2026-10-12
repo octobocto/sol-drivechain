@@ -86,6 +86,9 @@ SNAPSHOT_ARGS=(
   --full-snapshot-interval-slots "${FULL_SNAPSHOT_INTERVAL_SLOTS:-25000}"
   --maximum-full-snapshots-to-retain "${FULL_SNAPSHOTS_TO_RETAIN:-10}"
 )
+if [ -n "${INCREMENTAL_SNAPSHOT_INTERVAL_SLOTS:-}" ]; then
+  SNAPSHOT_ARGS+=(--snapshot-interval-slots "$INCREMENTAL_SNAPSHOT_INTERVAL_SLOTS")
+fi
 
 # Gossip between nodes on one host uses loopback, which the validator takes
 # only with this flag.
@@ -117,9 +120,17 @@ VOTE_ARGS=(
 if [ -n "${NO_VOTE:-}" ]; then
   VOTE_ARGS=(--no-voting)
 fi
+# A node with HALT replays its ledger, then makes no vote and no block, so the
+# chain stands still at its last slot. A migration reads the old chain there.
+LEADER_ARGS=(--no-wait-for-vote-to-start-leader)
+if [ -n "${HALT:-}" ]; then
+  VOTE_ARGS=(--no-voting)
+  LEADER_ARGS=()
+fi
 
-# The default filter drops every message of the BMM crates.
-export RUST_LOG="${RUST_LOG:-solana=info,sol_drivechain_bmm=debug,solana_runtime::bank::bmm=debug}"
+# The default filter drops every message of the BMM crates, the root moves,
+# and the BMM restart.
+export RUST_LOG="${RUST_LOG:-solana=info,agave_validator=info,agave_votor=info,sol_drivechain_bmm=debug,solana_runtime::bank::bmm=debug}"
 
 exec "$AGAVE_VALIDATOR" \
   --ledger "$LEDGER" \
@@ -129,13 +140,15 @@ exec "$AGAVE_VALIDATOR" \
   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
   --rpc-port "$RPC_PORT" \
   --gossip-port "$GOSSIP_PORT" \
-  --no-wait-for-vote-to-start-leader \
+  ${LEADER_ARGS[@]+"${LEADER_ARGS[@]}"} \
   $NO_XDP \
   ${JOIN_ARGS[@]+"${JOIN_ARGS[@]}"} \
   --no-poh-speed-test \
   --bmm-enforcer-url "$ENFORCER_URL" \
   --bmm-sidechain-slot "$SIDECHAIN_SLOT" \
   --bmm-confirmations "${BMM_CONFIRMATIONS:-6}" \
+  --bmm-root-depth "${BMM_ROOT_DEPTH:-2}" \
+  --bmm-fallback-blocks "${BMM_FALLBACK_BLOCKS:-6}" \
   --no-os-network-limits-test \
   --full-rpc-api \
   --bind-address "$BIND_ADDRESS" \

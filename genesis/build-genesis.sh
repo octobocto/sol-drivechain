@@ -42,21 +42,33 @@ CPMM_ID=CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C
 # at each epoch. That destroys money outside the peg, so the genesis switches
 # it off. It only runs when `alpenglow` is also active, and that stays off too.
 VAT_FEATURE="${VAT_FEATURE:-VAT9huvhPjRN9cyrPytq9rwvEJ3J4ADtjdncgZRyANJ}"
-# The oracle pays the rent of every deposit claim account.
+# The oracle marks the paid withdrawals and pays the fees of the credit loop.
 ORACLE_SOL="${ORACLE_SOL:-1}"
+
+# The bridge config. BMM settles from ECASH_START_HEIGHT, and a new chain
+# counts the deposits up to it as credited, so it is the eCash tip at the
+# start. D is the eCash confirmations before a credit. A checkpoint at eCash
+# height H counts only when its bank credited every deposit through H minus
+# DEPOSIT_LAG. K and L are validator flags in run-validator.sh.
+ECASH_START_HEIGHT="${ECASH_START_HEIGHT:-}"
+DEPOSIT_CONFIRMATIONS="${DEPOSIT_CONFIRMATIONS:-6}"
+DEPOSIT_LAG="${DEPOSIT_LAG:-100}"
+# The state file of a halted chain from `migrate-state`. The new genesis then
+# carries its balances, its open withdrawals, and its deposit cursor.
+STATE="${STATE:-}"
 
 # These lamports carry no Bitcoin behind them. The bridge counts pegged
 # lamports and subtracts with a checked subtraction, so they can never peg out.
-# The patched Agave returns every fee to the leader, so the validator only
-# holds a buffer, not a running cost.
+# Every fee goes to the bridge treasury, so the validator only holds a buffer
+# for its votes, not a running cost.
 BOOTSTRAP_LAMPORTS="${BOOTSTRAP_LAMPORTS:-1000000000}"
 STAKE_LAMPORTS="${STAKE_LAMPORTS:-100000}"
-# (128 + 0) * LAMPORTS_PER_BYTE_YEAR * 2 makes an empty account rent-exempt.
+# Agave 4 takes LAMPORTS_PER_BYTE_YEAR as the price of one byte, with an
+# exemption threshold of one. (128 + data_len) * LAMPORTS_PER_BYTE_YEAR gives
+# the rent-exempt minimum. The stock price of 6960 makes an empty account cost
+# 890880 lamports, which is 89088 satoshis. Four makes it 512 lamports.
 FAUCET_LAMPORTS="${FAUCET_LAMPORTS:-1024}"
 
-# (128 + data_len) * LAMPORTS_PER_BYTE_YEAR * RENT_EXEMPTION_THRESHOLD gives the
-# rent-exempt minimum. The stock 3480 makes an empty account cost 890880
-# lamports, which is 89088 satoshis. Four makes it 1024 lamports.
 LAMPORTS_PER_BYTE_YEAR="${LAMPORTS_PER_BYTE_YEAR:-4}"
 
 # One satoshi per signature. The stock 5000 lamports is 500 satoshis.
@@ -79,6 +91,12 @@ if [ ! -f "$PROGRAM_SO" ]; then
   exit 1
 fi
 
+if [ -z "$ECASH_START_HEIGHT" ]; then
+  echo "error: set ECASH_START_HEIGHT to the eCash tip, for example from" >&2
+  echo "  sol-drivechain-daemon ecash-tip --network <network> --enforcer-url <url> --slot <slot>" >&2
+  exit 1
+fi
+
 if [ ! -x "$DAEMON" ]; then
   echo "error: the daemon is not at $DAEMON" >&2
   echo "Build it first: cargo build --manifest-path daemon/Cargo.toml" >&2
@@ -94,14 +112,26 @@ for name in validator-identity validator-vote validator-stake oracle faucet; do
 done
 
 PROGRAM_ID="$(cat "$KEYS/bridge-program.pubkey")"
-# Every fee goes to the treasury, and the runtime burns a fee that would leave
-# it below the rent reserve. So the treasury starts at exactly the reserve of an
-# empty account, which no peg-out can reach.
-TREASURY_LAMPORTS=$(((128 + 0) * LAMPORTS_PER_BYTE_YEAR * 2))
+IDENTITY="$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-identity.json")"
 
+# The genesis writes the bridge config and the block record, so no
+# transaction creates them and the runtime never mints their rent.
+STATE_ARGS=()
+if [ -n "$STATE" ]; then
+  STATE_ARGS=(--state "$STATE")
+  # `solana-genesis` writes the bootstrap identity after the primordial
+  # accounts, so the identity keeps its old balance only through this flag.
+  OLD_IDENTITY_LAMPORTS="$("$DAEMON" state-lamports --state "$STATE" --pubkey "$IDENTITY")"
+  if [ "$OLD_IDENTITY_LAMPORTS" != 0 ]; then
+    BOOTSTRAP_LAMPORTS="$OLD_IDENTITY_LAMPORTS"
+  fi
+fi
 "$DAEMON" genesis --program-id "$PROGRAM_ID" --vault-sol "$VAULT_SOL" \
   --oracle "$("$SOLANA_KEYGEN" pubkey "$KEYS/oracle.json")" --oracle-sol "$ORACLE_SOL" \
-  --treasury-lamports "$TREASURY_LAMPORTS" \
+  --lamports-per-byte-year "$LAMPORTS_PER_BYTE_YEAR" \
+  --ecash-start-height "$ECASH_START_HEIGHT" \
+  --deposit-confirmations "$DEPOSIT_CONFIRMATIONS" --deposit-lag "$DEPOSIT_LAG" \
+  ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} \
   --out "$REPO/genesis/primordial.yaml"
 
 DEX_FLAGS=()
@@ -127,7 +157,7 @@ mkdir -p "$LEDGER"
   --ledger "$LEDGER" \
   --cluster-type development \
   --bootstrap-validator \
-    "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-identity.json")" \
+    "$IDENTITY" \
     "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-vote.json")" \
     "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-stake.json")" \
   --bootstrap-validator-lamports "$BOOTSTRAP_LAMPORTS" \
@@ -147,4 +177,5 @@ mkdir -p "$LEDGER"
 echo
 echo "the ledger is at $LEDGER"
 echo "the oracle is $("$SOLANA_KEYGEN" pubkey "$KEYS/oracle.json")"
+echo "the identity starts with $BOOTSTRAP_LAMPORTS lamports"
 "$DAEMON" derive --program-id "$PROGRAM_ID"
