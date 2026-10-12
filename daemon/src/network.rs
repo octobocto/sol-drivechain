@@ -102,12 +102,13 @@ impl PegNetwork {
         }
     }
 
-    /// How many confirmations a deposit waits before the daemon credits it.
+    /// The default D: how many eCash confirmations a deposit waits before a
+    /// credit.
     ///
-    /// A reorg that drops a credited deposit mints lamports that no Bitcoin
-    /// backs, and only a coordinated restart can undo it. So a chain that
-    /// holds real money waits much longer than the BMM depth N. Alphanet and
-    /// betanet are test networks, and they wait 6 blocks.
+    /// An eCash reorg that drops a credited deposit rolls the Solana chain
+    /// back. So a chain that holds real money waits much longer than the BMM
+    /// depth N. Alphanet and betanet are test networks, and they wait 6
+    /// blocks.
     pub fn default_confirmations(self) -> u32 {
         match self {
             Self::Mainnet => 100,
@@ -309,7 +310,7 @@ mod tests {
         assert_eq!(PegNetwork::Alphanet.default_confirmations(), 6);
         assert_eq!(PegNetwork::Regtest.default_confirmations(), 1);
         // A deposit on a chain with real money waits much longer than a BMM
-        // settle, because only a restart can undo a deposit that a reorg drops.
+        // settle, because a reorg that drops a credit rolls the chain back.
         assert!(PegNetwork::Mainnet.default_confirmations() > 6);
     }
 

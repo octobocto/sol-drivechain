@@ -20,6 +20,82 @@ pub const TREASURY_SEED: &[u8] = b"treasury";
 pub const BMM_ANSWER_ID: Pubkey =
     Pubkey::from_str_const("BmmAnswer1111111111111111111111111111111111");
 
+/// The account that the patched validator builds for each credit. It must
+/// match `DEPOSIT_ANSWER_ID` in the Agave patch and the bridge program.
+pub const DEPOSIT_ANSWER_ID: Pubkey =
+    Pubkey::from_str_const("DepositAnswer111111111111111111111111111111");
+
+/// The block record of the patched validator: the last block of each stride
+/// of slots on the fork, with the deposit credits of its bank. A settle pays
+/// only a commitment to a block in it. It must match `BMM_BLOCKS_ID` in the
+/// Agave patch.
+pub const BMM_BLOCKS_ID: Pubkey =
+    Pubkey::from_str_const("BmmB1ocks1111111111111111111111111111111111");
+
+/// The owner of every sysvar, and of the block record.
+pub const SYSVAR_OWNER_ID: Pubkey =
+    Pubkey::from_str_const("Sysvar1111111111111111111111111111111111111");
+
+/// One record entry: the slot, the bank hash, the credited eCash height, the
+/// credited eCash block, and the eCash block of the parts so far.
+const BLOCK_RECORD_ENTRY_LEN: usize = 8 + 32 + 8 + 32 + 32;
+
+/// The size of the block record account. It must match `BLOCK_RECORD_LEN` in
+/// the Agave patch.
+pub const BLOCK_RECORD_LEN: usize = 2048 * BLOCK_RECORD_ENTRY_LEN;
+
+/// One block of the block record, with the deposit credits of its bank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordedBlock {
+    pub slot: u64,
+    pub bank_hash: [u8; 32],
+    /// The highest eCash height whose deposits the bank credited in full.
+    pub credited_height: u64,
+    /// The eCash block at `credited_height`, in the internal byte order.
+    /// Zero before the first credit.
+    pub credited_block: [u8; 32],
+    /// The eCash block at `credited_height + 1` whose first deposits the
+    /// bank credited. Zero when no part is open.
+    pub part_block: [u8; 32],
+}
+
+/// The blocks of a block record, newest first.
+pub fn recorded_blocks(record: &[u8]) -> Vec<RecordedBlock> {
+    let mut blocks: Vec<RecordedBlock> = record
+        .chunks_exact(BLOCK_RECORD_ENTRY_LEN)
+        .filter_map(|entry| {
+            let mut reader = Reader::new(entry);
+            let block = RecordedBlock {
+                slot: reader.u64()?,
+                bank_hash: reader.array32()?,
+                credited_height: reader.u64()?,
+                credited_block: reader.array32()?,
+                part_block: reader.array32()?,
+            };
+            (block.bank_hash != [0u8; 32]).then_some(block)
+        })
+        .collect();
+    blocks.sort_by_key(|block| std::cmp::Reverse(block.slot));
+    blocks
+}
+
+/// The rent-exempt minimum of an account with `data_len` bytes, for a
+/// genesis with `--lamports-per-byte-year`. Agave 4 takes that value as the
+/// price of one byte, with an exemption threshold of one.
+pub fn rent_exempt_lamports(data_len: usize, lamports_per_byte_year: u64) -> Option<u64> {
+    const ACCOUNT_STORAGE_OVERHEAD: u64 = 128;
+    ACCOUNT_STORAGE_OVERHEAD
+        .checked_add(u64::try_from(data_len).ok()?)?
+        .checked_mul(lamports_per_byte_year)
+}
+
+/// h* of a BMM bid: SHA-256(Solana bank hash ‖ payee).
+pub fn commitment_of(solana_block: &[u8; 32], payee: &Pubkey) -> [u8; 32] {
+    let mut bytes = solana_block.to_vec();
+    bytes.extend_from_slice(payee.as_ref());
+    sha256::Hash::hash(&bytes).to_byte_array()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error("the account holds {found} bytes, but `{name}` asks for at least {want}")]
@@ -72,13 +148,44 @@ pub struct Config {
     pub withdrawal_count: u64,
     pub bmm_next_height: u64,
     pub bmm_paid_total: u64,
+    pub deposit_confirmations: u64,
+    pub deposit_lag: u64,
+    pub credited_height: u64,
+    pub credited_block: [u8; 32],
+    pub credit_index: u64,
+    pub credit_part_block: [u8; 32],
+    pub stranded_lamports: u64,
     pub bump: u8,
     pub vault_bump: u8,
     pub treasury_bump: u8,
 }
 
 impl Config {
-    pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 1;
+    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1;
+
+    /// The account data in the Anchor layout, as the genesis writes it.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut data = discriminator("account", "Config").to_vec();
+        data.extend_from_slice(self.oracle.as_ref());
+        for value in [
+            self.deposit_high_water,
+            self.pegged_lamports,
+            self.withdrawal_count,
+            self.bmm_next_height,
+            self.bmm_paid_total,
+            self.deposit_confirmations,
+            self.deposit_lag,
+            self.credited_height,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&self.credited_block);
+        data.extend_from_slice(&self.credit_index.to_le_bytes());
+        data.extend_from_slice(&self.credit_part_block);
+        data.extend_from_slice(&self.stranded_lamports.to_le_bytes());
+        data.extend_from_slice(&[self.bump, self.vault_bump, self.treasury_bump]);
+        data
+    }
 
     pub fn decode(data: &[u8]) -> Result<Self, BridgeError> {
         if data.len() < Self::LEN {
@@ -103,9 +210,59 @@ impl Config {
             withdrawal_count: reader.u64().ok_or_else(|| cut("withdrawal_count"))?,
             bmm_next_height: reader.u64().ok_or_else(|| cut("bmm_next_height"))?,
             bmm_paid_total: reader.u64().ok_or_else(|| cut("bmm_paid_total"))?,
+            deposit_confirmations: reader.u64().ok_or_else(|| cut("deposit_confirmations"))?,
+            deposit_lag: reader.u64().ok_or_else(|| cut("deposit_lag"))?,
+            credited_height: reader.u64().ok_or_else(|| cut("credited_height"))?,
+            credited_block: reader.array32().ok_or_else(|| cut("credited_block"))?,
+            credit_index: reader.u64().ok_or_else(|| cut("credit_index"))?,
+            credit_part_block: reader.array32().ok_or_else(|| cut("credit_part_block"))?,
+            stranded_lamports: reader.u64().ok_or_else(|| cut("stranded_lamports"))?,
             bump: reader.u8().ok_or_else(|| cut("bump"))?,
             vault_bump: reader.u8().ok_or_else(|| cut("vault_bump"))?,
             treasury_bump: reader.u8().ok_or_else(|| cut("treasury_bump"))?,
+        })
+    }
+}
+
+/// The bridge config of a chain from before the BMM checkpoints. The oracle
+/// credited each deposit by its sequence number, and no field holds an eCash
+/// height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OracleEraConfig {
+    pub oracle: Pubkey,
+    pub deposit_high_water: u64,
+    pub pegged_lamports: u64,
+    pub withdrawal_count: u64,
+    pub bmm_next_height: u64,
+    pub bmm_paid_total: u64,
+}
+
+impl OracleEraConfig {
+    pub const LEN: usize = 8 + 32 + 8 * 5 + 1 + 1 + 1;
+
+    pub fn decode(data: &[u8]) -> Result<Self, BridgeError> {
+        if data.len() != Self::LEN {
+            return Err(BridgeError::ShortAccount {
+                name: "OracleEraConfig",
+                want: Self::LEN,
+                found: data.len(),
+            });
+        }
+        if data[..8] != discriminator("account", "Config") {
+            return Err(BridgeError::WrongDiscriminator("Config"));
+        }
+        let mut reader = Reader::new(&data[8..]);
+        let cut = |field| BridgeError::TruncatedField {
+            name: "OracleEraConfig",
+            field,
+        };
+        Ok(Self {
+            oracle: Pubkey::new_from_array(reader.array32().ok_or_else(|| cut("oracle"))?),
+            deposit_high_water: reader.u64().ok_or_else(|| cut("deposit_high_water"))?,
+            pegged_lamports: reader.u64().ok_or_else(|| cut("pegged_lamports"))?,
+            withdrawal_count: reader.u64().ok_or_else(|| cut("withdrawal_count"))?,
+            bmm_next_height: reader.u64().ok_or_else(|| cut("bmm_next_height"))?,
+            bmm_paid_total: reader.u64().ok_or_else(|| cut("bmm_paid_total"))?,
         })
     }
 }
@@ -162,47 +319,37 @@ impl WithdrawalRecord {
     }
 }
 
-pub fn initialize_ix(
+/// Credits the deposits of eCash block `block_hash` at `height`, from index
+/// `first`, `count` of them. `targets` holds the pubkey of each deposit of
+/// the part that names one, in order. `block_hash` is in the internal byte
+/// order. Anyone can send it.
+pub fn credit_deposits_ix(
     program_id: &Pubkey,
-    payer: &Pubkey,
-    oracle: &Pubkey,
-    bmm_start_height: u64,
+    height: u64,
+    block_hash: &[u8; 32],
+    first: u32,
+    count: u8,
+    targets: &[Pubkey],
 ) -> Instruction {
-    let mut data = discriminator("global", "initialize").to_vec();
-    data.extend_from_slice(oracle.as_ref());
-    data.extend_from_slice(&bmm_start_height.to_le_bytes());
+    let mut data = discriminator("global", "credit_deposits").to_vec();
+    data.extend_from_slice(&height.to_le_bytes());
+    data.extend_from_slice(block_hash);
+    data.extend_from_slice(&first.to_le_bytes());
+    data.push(count);
+    let mut accounts = vec![
+        AccountMeta::new(config_pda(program_id).0, false),
+        AccountMeta::new(vault_pda(program_id).0, false),
+        AccountMeta::new_readonly(DEPOSIT_ANSWER_ID, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    accounts.extend(
+        targets
+            .iter()
+            .map(|target| AccountMeta::new(*target, false)),
+    );
     Instruction {
         program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(config_pda(program_id).0, false),
-            AccountMeta::new_readonly(vault_pda(program_id).0, false),
-            AccountMeta::new_readonly(treasury_pda(program_id).0, false),
-            AccountMeta::new(*payer, true),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data,
-    }
-}
-
-pub fn deposit_ix(
-    program_id: &Pubkey,
-    oracle: &Pubkey,
-    recipient: &Pubkey,
-    sequence_number: u64,
-    value_sats: u64,
-) -> Instruction {
-    let mut data = discriminator("global", "deposit").to_vec();
-    data.extend_from_slice(&sequence_number.to_le_bytes());
-    data.extend_from_slice(&value_sats.to_le_bytes());
-    Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(config_pda(program_id).0, false),
-            AccountMeta::new(vault_pda(program_id).0, false),
-            AccountMeta::new(*recipient, false),
-            AccountMeta::new_readonly(*oracle, true),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
+        accounts,
         data,
     }
 }
@@ -253,18 +400,20 @@ pub fn mark_paid_ix(
     }
 }
 
-/// Settles eCash height `height`, which `block_hash` holds on the active
-/// chain. `payee` must be the key in its BMM commitment, or any account when
-/// the coinbase holds none. `block_hash` is in the internal byte order.
+/// Settles the commitment at eCash height `height`, which `block_hash` holds on
+/// the active chain. The commitment must be SHA-256(`solana_block` ‖ `payee`).
+/// `block_hash` is in the internal byte order.
 pub fn settle_bmm_ix(
     program_id: &Pubkey,
     height: u64,
     block_hash: &[u8; 32],
+    solana_block: &[u8; 32],
     payee: &Pubkey,
 ) -> Instruction {
     let mut data = discriminator("global", "settle_bmm").to_vec();
     data.extend_from_slice(&height.to_le_bytes());
     data.extend_from_slice(block_hash);
+    data.extend_from_slice(solana_block);
     Instruction {
         program_id: *program_id,
         accounts: vec![
@@ -344,19 +493,13 @@ mod tests {
 
     #[test]
     fn the_discriminator_is_eight_bytes_of_sha256() {
-        let want = &sha256::Hash::hash(b"global:deposit").to_byte_array()[..8];
-        assert_eq!(discriminator("global", "deposit"), want);
+        let want = &sha256::Hash::hash(b"global:credit_deposits").to_byte_array()[..8];
+        assert_eq!(discriminator("global", "credit_deposits"), want);
     }
 
     #[test]
     fn each_instruction_carries_its_own_discriminator() {
-        let names = [
-            "initialize",
-            "deposit",
-            "withdraw",
-            "mark_paid",
-            "settle_bmm",
-        ];
+        let names = ["credit_deposits", "withdraw", "mark_paid", "settle_bmm"];
         let mut seen: Vec<[u8; 8]> = names
             .iter()
             .map(|name| discriminator("global", name))
@@ -374,6 +517,13 @@ mod tests {
             withdrawal_count: 2,
             bmm_next_height: 900,
             bmm_paid_total: 7_000,
+            deposit_confirmations: 6,
+            deposit_lag: 100,
+            credited_height: 1_000,
+            credited_block: [4u8; 32],
+            credit_index: 2,
+            credit_part_block: [5u8; 32],
+            stranded_lamports: 50,
             bump: 254,
             vault_bump: 253,
             treasury_bump: 252,
@@ -381,17 +531,7 @@ mod tests {
     }
 
     fn a_config_account(config: &Config) -> Vec<u8> {
-        let mut data = discriminator("account", "Config").to_vec();
-        data.extend_from_slice(config.oracle.as_ref());
-        data.extend_from_slice(&config.deposit_high_water.to_le_bytes());
-        data.extend_from_slice(&config.pegged_lamports.to_le_bytes());
-        data.extend_from_slice(&config.withdrawal_count.to_le_bytes());
-        data.extend_from_slice(&config.bmm_next_height.to_le_bytes());
-        data.extend_from_slice(&config.bmm_paid_total.to_le_bytes());
-        data.push(config.bump);
-        data.push(config.vault_bump);
-        data.push(config.treasury_bump);
-        data
+        config.encode()
     }
 
     fn a_record() -> WithdrawalRecord {
@@ -421,18 +561,10 @@ mod tests {
 
     #[test]
     fn a_config_round_trips() {
-        let config = Config {
-            oracle: Pubkey::new_from_array([9u8; 32]),
-            deposit_high_water: 42,
-            pegged_lamports: 1_000_000,
-            withdrawal_count: 7,
-            bmm_next_height: 12_345,
-            bmm_paid_total: 99,
-            bump: 254,
-            vault_bump: 253,
-            treasury_bump: 252,
-        };
-        assert_eq!(Config::decode(&a_config_account(&config)).unwrap(), config);
+        let config = a_config();
+        let data = a_config_account(&config);
+        assert_eq!(data.len(), Config::LEN);
+        assert_eq!(Config::decode(&data).unwrap(), config);
     }
 
     #[test]
@@ -551,17 +683,27 @@ mod tests {
     }
 
     #[test]
-    fn the_deposit_instruction_carries_the_sequence_number_and_the_value() {
+    fn the_credit_instruction_carries_the_question_and_one_writable_target_each() {
         let program_id = a_program_id();
-        let oracle = Pubkey::new_from_array([1u8; 32]);
-        let recipient = Pubkey::new_from_array([2u8; 32]);
-        let ix = deposit_ix(&program_id, &oracle, &recipient, 12, 50_000);
-        assert_eq!(&ix.data[..8], discriminator("global", "deposit"));
-        assert_eq!(&ix.data[8..16], &12u64.to_le_bytes());
-        assert_eq!(&ix.data[16..24], &50_000u64.to_le_bytes());
-        assert_eq!(ix.accounts[3].pubkey, oracle);
-        assert!(ix.accounts[3].is_signer);
-        assert!(ix.accounts[2].is_writable);
+        let targets = [
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([2u8; 32]),
+        ];
+        let ix = credit_deposits_ix(&program_id, 77, &[5u8; 32], 3, 2, &targets);
+        assert_eq!(&ix.data[..8], discriminator("global", "credit_deposits"));
+        assert_eq!(&ix.data[8..16], &77u64.to_le_bytes());
+        assert_eq!(&ix.data[16..48], &[5u8; 32]);
+        assert_eq!(&ix.data[48..52], &3u32.to_le_bytes());
+        assert_eq!(ix.data[52], 2);
+        assert_eq!(ix.data.len(), 53);
+        assert_eq!(ix.accounts[2].pubkey, DEPOSIT_ANSWER_ID);
+        assert!(!ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[4].pubkey, targets[0]);
+        assert_eq!(ix.accounts[5].pubkey, targets[1]);
+        assert!(ix.accounts[4..]
+            .iter()
+            .all(|meta| meta.is_writable && !meta.is_signer));
+        assert!(ix.accounts.iter().all(|meta| !meta.is_signer));
     }
 
     #[test]
@@ -577,17 +719,115 @@ mod tests {
     }
 
     #[test]
-    fn the_settle_instruction_carries_the_height_and_the_block_hash() {
+    fn the_settle_instruction_carries_the_height_the_block_hash_and_the_solana_block() {
         let program_id = a_program_id();
         let payee = Pubkey::new_from_array([8u8; 32]);
-        let ix = settle_bmm_ix(&program_id, 77, &[5u8; 32], &payee);
+        let ix = settle_bmm_ix(&program_id, 77, &[5u8; 32], &[6u8; 32], &payee);
         assert_eq!(&ix.data[..8], discriminator("global", "settle_bmm"));
         assert_eq!(&ix.data[8..16], &77u64.to_le_bytes());
-        assert_eq!(&ix.data[16..], &[5u8; 32]);
+        assert_eq!(&ix.data[16..48], &[5u8; 32]);
+        assert_eq!(&ix.data[48..], &[6u8; 32]);
         assert_eq!(ix.accounts[2].pubkey, payee);
         assert!(ix.accounts[2].is_writable);
         assert_eq!(ix.accounts[3].pubkey, BMM_ANSWER_ID);
         assert!(!ix.accounts[3].is_writable);
+    }
+
+    fn an_entry(slot: u64, credited_height: u64) -> Vec<u8> {
+        let mut entry = slot.to_le_bytes().to_vec();
+        entry.extend_from_slice(&[slot as u8; 32]);
+        entry.extend_from_slice(&credited_height.to_le_bytes());
+        entry.extend_from_slice(&[credited_height as u8; 32]);
+        entry.extend_from_slice(&[credited_height as u8 + 1; 32]);
+        entry
+    }
+
+    #[test]
+    fn the_record_lists_its_blocks_newest_first_with_their_credits() {
+        let mut record = Vec::new();
+        for (slot, credited) in [(70u64, 10u64), (130, 12), (99, 11)] {
+            record.extend(an_entry(slot, credited));
+        }
+        record.extend_from_slice(&[0u8; BLOCK_RECORD_ENTRY_LEN]);
+        let blocks = recorded_blocks(&record);
+        let slots: Vec<u64> = blocks.iter().map(|block| block.slot).collect();
+        assert_eq!(slots, vec![130, 99, 70]);
+        assert_eq!(
+            blocks[0],
+            RecordedBlock {
+                slot: 130,
+                bank_hash: [130u8; 32],
+                credited_height: 12,
+                credited_block: [12u8; 32],
+                part_block: [13u8; 32],
+            }
+        );
+        assert!(recorded_blocks(&[0u8; 224]).is_empty());
+    }
+
+    #[test]
+    fn the_record_has_the_size_of_the_agave_patch() {
+        assert_eq!(BLOCK_RECORD_LEN, 229_376);
+    }
+
+    #[test]
+    fn the_rent_of_an_account_is_its_bytes_and_overhead_at_the_byte_price() {
+        // The chain gave 512 for 0 bytes.
+        assert_eq!(rent_exempt_lamports(0, 4), Some(512));
+        assert_eq!(rent_exempt_lamports(BLOCK_RECORD_LEN, 4), Some(918_016));
+        assert_eq!(rent_exempt_lamports(0, 6_960), Some(890_880));
+        assert_eq!(rent_exempt_lamports(usize::MAX, 4), None);
+    }
+
+    #[test]
+    fn the_config_sits_at_the_offsets_that_the_validator_reads() {
+        let data = a_config().encode();
+        let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        assert_eq!(data.len(), 187);
+        assert_eq!(&data[8..40], &[7u8; 32]);
+        assert_eq!(at(64), 900);
+        assert_eq!(at(80), 6);
+        assert_eq!(at(88), 100);
+        assert_eq!(at(96), 1_000);
+        assert_eq!(&data[104..136], &[4u8; 32]);
+        assert_eq!(at(136), 2);
+        assert_eq!(&data[144..176], &[5u8; 32]);
+        assert_eq!(data[184..187], [254, 253, 252]);
+    }
+
+    #[test]
+    fn an_oracle_era_config_decodes_its_counters() {
+        let config = a_config();
+        let mut data = discriminator("account", "Config").to_vec();
+        data.extend_from_slice(config.oracle.as_ref());
+        for value in [12u64, 30_000_000, 2, 900, 7_000] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&[254, 253, 252]);
+        assert_eq!(
+            OracleEraConfig::decode(&data).unwrap(),
+            OracleEraConfig {
+                oracle: config.oracle,
+                deposit_high_water: 12,
+                pegged_lamports: 30_000_000,
+                withdrawal_count: 2,
+                bmm_next_height: 900,
+                bmm_paid_total: 7_000,
+            }
+        );
+        assert!(OracleEraConfig::decode(&config.encode()).is_err());
+        assert!(Config::decode(&data).is_err());
+    }
+
+    #[test]
+    fn the_commitment_is_sha256_of_the_solana_block_then_the_payee() {
+        let payee = Pubkey::new_from_array([2u8; 32]);
+        let mut bytes = [1u8; 32].to_vec();
+        bytes.extend_from_slice(&[2u8; 32]);
+        assert_eq!(
+            commitment_of(&[1u8; 32], &payee),
+            sha256::Hash::hash(&bytes).to_byte_array()
+        );
     }
 
     #[test]
@@ -595,6 +835,14 @@ mod tests {
         assert_eq!(
             BMM_ANSWER_ID.to_string(),
             "BmmAnswer1111111111111111111111111111111111"
+        );
+        assert_eq!(
+            BMM_BLOCKS_ID.to_string(),
+            "BmmB1ocks1111111111111111111111111111111111"
+        );
+        assert_eq!(
+            DEPOSIT_ANSWER_ID.to_string(),
+            "DepositAnswer111111111111111111111111111111"
         );
         assert_ne!(
             treasury_pda(&a_program_id()).0,

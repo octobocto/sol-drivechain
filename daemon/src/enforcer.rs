@@ -531,16 +531,20 @@ impl Enforcer {
         Ok(())
     }
 
-    /// Every block of this slot's peg history, oldest first, up to `end`.
-    ///
-    /// The event stream carries only blocks that connect after the daemon
-    /// subscribes, so a restart would miss the rest without this.
-    pub async fn two_way_peg_data(&mut self, end: BlockHash) -> Result<Vec<PegEvent>> {
+    /// The peg events of each block after `start` up to `end`, oldest first.
+    /// The enforcer leaves out a block without an event for this slot.
+    pub async fn two_way_peg_data(
+        &mut self,
+        start: Option<BlockHash>,
+        end: BlockHash,
+    ) -> Result<Vec<PegEvent>> {
         let response = self
             .validator
             .get_two_way_peg_data(GetTwoWayPegDataRequest {
                 sidechain_id: Some(self.sidechain_id),
-                start_block_hash: None,
+                start_block_hash: start.map(|start| crate::proto::common::ReverseHex {
+                    hex: Some(start.to_string()),
+                }),
                 end_block_hash: Some(crate::proto::common::ReverseHex {
                     hex: Some(end.to_string()),
                 }),
@@ -556,6 +560,67 @@ impl Enforcer {
             .into_iter()
             .map(|item| connect_event(item.block_header_info, item.block_info))
             .collect()
+    }
+
+    /// The deposits of block `block_hash`, whose parent is `prev_hash`, in
+    /// block order.
+    pub async fn block_deposits(
+        &mut self,
+        block_hash: BlockHash,
+        prev_hash: BlockHash,
+    ) -> Result<Vec<DepositEvent>> {
+        let events = self.two_way_peg_data(Some(prev_hash), block_hash).await?;
+        Ok(events
+            .into_iter()
+            .filter_map(|event| match event {
+                PegEvent::Connect {
+                    block_hash: hash,
+                    deposits,
+                    ..
+                } if hash == block_hash => Some(deposits),
+                _ => None,
+            })
+            .flatten()
+            .collect())
+    }
+
+    /// The hash and the parent hash of the active block at `height` below
+    /// `tip`.
+    pub async fn block_at(
+        &mut self,
+        tip: (BlockHash, u32),
+        height: u32,
+    ) -> Result<(BlockHash, BlockHash)> {
+        let depth = tip
+            .1
+            .checked_sub(height)
+            .ok_or(EnforcerError::NoBlockAtHeight(height))?;
+        let headers = self
+            .validator
+            .get_block_header_info(GetBlockHeaderInfoRequest {
+                block_hash: Some(crate::proto::common::ReverseHex {
+                    hex: Some(tip.0.to_string()),
+                }),
+                max_ancestors: Some(depth),
+            })
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "GetBlockHeaderInfo",
+                source,
+            })?
+            .into_inner()
+            .header_infos;
+        let header = headers
+            .into_iter()
+            .find(|header| header.height == height)
+            .ok_or(EnforcerError::NoBlockAtHeight(height))?;
+        Ok((
+            decode_reverse_hash(header.block_hash.and_then(|hash| hash.hex), "block_hash")?,
+            decode_reverse_hash(
+                header.prev_block_hash.and_then(|hash| hash.hex),
+                "prev_block_hash",
+            )?,
+        ))
     }
 
     pub async fn chain_tip(&mut self) -> Result<BlockHash> {
