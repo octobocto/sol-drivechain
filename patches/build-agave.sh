@@ -14,10 +14,32 @@
 #
 # 3. Every fee goes to the bridge treasury, not to the leader.
 # 4. A simple vote pays no signature fee.
-# 5. The crate `sol-drivechain-bmm` reads settled eCash heights from the
-#    local enforcer. The bank checks each `settle_bmm` against it, and the
-#    syscall `sol_get_bmm_commitment` answers the bridge from it.
+# 5. The crate `sol-drivechain-bmm` reads the active eCash chain from the
+#    local enforcer. Before a `settle_bmm` runs, the bank asks it for the
+#    commitment of that eCash block, and it puts the answer into the
+#    `BmmAnswer` account of the tx.
 # 6. The validator takes `--bmm-enforcer-url` and `--bmm-sidechain-slot`.
+# 7. BMM checkpoints select the fork and move the root. After
+#    `--bmm-fallback-blocks` eCash blocks without a commitment, the stake votes
+#    move the root. A branch that splits behind the root and holds more
+#    checkpoints stops the validator with exit code 75, and the next start
+#    loads an older snapshot. The RPC `finalized` commitment is the local root.
+# 8. A commitment h* counts only when a pair (bank hash, payee) with
+#    SHA-256(bank hash ‖ payee) = h* is known. The RPC method `bmmPublishPairs`
+#    takes the pairs, and the validator sends them to every peer. The runtime
+#    writes a block record with the deposit credits of each recorded bank,
+#    and a settle pays only a block in the record of its own fork. The genesis
+#    holds the record account, so the runtime never mints its rent.
+# 9. Before a `credit_deposits` runs, the bank asks the local enforcer for the
+#    deposits of that eCash block, after D confirmations from the bridge
+#    config. A checkpoint counts only when its bank credited every deposit
+#    through H - lag, and the active eCash chain still holds those credits.
+#    No leader builds on a bank whose credits the active chain dropped. A
+#    settle gets the same rule 3 answer for the credits of its record entry.
+# 10. Each validator keeps the answer of each settle and credit in the file
+#    `bmm-answers` of its ledger. A replay of a slot at or below the root of
+#    the start takes that answer. An eCash reorg after the first run then
+#    cannot stop a restart or a replay from the genesis.
 #
 # To move to a later Agave, raise AGAVE_TAG and run this again.
 set -euo pipefail
