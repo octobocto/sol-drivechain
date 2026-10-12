@@ -1,17 +1,18 @@
 use std::{os::unix::fs::PermissionsExt as _, path::PathBuf, str::FromStr as _, time::Duration};
 
+use bitcoin::hashes::Hash as _;
 use clap::{Parser, Subcommand};
 use sol_drivechain_daemon::enforcer::{Declaration, Enforcer};
 use sol_drivechain_daemon::network::PegNetwork;
 use sol_drivechain_daemon::proto::mainchain::AckAllProposalsPolicy;
-use sol_drivechain_daemon::{address, bmm, bridge, peg, seed};
+use sol_drivechain_daemon::{address, bmm, books, bridge, credit, genesis, migrate, peg, seed};
 use solana_sdk::{pubkey::Pubkey, signature::read_keypair_file, signer::Signer as _};
 
 /// The lamport count of one SOL.
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 #[derive(Parser)]
-#[command(version, about = "The oracle daemon of the SOL drivechain")]
+#[command(version, about = "The peg and BMM daemon of the SOL drivechain")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -149,22 +150,6 @@ enum Command {
         #[command(flatten)]
         enforcer: EnforcerArgs,
     },
-    /// Creates the bridge config account. Run this one time per chain.
-    Initialize {
-        #[arg(long, default_value = "http://127.0.0.1:8899")]
-        solana_rpc_url: String,
-        #[arg(long)]
-        program_id: String,
-        /// The keypair that pays the rent of the config account.
-        #[arg(long)]
-        payer: PathBuf,
-        /// The keypair whose pubkey credits every deposit.
-        #[arg(long)]
-        oracle: PathBuf,
-        /// The first eCash height that BMM settles, normally the current tip.
-        #[arg(long)]
-        bmm_start_height: u64,
-    },
     /// Burns lamports and asks the mainchain to pay a Bitcoin address.
     Withdraw {
         #[arg(long, default_value = "http://127.0.0.1:8899")]
@@ -192,6 +177,58 @@ enum Command {
         solana_rpc_url: String,
         #[arg(long)]
         program_id: String,
+        /// Reads the branch that the validator follows, not the confirmed one.
+        #[arg(long)]
+        processed: bool,
+        /// Prints both balance equations with each term, and fails when one
+        /// does not hold. It reads eCash from the enforcer.
+        #[arg(long, requires = "slot")]
+        books: bool,
+        #[arg(long, default_value = "http://127.0.0.1:50051")]
+        enforcer_url: String,
+        #[arg(long)]
+        slot: Option<u8>,
+        /// The supply of the chain, which the genesis put in the vault.
+        #[arg(long, default_value_t = 21_000_000)]
+        supply_sol: u64,
+    },
+    /// Reads the state of a halted chain into a file for the genesis of its
+    /// successor: the system balances, the withdrawal records, and the deposit
+    /// cursor.
+    MigrateState {
+        /// The RPC of a validator that runs with HALT=1 on the old ledger.
+        #[arg(long)]
+        solana_rpc_url: String,
+        #[arg(long)]
+        program_id: String,
+        /// The enforcer finds the cursor of a chain from the oracle era.
+        #[arg(long)]
+        enforcer_url: Option<String>,
+        #[arg(long, requires = "enforcer_url")]
+        slot: Option<u8>,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Prints the lamports of one account in a state file, or 0.
+    StateLamports {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        pubkey: String,
+    },
+    /// Credits the deposits of each eCash height in order. Anyone can run it.
+    Credit {
+        #[arg(long, default_value = "http://127.0.0.1:50051")]
+        enforcer_url: String,
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+        #[arg(long)]
+        slot: u8,
+        #[arg(long)]
+        program_id: String,
+        /// The keypair that signs and pays the fees.
+        #[arg(long)]
+        payer: PathBuf,
     },
     /// Prints the address of one account of a BIP39 seed phrase.
     SeedPubkey {
@@ -232,21 +269,39 @@ enum Command {
         #[command(flatten)]
         declared: DeclarationArgs,
     },
-    /// Writes the primordial accounts file for the genesis.
+    /// Writes the primordial accounts file: the vault, the treasury, the
+    /// bridge config, the block record, and the oracle. With `--state`, it
+    /// adds the balances, the withdrawal records, and the deposit cursor of a
+    /// halted chain.
     Genesis {
         #[arg(long)]
         program_id: String,
+        /// The supply of the chain. The vault holds it at the start.
         #[arg(long, default_value_t = 21_000_000)]
         vault_sol: u64,
-        /// The oracle account. It pays the rent of every deposit claim.
+        /// The key that marks a withdrawal paid.
         #[arg(long)]
-        oracle: Option<String>,
-        #[arg(long, default_value_t = 10)]
+        oracle: String,
+        /// The SOL that the oracle gets to pay its tx fees.
+        #[arg(long, default_value_t = 1)]
         oracle_sol: u64,
-        /// The rent reserve of the empty treasury account. Every fee goes to
-        /// the treasury, so it must exist from the genesis on.
+        /// The rent of the genesis. Each account gets its rent-exempt minimum.
         #[arg(long)]
-        treasury_lamports: u64,
+        lamports_per_byte_year: u64,
+        /// The eCash tip when the chain starts. BMM settles from it, and a new
+        /// chain counts the deposits up to it as credited.
+        #[arg(long)]
+        ecash_start_height: u64,
+        /// D, the eCash confirmations before a credit.
+        #[arg(long)]
+        deposit_confirmations: u64,
+        /// A BMM checkpoint at eCash height H counts only when its bank
+        /// credited every deposit through H minus this lag.
+        #[arg(long)]
+        deposit_lag: u64,
+        /// The state file of a halted chain, from `migrate-state`.
+        #[arg(long)]
+        state: Option<PathBuf>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -268,18 +323,56 @@ enum Command {
         #[command(flatten)]
         enforcer: EnforcerArgs,
     },
-    /// Sends one BIP301 bid for the next eCash block. The payee takes the
-    /// treasury if the bid wins. An operator or a test uses it.
+    /// Sends one BIP301 bid for the next eCash block, for the newest block in
+    /// the block record of the validator that passes rule 3, and publishes the
+    /// pair to the validator. The payee takes the treasury if the bid settles.
+    /// An operator or a test uses it.
     BidBmm {
         #[command(flatten)]
         enforcer: EnforcerArgs,
-        /// The pubkey that takes the payout. It is the whole h*.
-        #[arg(long)]
-        payee: String,
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+        /// The pubkey that takes the payout.
+        #[arg(long, required_unless_present = "commitment")]
+        payee: Option<String>,
         #[arg(long)]
         sats: u64,
+        /// Bids this h*, in hex, and publishes no pair. A test uses it for a
+        /// commitment that no pair matches.
+        #[arg(long, conflicts_with = "payee")]
+        commitment: Option<String>,
+        /// Bids, but keeps the pair back.
+        #[arg(long)]
+        withhold: bool,
+        /// Bids for this Solana bank hash, in base58, and not for the newest
+        /// recorded block. It skips the rule 3 check. A test uses it.
+        #[arg(long, conflicts_with = "commitment")]
+        block: Option<String>,
+        #[arg(long)]
+        program_id: Option<String>,
+        /// How long the bid waits for a recorded block that passes rule 3.
+        #[arg(long, default_value_t = 240)]
+        wait_secs: u64,
     },
-    /// Settles one eCash height by hand. A test or an operator uses it.
+    /// Publishes one BMM pair to a validator.
+    PublishPair {
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+        #[arg(long)]
+        height: u64,
+        /// The Solana bank hash, in base58.
+        #[arg(long)]
+        block: String,
+        #[arg(long)]
+        payee: String,
+    },
+    /// Prints the slot and the bank hash of the newest block in the block
+    /// record of the validator.
+    BmmBlock {
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+    },
+    /// Settles one BMM commitment by hand. A test or an operator uses it.
     SettleBmm {
         #[arg(long, default_value = "http://127.0.0.1:8899")]
         solana_rpc_url: String,
@@ -290,10 +383,13 @@ enum Command {
         identity: PathBuf,
         #[arg(long)]
         height: u64,
-        /// The block hash in the hex that the explorers show.
+        /// The eCash block hash in the hex that the explorers show.
         #[arg(long)]
         block_hash: String,
-        /// The payee in the BMM commitment. It defaults to the signer.
+        /// The Solana bank hash of the pair, in base58.
+        #[arg(long)]
+        solana_block: String,
+        /// The payee of the pair. It defaults to the signer.
         #[arg(long)]
         payee: Option<String>,
     },
@@ -307,8 +403,8 @@ enum Command {
         slot: u8,
         #[arg(long)]
         program_id: String,
-        /// The keypair that signs, and whose pubkey is the BMM commitment and
-        /// the payee. Normally the validator identity.
+        /// The keypair that signs, and whose pubkey is the payee of each bid.
+        /// Normally the validator identity.
         #[arg(long)]
         identity: PathBuf,
         /// N. It must match `--bmm-confirmations` on the validators.
@@ -322,7 +418,8 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         interval_secs: u64,
     },
-    /// Runs the peg. It credits deposits and it proposes withdrawal bundles.
+    /// Runs the peg. It credits deposits, it proposes withdrawal bundles, and
+    /// it marks the paid withdrawals.
     Run {
         #[arg(long, default_value = "regtest")]
         network: PegNetwork,
@@ -336,9 +433,6 @@ enum Command {
         program_id: String,
         #[arg(long)]
         oracle: PathBuf,
-        /// Defaults to the safe count of the network.
-        #[arg(long)]
-        confirmations: Option<u32>,
         #[arg(long, default_value_t = 30)]
         bundle_interval_secs: u64,
     },
@@ -378,6 +472,10 @@ enum CliError {
     },
     #[error("the daemon cannot start its runtime")]
     NoRuntime(#[source] std::io::Error),
+    #[error("the block record of the validator is empty")]
+    EmptyBlockRecord,
+    #[error("a bid needs a payee or a commitment")]
+    NoCommitment,
     #[error(transparent)]
     Enforcer(#[from] sol_drivechain_daemon::enforcer::EnforcerError),
     #[error("the Solana rpc call `{call}` failed")]
@@ -396,6 +494,28 @@ enum CliError {
     Peg(#[from] peg::PegError),
     #[error(transparent)]
     Bmm(#[from] bmm::BmmError),
+    #[error(transparent)]
+    Credit(#[from] credit::CreditError),
+    #[error(transparent)]
+    Genesis(#[from] genesis::GenesisError),
+    #[error(transparent)]
+    Migrate(#[from] migrate::MigrateError),
+    #[error(transparent)]
+    Books(#[from] books::BooksError),
+    #[error("the books do not close")]
+    BooksOpen,
+    #[error("the state file `{path}` is not valid")]
+    BadState {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("a bid without --block needs --program-id")]
+    NoProgramId,
+    #[error("the books need --slot")]
+    NoSlot,
+    #[error("no recorded block passed rule 3 for eCash height {height} in {secs} seconds")]
+    NoBidBlock { height: u64, secs: u64 },
 }
 
 fn main() -> Result<(), CliError> {
@@ -591,7 +711,7 @@ fn main() -> Result<(), CliError> {
                                     deposit.sequence_number, deposit.value_sats
                                 );
                                 match parsed {
-                                    Ok(pubkey) => println!("  the daemon credits {pubkey}"),
+                                    Ok(pubkey) => println!("  the target is {pubkey}"),
                                     Err(error) => println!("  the address fails: {error}"),
                                 }
                             }
@@ -603,33 +723,6 @@ fn main() -> Result<(), CliError> {
                 }
                 Ok(())
             })
-        }
-        Command::Initialize {
-            solana_rpc_url,
-            program_id,
-            payer,
-            oracle,
-            bmm_start_height,
-        } => {
-            let program_id = parse_pubkey(&program_id)?;
-            let payer_key = read_keypair_file(&payer).map_err(|_| CliError::NoOracleKey {
-                path: payer.clone(),
-            })?;
-            let oracle_key = read_keypair_file(&oracle).map_err(|_| CliError::NoOracleKey {
-                path: oracle.clone(),
-            })?;
-            let rpc = blocking_rpc(&solana_rpc_url);
-            let instruction = bridge::initialize_ix(
-                &program_id,
-                &payer_key.pubkey(),
-                &oracle_key.pubkey(),
-                bmm_start_height,
-            );
-            send_one(&rpc, &payer_key, instruction, "initialize")?;
-            println!("the bridge config holds oracle {}", oracle_key.pubkey());
-            println!("BMM settles from eCash height {bmm_start_height}");
-            println!("config {}", bridge::config_pda(&program_id).0);
-            Ok(())
         }
         Command::Withdraw {
             solana_rpc_url,
@@ -674,9 +767,22 @@ fn main() -> Result<(), CliError> {
         Command::BridgeState {
             solana_rpc_url,
             program_id,
+            processed,
+            books,
+            enforcer_url,
+            slot,
+            supply_sol,
         } => {
             let program_id = parse_pubkey(&program_id)?;
-            let rpc = blocking_rpc(&solana_rpc_url);
+            let commitment = if processed {
+                solana_commitment_config::CommitmentConfig::processed()
+            } else {
+                solana_commitment_config::CommitmentConfig::confirmed()
+            };
+            let rpc = solana_rpc_client::rpc_client::RpcClient::new_with_commitment(
+                solana_rpc_url.clone(),
+                commitment,
+            );
             let (config_key, _) = bridge::config_pda(&program_id);
             let (vault_key, _) = bridge::vault_pda(&program_id);
             let data = rpc
@@ -706,7 +812,125 @@ fn main() -> Result<(), CliError> {
             println!("treasury lamports {treasury}");
             println!("bmm next height   {}", config.bmm_next_height);
             println!("bmm paid total    {}", config.bmm_paid_total);
+            println!("credited height   {}", config.credited_height);
+            println!(
+                "credited block    {}",
+                bitcoin::BlockHash::from_byte_array(config.credited_block)
+            );
+            println!("credit index      {}", config.credit_index);
+            println!(
+                "credit part block {}",
+                bitcoin::BlockHash::from_byte_array(config.credit_part_block)
+            );
+            println!("stranded lamports {}", config.stranded_lamports);
+            println!("deposit confirmations {}", config.deposit_confirmations);
+            println!("deposit lag       {}", config.deposit_lag);
+            if !books {
+                return Ok(());
+            }
+            let slot = slot.ok_or(CliError::NoSlot)?;
+            let supply = supply_sol
+                .checked_mul(LAMPORTS_PER_SOL)
+                .ok_or(CliError::VaultTooLarge(supply_sol))?;
+            let books = runtime.block_on(async {
+                let rpc =
+                    solana_rpc_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
+                        solana_rpc_url,
+                        commitment,
+                    );
+                let mut enforcer = Enforcer::connect(enforcer_url, u32::from(slot)).await?;
+                Ok::<_, CliError>(books::read(&rpc, &mut enforcer, &program_id, supply).await?)
+            })?;
+            print!("{}", books.report());
+            if books.vault_holds() && books.treasury_holds() {
+                Ok(())
+            } else {
+                Err(CliError::BooksOpen)
+            }
+        }
+        Command::MigrateState {
+            solana_rpc_url,
+            program_id,
+            enforcer_url,
+            slot,
+            out,
+        } => {
+            let program_id = parse_pubkey(&program_id)?;
+            let state = runtime.block_on(async {
+                let rpc =
+                    solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
+                let mut enforcer = match (enforcer_url, slot) {
+                    (Some(url), Some(slot)) => Some(Enforcer::connect(url, u32::from(slot)).await?),
+                    _ => None,
+                };
+                Ok::<_, CliError>(migrate::export(&rpc, &program_id, enforcer.as_mut()).await?)
+            })?;
+            let body =
+                serde_json::to_string_pretty(&state).map_err(|source| CliError::BadState {
+                    path: out.clone(),
+                    source,
+                })?;
+            std::fs::write(&out, body).map_err(|source| CliError::Write {
+                path: out.clone(),
+                source,
+            })?;
+            let copied: u64 = state
+                .balances
+                .values()
+                .chain(state.records.iter().map(|record| &record.lamports))
+                .fold(0, |sum, lamports| sum.saturating_add(*lamports));
+            println!("slot              {}", state.slot);
+            println!("pegged lamports   {}", state.cursor.pegged_lamports);
+            println!("credited height   {}", state.cursor.credited_height);
+            println!(
+                "credited block    {}",
+                bitcoin::BlockHash::from_byte_array(state.cursor.credited_block)
+            );
+            println!("credit index      {}", state.cursor.credit_index);
+            println!("deposit high water {}", state.cursor.deposit_high_water);
+            println!("withdrawals       {}", state.cursor.withdrawal_count);
+            println!("open withdrawals  {}", state.records.len());
+            println!("system accounts   {}", state.balances.len());
+            println!(
+                "copied lamports   {copied} of a supply of {}",
+                state.supply_lamports
+            );
+            println!("the state is in {}", out.display());
             Ok(())
+        }
+        Command::StateLamports { state, pubkey } => {
+            let state = read_state(&state)?;
+            let pubkey = parse_pubkey(&pubkey)?;
+            println!(
+                "{}",
+                state
+                    .balances
+                    .get(&pubkey.to_string())
+                    .copied()
+                    .unwrap_or(0)
+            );
+            Ok(())
+        }
+        Command::Credit {
+            enforcer_url,
+            solana_rpc_url,
+            slot,
+            program_id,
+            payer,
+        } => {
+            let program_id = parse_pubkey(&program_id)?;
+            let payer_key = read_keypair_file(&payer).map_err(|_| CliError::NoIdentityKey {
+                path: payer.clone(),
+            })?;
+            runtime.block_on(async {
+                let mut enforcer = sol_drivechain_daemon::enforcer::Enforcer::connect(
+                    enforcer_url,
+                    u32::from(slot),
+                )
+                .await?;
+                credit::run(&mut enforcer, solana_rpc_url, program_id, &payer_key).await?;
+                Ok(())
+            })
         }
         Command::SeedPubkey {
             mnemonic_file,
@@ -749,6 +973,7 @@ fn main() -> Result<(), CliError> {
             println!("vault    {}", bridge::vault_pda(&program_id).0);
             println!("treasury {}", bridge::treasury_pda(&program_id).0);
             println!("bmm answer {}", bridge::BMM_ANSWER_ID);
+            println!("block record {}", bridge::BMM_BLOCKS_ID);
             Ok(())
         }
         Command::Address { slot, pubkey } => {
@@ -765,34 +990,71 @@ fn main() -> Result<(), CliError> {
             vault_sol,
             oracle,
             oracle_sol,
-            treasury_lamports,
+            lamports_per_byte_year,
+            ecash_start_height,
+            deposit_confirmations,
+            deposit_lag,
+            state,
             out,
         } => {
-            let program_id = parse_pubkey(&program_id)?;
-            let lamports = vault_sol
-                .checked_mul(LAMPORTS_PER_SOL)
-                .ok_or(CliError::VaultTooLarge(vault_sol))?;
-            let vault = bridge::vault_pda(&program_id).0;
-            let mut body = primordial_yaml(&vault, lamports);
-            let treasury = bridge::treasury_pda(&program_id).0;
-            body.push_str(&primordial_yaml(&treasury, treasury_lamports));
-            println!("treasury {treasury} holds {treasury_lamports} lamports");
-            if let Some(oracle) = oracle {
-                let oracle = parse_pubkey(&oracle)?;
-                let oracle_lamports = oracle_sol
+            let params = genesis::Params {
+                program_id: parse_pubkey(&program_id)?,
+                supply_lamports: vault_sol
                     .checked_mul(LAMPORTS_PER_SOL)
-                    .ok_or(CliError::VaultTooLarge(oracle_sol))?;
-                body.push_str(&primordial_yaml(&oracle, oracle_lamports));
-                println!("oracle {oracle} holds {oracle_lamports} lamports");
-            }
-            std::fs::write(&out, body).map_err(|source| CliError::Write {
+                    .ok_or(CliError::VaultTooLarge(vault_sol))?,
+                oracle: parse_pubkey(&oracle)?,
+                oracle_lamports: oracle_sol
+                    .checked_mul(LAMPORTS_PER_SOL)
+                    .ok_or(CliError::VaultTooLarge(oracle_sol))?,
+                lamports_per_byte_year,
+                ecash_start_height,
+                deposit_confirmations,
+                deposit_lag,
+            };
+            let state = state.as_ref().map(read_state).transpose()?;
+            let accounts = genesis::accounts(&params, state.as_ref())?;
+            std::fs::write(&out, genesis::yaml(&accounts)).map_err(|source| CliError::Write {
                 path: out.clone(),
                 source,
             })?;
+            let config = bridge::config_pda(&params.program_id).0;
+            for account in &accounts {
+                let name = if account.pubkey == bridge::vault_pda(&params.program_id).0 {
+                    "vault"
+                } else if account.pubkey == bridge::treasury_pda(&params.program_id).0 {
+                    "treasury"
+                } else if account.pubkey == config {
+                    "config"
+                } else if account.pubkey == bridge::BMM_BLOCKS_ID {
+                    "block record"
+                } else if account.pubkey == params.oracle {
+                    "oracle"
+                } else {
+                    continue;
+                };
+                println!(
+                    "{name} {} holds {} lamports",
+                    account.pubkey, account.lamports
+                );
+            }
+            if let Some(state) = &state {
+                println!(
+                    "the state of slot {} adds {} balances and {} withdrawal records",
+                    state.slot,
+                    state.balances.len(),
+                    state.records.len()
+                );
+            }
             println!(
-                "vault {vault} holds {lamports} lamports in {}",
-                out.display()
+                "D is {deposit_confirmations}, the lag is {deposit_lag}, and BMM settles from \
+                 eCash height {}",
+                ecash_start_height.max(
+                    state
+                        .as_ref()
+                        .map_or(0, |state| state.cursor.bmm_next_height)
+                )
             );
+            println!("{} accounts are in {}", accounts.len(), out.display());
             Ok(())
         }
         Command::Run {
@@ -802,7 +1064,6 @@ fn main() -> Result<(), CliError> {
             slot,
             program_id,
             oracle,
-            confirmations,
             bundle_interval_secs,
         } => {
             let program_id = parse_pubkey(&program_id)?;
@@ -815,7 +1076,6 @@ fn main() -> Result<(), CliError> {
                 solana_rpc_url,
                 sidechain_id: slot,
                 program_id,
-                confirmations: confirmations.unwrap_or_else(|| network.default_confirmations()),
                 bundle_interval: Duration::from_secs(bundle_interval_secs.max(1)),
             };
             runtime.block_on(peg::run(settings, keypair))?;
@@ -850,17 +1110,99 @@ fn main() -> Result<(), CliError> {
         }),
         Command::BidBmm {
             enforcer,
+            solana_rpc_url,
             payee,
             sats,
+            commitment,
+            withhold,
+            block,
+            program_id,
+            wait_secs,
         } => runtime.block_on(async {
-            let payee = parse_pubkey(&payee)?;
+            let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
             let mut enforcer = enforcer.open().await?;
-            let tip = enforcer.tip().await?;
-            let txid = enforcer
-                .create_bmm_request(sats, tip, &payee.to_bytes())
-                .await?;
-            println!("bid {sats} sats for eCash height {} as {txid}", tip.1 + 1);
-            println!("the payee is {payee}");
+            let mut tip = enforcer.tip().await?;
+            let pair = match payee {
+                Some(payee) => {
+                    let block = match block {
+                        Some(block) => {
+                            let block = parse_pubkey(&block)?.to_bytes();
+                            if let Some(found) = bmm::recorded_blocks(&rpc)
+                                .await?
+                                .iter()
+                                .find(|recorded| recorded.bank_hash == block)
+                            {
+                                println!("slot {}", found.slot);
+                            }
+                            block
+                        }
+                        None => {
+                            let program_id =
+                                parse_pubkey(&program_id.ok_or(CliError::NoProgramId)?)?;
+                            let found =
+                                wait_for_bid_block(&rpc, &mut enforcer, &program_id, wait_secs)
+                                    .await?;
+                            tip = found.0;
+                            println!("slot {}", found.1.slot);
+                            found.1.bank_hash
+                        }
+                    };
+                    Some(bmm::Pair {
+                        height: u64::from(tip.1) + 1,
+                        block,
+                        payee: parse_pubkey(&payee)?,
+                    })
+                }
+                None => None,
+            };
+            let height = u64::from(tip.1) + 1;
+            let h_star = match (&pair, &commitment) {
+                (Some(pair), _) => pair.commitment(),
+                (None, Some(commitment)) => fixed_hash::<32>(commitment, "commitment")?,
+                (None, None) => return Err(CliError::NoCommitment),
+            };
+            let txid = enforcer.create_bmm_request(sats, tip, &h_star).await?;
+            println!("bid {sats} sats for eCash height {height} as {txid}");
+            println!("commitment {}", sol_drivechain_daemon::hex::encode(&h_star));
+            if let Some(pair) = pair {
+                println!("block {}", Pubkey::new_from_array(pair.block));
+                println!("payee {}", pair.payee);
+                if !withhold {
+                    for outcome in bmm::publish_pairs(&rpc, &[pair]).await? {
+                        println!("pair {outcome}");
+                    }
+                }
+            }
+            Ok(())
+        }),
+        Command::PublishPair {
+            solana_rpc_url,
+            height,
+            block,
+            payee,
+        } => runtime.block_on(async {
+            let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
+            let pair = bmm::Pair {
+                height,
+                block: parse_pubkey(&block)?.to_bytes(),
+                payee: parse_pubkey(&payee)?,
+            };
+            for outcome in bmm::publish_pairs(&rpc, &[pair]).await? {
+                println!("pair {outcome}");
+            }
+            Ok(())
+        }),
+        Command::BmmBlock { solana_rpc_url } => runtime.block_on(async {
+            let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
+            let newest = *bmm::recorded_blocks(&rpc)
+                .await?
+                .first()
+                .ok_or(CliError::EmptyBlockRecord)?;
+            println!(
+                "{} {}",
+                newest.slot,
+                Pubkey::new_from_array(newest.bank_hash)
+            );
             Ok(())
         }),
         Command::SettleBmm {
@@ -869,6 +1211,7 @@ fn main() -> Result<(), CliError> {
             identity,
             height,
             block_hash,
+            solana_block,
             payee,
         } => {
             let program_id = parse_pubkey(&program_id)?;
@@ -883,8 +1226,10 @@ fn main() -> Result<(), CliError> {
                 Some(payee) => parse_pubkey(&payee)?,
                 None => signer.pubkey(),
             };
+            let solana_block = parse_pubkey(&solana_block)?.to_bytes();
             let rpc = blocking_rpc(&solana_rpc_url);
-            let instruction = bridge::settle_bmm_ix(&program_id, height, &internal, &payee);
+            let instruction =
+                bridge::settle_bmm_ix(&program_id, height, &internal, &solana_block, &payee);
             send_one(&rpc, &signer, instruction, "settle_bmm")?;
             println!("eCash height {height} settled, and the payee is {payee}");
             Ok(())
@@ -1030,15 +1375,53 @@ fn parse_pubkey(text: &str) -> Result<Pubkey, CliError> {
     Pubkey::from_str(text).map_err(|_| CliError::NotAPubkey(text.to_owned()))
 }
 
-/// Builds the `--primordial-accounts-file` body that `solana-genesis` reads.
-///
-/// The vault is a system account with no data, so a program signs a transfer
-/// out of it with the vault seeds.
-fn primordial_yaml(vault: &Pubkey, lamports: u64) -> String {
-    format!(
-        "{vault}:\n  balance: {lamports}\n  owner: {}\n  data: \"\"\n  executable: false\n",
-        bridge::SYSTEM_PROGRAM_ID
-    )
+fn read_state(path: &PathBuf) -> Result<migrate::State, CliError> {
+    let text = std::fs::read_to_string(path).map_err(|source| CliError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    serde_json::from_str(&text).map_err(|source| CliError::BadState {
+        path: path.clone(),
+        source,
+    })
+}
+
+/// Waits for a recorded block of the followed branch that passes rule 3 for
+/// the next eCash block. Gives the eCash tip of the check and the block.
+async fn wait_for_bid_block(
+    rpc: &solana_rpc_client::nonblocking::rpc_client::RpcClient,
+    enforcer: &mut Enforcer,
+    program_id: &Pubkey,
+    wait_secs: u64,
+) -> Result<((bitcoin::BlockHash, u32), bridge::RecordedBlock), CliError> {
+    let config_key = bridge::config_pda(program_id).0;
+    let mut height = 0;
+    for _ in 0..=wait_secs {
+        let tip = enforcer.tip().await?;
+        height = u64::from(tip.1) + 1;
+        let data = rpc
+            .get_account_with_commitment(
+                &config_key,
+                solana_commitment_config::CommitmentConfig::processed(),
+            )
+            .await
+            .map_err(|source| CliError::Rpc {
+                call: "getAccountInfo(config)",
+                source,
+            })?
+            .value
+            .map(|account| account.data)
+            .unwrap_or_default();
+        let lag = bridge::Config::decode(&data)?.deposit_lag;
+        if let Some(block) = bmm::bid_block(rpc, enforcer, tip, height, lag).await? {
+            return Ok((tip, block));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(CliError::NoBidBlock {
+        height,
+        secs: wait_secs,
+    })
 }
 
 #[cfg(test)]
@@ -1105,16 +1488,6 @@ mod tests {
     }
 
     #[test]
-    fn the_primordial_file_names_the_vault_and_the_system_program() {
-        let vault = Pubkey::new_from_array([2u8; 32]);
-        let yaml = primordial_yaml(&vault, 21_000_000_000_000_000);
-        assert!(yaml.starts_with(&format!("{vault}:")));
-        assert!(yaml.contains("owner: 11111111111111111111111111111111"));
-        assert!(yaml.contains("balance: 21000000000000000"));
-        assert!(yaml.contains("executable: false"));
-    }
-
-    #[test]
     fn twenty_one_million_sol_fits_a_u64() {
         assert_eq!(
             21_000_000u64.checked_mul(LAMPORTS_PER_SOL),
@@ -1167,7 +1540,6 @@ mod tests {
         let Command::Run {
             network,
             slot,
-            confirmations,
             bundle_interval_secs,
             ..
         } = cli.command
@@ -1176,7 +1548,6 @@ mod tests {
         };
         assert_eq!(network, PegNetwork::Regtest);
         assert_eq!(slot, 8);
-        assert_eq!(confirmations, None);
         assert_eq!(bundle_interval_secs, 30);
     }
 }
