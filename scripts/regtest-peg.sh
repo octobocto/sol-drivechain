@@ -39,6 +39,8 @@ export ENFORCER_RPC_PORT="${ENFORCER_RPC_PORT:-19552}"
 # The Solana side.
 SOLANA_RPC_PORT="${SOLANA_RPC_PORT:-8999}"
 SOLANA_GOSSIP_PORT="${SOLANA_GOSSIP_PORT:-8101}"
+# The JSON-RPC that drivechaind calls to bid.
+BMM_RPC_PORT="${BMM_RPC_PORT:-19560}"
 
 ENFORCER_URL="http://127.0.0.1:$GRPC_PORT"
 SOLANA_URL="http://127.0.0.1:$SOLANA_RPC_PORT"
@@ -373,13 +375,16 @@ done
 SECOND_SLOT_BEFORE="$("$SOLANA" -u "$SECOND_URL" slot)"
 echo "the second validator replays at slot $SECOND_SLOT_BEFORE"
 
-nohup "$D" bmm --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
-  --slot "$SLOT" --program-id "$PROGRAM_ID" \
-  --identity "$ROOT/keys/validator-identity.json" \
-  --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --interval-secs 1 \
-  > "$ROOT/bmm.log" 2>&1 &
-BMM_PID=$!
-PIDS+=("$BMM_PID")
+start_bid_loop() {
+  nohup "$D" bmm --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
+    --slot "$SLOT" --program-id "$PROGRAM_ID" \
+    --identity "$ROOT/keys/validator-identity.json" \
+    --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --interval-secs 1 \
+    >> "$ROOT/bmm.log" 2>&1 &
+  BMM_PID=$!
+  PIDS+=("$BMM_PID")
+}
+start_bid_loop
 
 # Each block gives the loop a new tip to bid on, and the loop publishes the
 # pair of each bid. A win settles N + 1 blocks later, so the whole round takes
@@ -408,6 +413,103 @@ SECOND_SLOT_AFTER="$("$SOLANA" -u "$SECOND_URL" slot)" || fail "the second valid
 [ "$SECOND_SLOT_AFTER" -gt "$SECOND_SLOT_BEFORE" ] || \
   fail "the second validator stopped at slot $SECOND_SLOT_AFTER"
 echo "PASS: the second validator replayed the settles, up to slot $SECOND_SLOT_AFTER"
+
+step "BMM through the JSON-RPC: one round as drivechaind drives it"
+# drivechaind pays the bids from a BitWindow wallet. With --no-bid the daemon
+# gives the template, answers the checks, and settles.
+kill "$BMM_PID"
+wait "$BMM_PID" 2>/dev/null || true
+# A new block drops the last bid of the old loop, so only the M8 below can win.
+"$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
+BMM_RPC_URL="http://127.0.0.1:$BMM_RPC_PORT"
+NO_COLOR=1 nohup "$D" bmm --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
+  --slot "$SLOT" --program-id "$PROGRAM_ID" \
+  --identity "$ROOT/keys/validator-identity.json" \
+  --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --interval-secs 1 \
+  --rpc-listen "127.0.0.1:$BMM_RPC_PORT" --no-bid \
+  > "$ROOT/bmm-rpc.log" 2>&1 &
+BMM_PID=$!
+PIDS+=("$BMM_PID")
+bmm_rpc() {
+  curl -s --max-time 10 -X POST -H 'content-type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" "$BMM_RPC_URL"
+}
+# Prints one field of a JSON reply. A text prints bare, any other value as JSON.
+field() {
+  python3 -c 'import json,sys
+v=json.load(sys.stdin)
+for k in sys.argv[1:]:
+    v=v[k]
+print(v if isinstance(v,str) else json.dumps(v))' "$@"
+}
+TEMPLATE=""
+for _ in $(seq 1 60); do
+  kill -0 "$BMM_PID" 2>/dev/null || { tail -30 "$ROOT/bmm-rpc.log" >&2; fail "the BMM rpc stopped"; }
+  TEMPLATE="$(bmm_rpc get_block_template '[]' || true)"
+  printf '%s' "$TEMPLATE" | grep -q '"result"' && break
+  sleep 2
+done
+printf '%s' "$TEMPLATE" | grep -q '"result"' || fail "get_block_template gave $TEMPLATE"
+echo "get_block_template: $TEMPLATE"
+CRITICAL="$(printf '%s' "$TEMPLATE" | field result critical_hash)"
+BLOCK="$(printf '%s' "$TEMPLATE" | field result block)"
+PREV="$(printf '%s' "$BLOCK" | field prev_main_hash)"
+HEIGHT="$(printf '%s' "$BLOCK" | field height)"
+FEES="$(printf '%s' "$TEMPLATE" | field result fees_sats)"
+TIP_LINE="$("$D" ecash-tip $E)"
+[ "$PREV" = "$(printf '%s' "$TIP_LINE" | awk '{print $2}')" ] || fail "prev_main_hash $PREV is not the eCash tip $TIP_LINE"
+[ "$HEIGHT" = $(( $(printf '%s' "$TIP_LINE" | awk '{print $1}') + 1 )) ] || fail "the template height $HEIGHT is not the tip height + 1"
+[ "$(bmm_rpc template_valid "[$BLOCK]" | field result)" = true ] || fail "the fresh template is not valid"
+
+# drivechaind sends the same M8: h* = critical_hash, on top of prev_main_hash.
+BID_SATS=$(( FEES > 1000 ? FEES : 1000 ))
+# The enforcer wallet can still hold a coin that the last block spent, so a
+# refused bid tries again on the same tip.
+BID_SENT=no
+for _ in $(seq 1 10); do
+  if "$D" bid-bmm $E --solana-rpc-url "$SOLANA_URL" --commitment "$CRITICAL" \
+      --sats "$BID_SATS" > "$ROOT/bid-rpc.log" 2>&1; then
+    BID_SENT=yes
+    break
+  fi
+  sleep 3
+done
+cat "$ROOT/bid-rpc.log"
+[ "$BID_SENT" = yes ] || fail "the enforcer wallet did not send the M8"
+grep -q "^commitment $CRITICAL\$" "$ROOT/bid-rpc.log" || fail "the M8 does not carry the critical hash"
+grep -q "for eCash height $HEIGHT " "$ROOT/bid-rpc.log" || fail "the M8 is not for eCash height $HEIGHT"
+"$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
+WON="$(btc getblockhash "$HEIGHT")"
+CONNECTED="$(bmm_rpc connect_block "[$BLOCK, \"$WON\"]")"
+echo "connect_block: $CONNECTED"
+[ "$(printf '%s' "$CONNECTED" | field result)" = true ] || fail "connect_block refused the block that won"
+[ "$(bmm_rpc connect_block "[$BLOCK, \"$PREV\"]" | field result)" = false ] || fail "connect_block took another block"
+INCLUSIONS="$(bmm_rpc get_bmm_inclusions "[\"$CRITICAL\"]")"
+echo "get_bmm_inclusions: $INCLUSIONS"
+[ "$(printf '%s' "$INCLUSIONS" | field result)" = "[\"$WON\"]" ] || fail "get_bmm_inclusions does not name $WON"
+
+PAID_BEFORE_RPC="$(bridge_value "bmm paid total")"
+SETTLED=no
+for _ in $(seq 1 $((BMM_CONFIRMATIONS + 10))); do
+  sleep 3
+  earn_fees
+  "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
+  if [ "$(bridge_value "bmm next height")" -gt "$HEIGHT" ]; then
+    SETTLED=yes
+    break
+  fi
+done
+[ "$SETTLED" = yes ] || { tail -30 "$ROOT/bmm-rpc.log" >&2; fail "the loop did not settle eCash height $HEIGHT"; }
+grep "the loop settled its own win" "$ROOT/bmm-rpc.log" | grep -q "height=$HEIGHT" \
+  || { tail -30 "$ROOT/bmm-rpc.log" >&2; fail "the settle of eCash height $HEIGHT did not pay the payee of the template"; }
+PAID_AFTER_RPC="$(bridge_value "bmm paid total")"
+[ "$PAID_AFTER_RPC" -gt "$PAID_BEFORE_RPC" ] || fail "the settle paid nothing"
+COUNT="$(bmm_rpc getblockcount '[]' | field result)"
+[ "$COUNT" = $(( $(bridge_value "bmm next height") - 1 )) ] || fail "getblockcount gave $COUNT"
+echo "PASS: one round through the JSON-RPC: the M8 for eCash height $HEIGHT won in $WON, and the settle paid $((PAID_AFTER_RPC - PAID_BEFORE_RPC)) lamports"
+kill "$BMM_PID"
+wait "$BMM_PID" 2>/dev/null || true
+start_bid_loop
 
 step "BMM: a settle for a block that is too new never lands"
 TIP_HEIGHT="$(btc getblockcount)"
@@ -646,4 +748,4 @@ books_close
 echo "PASS: eCash paid the migrated withdrawal, and the books close"
 
 echo
-echo "PASS: the peg, BMM, the reorg cases, and the migration all work, and the books close."
+echo "PASS: the peg, BMM, BMM through the JSON-RPC, the reorg cases, and the migration all work, and the books close."
