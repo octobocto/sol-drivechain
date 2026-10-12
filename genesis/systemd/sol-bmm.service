@@ -1,5 +1,5 @@
 [Unit]
-Description=sol-drivechain BMM bidder, settler, and claimer
+Description=sol-drivechain BMM template server and settler
 After=network-online.target sol-validator.service
 Wants=network-online.target
 
@@ -16,7 +16,9 @@ ExecStart=/usr/bin/bash -c '/root/src/sol-drivechain/daemon/target/release/sol-d
   --solana-rpc-url "$SOLANA_RPC_URL" \
   --slot "$PEG_SLOT" \
   --program-id "$(cat /root/src/sol-drivechain/keys/bridge-program.pubkey)" \
-  --identity /root/src/sol-drivechain/keys/validator-identity.json'
+  --identity /root/src/sol-drivechain/keys/validator-identity.json \
+  --rpc-listen 127.0.0.1:6008 \
+  --no-bid'
 Restart=always
 RestartSec=15
 
