@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.22"
 bip39 = "3.0.0"
 bitcoin = "0.32"
@@ -34,7 +35,7 @@ solana-rpc-client = "4.3.0"
 solana-rpc-client-api = "4.3"
 solana-sdk = "4"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
 tracing = "0.1.44"

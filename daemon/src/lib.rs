@@ -1,5 +1,6 @@
 pub mod address;
 pub mod bmm;
+pub mod bmm_rpc;
 pub mod books;
 pub mod bridge;
 pub mod credit;

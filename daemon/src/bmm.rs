@@ -9,6 +9,9 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
+    net::SocketAddr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -23,6 +26,7 @@ use solana_sdk::{
     signature::{Keypair, Signer as _},
     transaction::{Transaction, TransactionError},
 };
+use tokio::sync::Mutex;
 
 use crate::{
     bridge::{self, Config, RecordedBlock},
@@ -42,6 +46,11 @@ pub struct Settings {
     /// The loop makes no bid below this amount.
     pub min_bid_sats: u64,
     pub interval: Duration,
+    /// The address of the JSON-RPC for BitWindow and drivechaind. `None` turns
+    /// it off.
+    pub rpc_listen: Option<SocketAddr>,
+    /// The loop sends no bid, because drivechaind pays the bids.
+    pub no_bid: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +71,14 @@ pub enum BmmError {
     HeightTooLarge(u64),
     #[error("the validator gave a pair with a bad key: {0}")]
     BadPair(String),
+    #[error("the BMM rpc cannot listen on {addr}")]
+    Listen {
+        addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the BMM rpc stopped")]
+    Serve(#[source] std::io::Error),
 }
 
 /// A published pair: the eCash height of the bid, the Solana bank hash, and
@@ -140,93 +157,294 @@ pub fn settle_is_ready(height: u64, tip_height: u64, confirmations: u64) -> bool
         .is_some_and(|needed| tip_height >= needed)
 }
 
+/// The rules of a bid: the payee and the part of the fees that it offers.
+#[derive(Clone, Copy, Debug)]
+pub struct BidRules {
+    pub payee: Pubkey,
+    pub confirmations: u64,
+    pub bid_percent: u64,
+    pub min_bid_sats: u64,
+}
+
+/// An inclusion answer can name a pair this many eCash blocks after its
+/// height.
+const REMEMBERED_HEIGHTS: u64 = 1_000;
+
+/// The state that the loop and the BMM rpc share: the fee history, the bid of
+/// the current tip, and the own pairs by commitment.
+#[derive(Debug, Default)]
+pub struct Memory {
+    history: FeeHistory,
+    fees: Option<(BlockHash, u64)>,
+    pairs: HashMap<[u8; 32], Pair>,
+}
+
+impl Memory {
+    pub fn observe(&mut self, tip_height: u64, gross: u64) {
+        self.history.observe(tip_height, gross);
+    }
+
+    pub fn forget_fees_below(&mut self, height: u64) {
+        self.history.forget_below(height);
+    }
+
+    pub fn cached_fees(&self, tip: &BlockHash) -> Option<u64> {
+        self.fees
+            .and_then(|(cached, fees)| (&cached == tip).then_some(fees))
+    }
+
+    /// The bid for the block after `tip`, in sats. It stays the same for the
+    /// whole tip. Zero means no bid.
+    pub fn fees_at(&mut self, tip: (BlockHash, u32), gross: u64, rules: &BidRules) -> u64 {
+        if let Some(fees) = self.cached_fees(&tip.0) {
+            return fees;
+        }
+        let tip_height = u64::from(tip.1);
+        self.history.observe(tip_height, gross);
+        let fees = self
+            .history
+            .income_per_block(tip_height, gross, rules.confirmations + 1)
+            .and_then(|income| bid_sats(income, rules.bid_percent, rules.min_bid_sats))
+            .unwrap_or(0);
+        self.fees = Some((tip.0, fees));
+        fees
+    }
+
+    pub fn remember(&mut self, pair: Pair) {
+        self.pairs.insert(pair.commitment(), pair);
+    }
+
+    pub fn pair(&self, commitment: &[u8; 32]) -> Option<Pair> {
+        self.pairs.get(commitment).copied()
+    }
+
+    /// The own pairs that no settle passed yet, for a new publish at eCash tip
+    /// `tip_height`.
+    pub fn pairs_to_publish(
+        &mut self,
+        next_height: u64,
+        tip_height: u64,
+        confirmations: u64,
+    ) -> Vec<Pair> {
+        self.pairs
+            .retain(|_, pair| pair.height.saturating_add(REMEMBERED_HEIGHTS) >= tip_height);
+        let mut pairs: Vec<Pair> = self
+            .pairs
+            .values()
+            .filter(|pair| {
+                pair.height >= next_height && pair.height + confirmations + 2 >= tip_height
+            })
+            .copied()
+            .collect();
+        pairs.sort_by_key(|pair| pair.height);
+        pairs
+    }
+}
+
+/// An active eCash block and its commitment for the sidechain.
+pub type ActiveBlock = (BlockHash, Option<[u8; 32]>);
+
+/// The reads of eCash and Solana that a template needs, and the pair publish.
+pub trait Chain: Send + Sync {
+    fn tip(&self) -> impl Future<Output = Result<(BlockHash, u32), BmmError>> + Send;
+    fn slot_is_active(&self) -> impl Future<Output = Result<bool, BmmError>> + Send;
+    fn config(&self) -> impl Future<Output = Result<Config, BmmError>> + Send;
+    fn treasury(&self) -> impl Future<Output = Result<u64, BmmError>> + Send;
+    fn recorded_blocks(&self) -> impl Future<Output = Result<Vec<RecordedBlock>, BmmError>> + Send;
+    /// The hash of the active eCash block at `height` below `tip`, in the
+    /// internal byte order.
+    fn block_hash_at(
+        &self,
+        tip: (BlockHash, u32),
+        height: u64,
+    ) -> impl Future<Output = Result<Option<[u8; 32]>, BmmError>> + Send;
+    /// The active eCash block at `height` below `tip`, and its commitment for
+    /// the sidechain.
+    fn active_block(
+        &self,
+        tip: (BlockHash, u32),
+        height: u64,
+    ) -> impl Future<Output = Result<Option<ActiveBlock>, BmmError>> + Send;
+    fn publish(&self, pairs: &[Pair]) -> impl Future<Output = Result<(), BmmError>> + Send;
+}
+
+/// The chain behind the local enforcer and the local validator.
+pub struct Live {
+    pub rpc: Arc<RpcClient>,
+    pub enforcer: Enforcer,
+    pub program_id: Pubkey,
+}
+
+fn height_u32(height: u64) -> Result<u32, BmmError> {
+    u32::try_from(height).map_err(|_| BmmError::HeightTooLarge(height))
+}
+
+impl Chain for Live {
+    async fn tip(&self) -> Result<(BlockHash, u32), BmmError> {
+        Ok(self.enforcer.clone().tip().await?)
+    }
+
+    async fn slot_is_active(&self) -> Result<bool, BmmError> {
+        let mut enforcer = self.enforcer.clone();
+        let sidechain_id = enforcer.sidechain_id();
+        Ok(enforcer
+            .sidechains()
+            .await?
+            .iter()
+            .any(|slot| slot.sidechain_number == sidechain_id && slot.activation_height.is_some()))
+    }
+
+    async fn config(&self) -> Result<Config, BmmError> {
+        read_config(&self.rpc, &self.program_id).await
+    }
+
+    async fn treasury(&self) -> Result<u64, BmmError> {
+        treasury_balance(&self.rpc, &self.program_id).await
+    }
+
+    async fn recorded_blocks(&self) -> Result<Vec<RecordedBlock>, BmmError> {
+        recorded_blocks(&self.rpc).await
+    }
+
+    async fn block_hash_at(
+        &self,
+        tip: (BlockHash, u32),
+        height: u64,
+    ) -> Result<Option<[u8; 32]>, BmmError> {
+        match self
+            .enforcer
+            .clone()
+            .block_at(tip, height_u32(height)?)
+            .await
+        {
+            Ok((hash, _)) => Ok(Some(hash.to_byte_array())),
+            Err(EnforcerError::NoBlockAtHeight(_)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn active_block(
+        &self,
+        tip: (BlockHash, u32),
+        height: u64,
+    ) -> Result<Option<ActiveBlock>, BmmError> {
+        match self
+            .enforcer
+            .clone()
+            .active_block(tip, height_u32(height)?)
+            .await
+        {
+            Ok(found) => Ok(Some(found)),
+            Err(EnforcerError::NoBlockAtHeight(_)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn publish(&self, pairs: &[Pair]) -> Result<(), BmmError> {
+        publish_pairs(&self.rpc, pairs).await.map(|_| ())
+    }
+}
+
 pub async fn run(settings: Settings, identity: Keypair) -> Result<(), BmmError> {
     if !(1..=100).contains(&settings.bid_percent) {
         return Err(BmmError::BadBidPercent(settings.bid_percent));
     }
-    let rpc = RpcClient::new_with_commitment(
-        settings.solana_rpc_url.clone(),
-        CommitmentConfig::confirmed(),
-    );
-    let mut enforcer = Enforcer::connect(
-        settings.enforcer_url.clone(),
-        u32::from(settings.sidechain_id),
-    )
-    .await?;
-    tracing::info!(payee = %identity.pubkey(), "the BMM loop starts");
+    let live = Arc::new(Live {
+        rpc: Arc::new(RpcClient::new_with_commitment(
+            settings.solana_rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        )),
+        enforcer: Enforcer::connect(
+            settings.enforcer_url.clone(),
+            u32::from(settings.sidechain_id),
+        )
+        .await?,
+        program_id: settings.program_id,
+    });
+    let memory = Arc::new(Mutex::new(Memory::default()));
+    let rules = BidRules {
+        payee: identity.pubkey(),
+        confirmations: settings.confirmations,
+        bid_percent: settings.bid_percent,
+        min_bid_sats: settings.min_bid_sats,
+    };
+    tracing::info!(payee = %rules.payee, no_bid = settings.no_bid, "the BMM loop starts");
+    let rounds = rounds(&settings, &identity, &live, &memory, &rules);
+    let Some(addr) = settings.rpc_listen else {
+        return rounds.await;
+    };
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|source| BmmError::Listen { addr, source })?;
+    tracing::info!(%addr, "the BMM rpc listens");
+    let server = crate::bmm_rpc::Server {
+        chain: live.clone(),
+        memory: memory.clone(),
+        rules,
+        sidechain_id: settings.sidechain_id,
+    };
+    tokio::select! {
+        result = rounds => result,
+        result = crate::bmm_rpc::serve(listener, server) => result,
+    }
+}
 
-    let mut history = FeeHistory::default();
+async fn rounds(
+    settings: &Settings,
+    identity: &Keypair,
+    live: &Live,
+    memory: &Mutex<Memory>,
+    rules: &BidRules,
+) -> Result<(), BmmError> {
+    let rpc = &live.rpc;
+    let mut enforcer = live.enforcer.clone();
     let mut last_bid_tip: Option<BlockHash> = None;
-    let mut own_pairs: Vec<Pair> = Vec::new();
     loop {
         let tip = enforcer.tip().await?;
         let tip_height = u64::from(tip.1);
-        let config = read_config(&rpc, &settings.program_id).await?;
-        let gross = treasury_balance(&rpc, &settings.program_id)
+        let config = read_config(rpc, &settings.program_id).await?;
+        let gross = treasury_balance(rpc, &settings.program_id)
             .await?
             .saturating_add(config.bmm_paid_total);
-        history.observe(tip_height, gross);
+        memory.lock().await.observe(tip_height, gross);
 
-        if last_bid_tip != Some(tip.0) {
-            let mut retry = false;
-            if slot_is_active(&mut enforcer, settings.sidechain_id).await? {
-                let result = bid(
-                    &mut enforcer,
-                    &settings,
-                    &identity,
-                    tip,
-                    &config,
-                    &history,
-                    gross,
-                    &rpc,
-                )
-                .await;
-                match result {
-                    Ok(Bid::Sent(pair)) => own_pairs.push(pair),
-                    Ok(Bid::Declined) => (),
-                    // The credits of the branch can catch up before the next
-                    // eCash block, so the next round tries the same tip again.
-                    Ok(Bid::NoBlock) => retry = true,
-                    Err(error) => {
-                        if bid_error_is_fatal(&error) {
-                            return Err(error);
-                        }
-                        // A bid is an offer, not a duty. The loop must keep the
-                        // settles going when the eCash wallet or the enforcer
-                        // refuses one bid.
-                        tracing::warn!(%error, "the bid failed, and the loop goes on");
+        if !settings.no_bid && last_bid_tip != Some(tip.0) {
+            let retry = match bid(live, &mut enforcer, memory, rules, tip).await {
+                // The credits of the branch can catch up before the next
+                // eCash block, so the next round tries the same tip again.
+                Ok(Bid::NoBlock) => true,
+                Ok(_) => false,
+                Err(error) => {
+                    if bid_error_is_fatal(&error) {
+                        return Err(error);
                     }
+                    // A bid is an offer, not a duty. The loop must keep the
+                    // settles going when the eCash wallet or the enforcer
+                    // refuses one bid.
+                    tracing::warn!(%error, "the bid failed, and the loop goes on");
+                    false
                 }
-            } else {
-                tracing::info!(
-                    slot = settings.sidechain_id,
-                    "the sidechain slot is not active, so the loop makes no bid"
-                );
-            }
+            };
             if !retry {
                 last_bid_tip = Some(tip.0);
             }
         }
-        own_pairs.retain(|pair| {
-            pair.height >= config.bmm_next_height
-                && pair.height + settings.confirmations + 2 >= tip_height
-        });
+        let pairs = memory.lock().await.pairs_to_publish(
+            config.bmm_next_height,
+            tip_height,
+            settings.confirmations,
+        );
         // A validator that was away when the loop published gets the pair now.
-        if let Err(error) = publish_pairs(&rpc, &own_pairs).await {
+        if let Err(error) = publish_pairs(rpc, &pairs).await {
             tracing::warn!(%error, "the loop cannot publish its pairs");
         }
-        settle(&rpc, &mut enforcer, &settings, &identity, tip, &config).await?;
-        history.forget_below(tip_height.saturating_sub(settings.confirmations + 1));
+        settle(rpc, &mut enforcer, settings, identity, tip, &config).await?;
+        memory
+            .lock()
+            .await
+            .forget_fees_below(tip_height.saturating_sub(settings.confirmations + 1));
         tokio::time::sleep(settings.interval).await;
     }
-}
-
-/// True when the mainchain activated the sidechain slot. A BMM request for an
-/// inactive slot has no value, so the loop does not send one.
-async fn slot_is_active(enforcer: &mut Enforcer, sidechain_id: u8) -> Result<bool, BmmError> {
-    Ok(enforcer.sidechains().await?.iter().any(|slot| {
-        slot.sidechain_number == u32::from(sidechain_id) && slot.activation_height.is_some()
-    }))
 }
 
 /// What one round of the loop did about the bid for the next eCash block.
@@ -259,99 +477,153 @@ pub fn passes_rule_3(
         .all(|(at, hash)| hash == [0u8; 32] || active_block(at) == Some(hash))
 }
 
+/// `passes_rule_3` with the active eCash blocks of `chain` below `tip`.
+/// `active` keeps the blocks that an earlier check read.
+pub async fn passes_rule_3_on<C: Chain>(
+    chain: &C,
+    tip: (BlockHash, u32),
+    block: &RecordedBlock,
+    height: u64,
+    lag: u64,
+    active: &mut HashMap<u64, Option<[u8; 32]>>,
+) -> Result<bool, BmmError> {
+    if block.credited_height.saturating_add(lag) < height {
+        return Ok(false);
+    }
+    let next = block.credited_height.saturating_add(1);
+    for (at, hash) in [
+        (block.credited_height, block.credited_block),
+        (next, block.part_block),
+    ] {
+        if hash != [0u8; 32] && !active.contains_key(&at) {
+            let found = chain.block_hash_at(tip, at).await?;
+            active.insert(at, found);
+        }
+    }
+    Ok(passes_rule_3(block, height, lag, |at| {
+        active.get(&at).copied().flatten()
+    }))
+}
+
 /// The newest block in the block record of the followed branch that passes
 /// rule 3 for a checkpoint at eCash height `height`, below eCash tip `tip`.
-pub async fn bid_block(
-    rpc: &RpcClient,
-    enforcer: &mut Enforcer,
+pub async fn bid_block<C: Chain>(
+    chain: &C,
     tip: (BlockHash, u32),
     height: u64,
     lag: u64,
 ) -> Result<Option<RecordedBlock>, BmmError> {
-    let mut active: HashMap<u64, Option<[u8; 32]>> = HashMap::new();
-    for block in recorded_blocks(rpc).await? {
-        if block.credited_height.saturating_add(lag) < height {
-            continue;
-        }
-        let next = block.credited_height.saturating_add(1);
-        for (at, hash) in [
-            (block.credited_height, block.credited_block),
-            (next, block.part_block),
-        ] {
-            if hash == [0u8; 32] || active.contains_key(&at) {
-                continue;
-            }
-            let height_u32 = u32::try_from(at).map_err(|_| BmmError::HeightTooLarge(at))?;
-            let found = match enforcer.block_at(tip, height_u32).await {
-                Ok((hash, _)) => Some(hash.to_byte_array()),
-                Err(EnforcerError::NoBlockAtHeight(_)) => None,
-                Err(error) => return Err(error.into()),
-            };
-            active.insert(at, found);
-        }
-        if passes_rule_3(&block, height, lag, |at| active.get(&at).copied().flatten()) {
+    let mut active = HashMap::new();
+    for block in chain.recorded_blocks().await? {
+        if passes_rule_3_on(chain, tip, &block, height, lag, &mut active).await? {
             return Ok(Some(block));
         }
     }
     Ok(None)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn bid(
-    enforcer: &mut Enforcer,
-    settings: &Settings,
-    identity: &Keypair,
+/// The bid for the eCash block after a tip: the pair of the newest block that
+/// passes rule 3, and the sats that the fees allow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Template {
+    pub tip: (BlockHash, u32),
+    pub pair: Pair,
+    /// The Solana slot of the block.
+    pub slot: u64,
+    pub fees_sats: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NoTemplate {
+    #[error("the sidechain slot is not active on eCash")]
+    SlotInactive,
+    #[error("Solana settled eCash height {0} already")]
+    Settled(u64),
+    #[error("no recorded block of the followed branch passes rule 3 for eCash height {0} yet")]
+    NoBlock(u64),
+    #[error(transparent)]
+    Chain(#[from] BmmError),
+}
+
+/// The template for the eCash block after `tip`. It sends nothing.
+pub async fn template<C: Chain>(
+    chain: &C,
+    memory: &Mutex<Memory>,
+    rules: &BidRules,
     tip: (BlockHash, u32),
-    config: &Config,
-    history: &FeeHistory,
-    gross: u64,
-    rpc: &RpcClient,
-) -> Result<Bid, BmmError> {
+) -> Result<Template, NoTemplate> {
+    if !chain.slot_is_active().await? {
+        return Err(NoTemplate::SlotInactive);
+    }
+    let config = chain.config().await?;
     let height = u64::from(tip.1) + 1;
     if height < config.bmm_next_height {
-        // Solana settled this height already, on a branch that eCash left.
-        tracing::info!(
+        return Err(NoTemplate::Settled(height));
+    }
+    let cached = memory.lock().await.cached_fees(&tip.0);
+    let fees_sats = match cached {
+        Some(fees) => fees,
+        None => {
+            let gross = chain
+                .treasury()
+                .await?
+                .saturating_add(config.bmm_paid_total);
+            memory.lock().await.fees_at(tip, gross, rules)
+        }
+    };
+    let block = bid_block(chain, tip, height, config.deposit_lag)
+        .await?
+        .ok_or(NoTemplate::NoBlock(height))?;
+    Ok(Template {
+        tip,
+        pair: Pair {
             height,
-            "Solana settled the height, so the loop does not bid"
-        );
+            block: block.bank_hash,
+            payee: rules.payee,
+        },
+        slot: block.slot,
+        fees_sats,
+    })
+}
+
+async fn bid(
+    live: &Live,
+    enforcer: &mut Enforcer,
+    memory: &Mutex<Memory>,
+    rules: &BidRules,
+    tip: (BlockHash, u32),
+) -> Result<Bid, BmmError> {
+    let template = match template(live, memory, rules, tip).await {
+        Ok(template) => template,
+        Err(NoTemplate::Chain(error)) => return Err(error),
+        Err(refusal @ NoTemplate::NoBlock(_)) => {
+            tracing::info!(%refusal, "the loop waits");
+            return Ok(Bid::NoBlock);
+        }
+        Err(refusal) => {
+            tracing::info!(%refusal, "the loop makes no bid");
+            return Ok(Bid::Declined);
+        }
+    };
+    let Template {
+        pair,
+        slot,
+        fees_sats: bid,
+        ..
+    } = template;
+    let height = pair.height;
+    if bid == 0 {
+        tracing::debug!(height, "the fees of one block give no bid");
         return Ok(Bid::Declined);
     }
-    let span = settings.confirmations + 1;
-    let Some(income) = history.income_per_block(u64::from(tip.1), gross, span) else {
-        tracing::debug!(
-            height,
-            "the loop has not watched the fees long enough to bid"
-        );
-        return Ok(Bid::Declined);
-    };
-    let Some(bid) = bid_sats(income, settings.bid_percent, settings.min_bid_sats) else {
-        tracing::debug!(
-            height,
-            income,
-            "the fees of one block are too small for a bid"
-        );
-        return Ok(Bid::Declined);
-    };
-    let Some(block) = bid_block(rpc, enforcer, tip, height, config.deposit_lag).await? else {
-        tracing::info!(
-            height,
-            "no recorded block of the followed branch passes rule 3 yet, so the loop waits"
-        );
-        return Ok(Bid::NoBlock);
-    };
-    let slot = block.slot;
-    let pair = Pair {
-        height,
-        block: block.bank_hash,
-        payee: identity.pubkey(),
-    };
     match enforcer
         .create_bmm_request(bid, tip, &pair.commitment())
         .await
     {
         Ok(txid) => {
             tracing::info!(height, bid, slot, %txid, "the loop bid for an eCash block");
-            if let Err(error) = publish_pairs(rpc, &[pair]).await {
+            memory.lock().await.remember(pair);
+            if let Err(error) = publish_pairs(&live.rpc, &[pair]).await {
                 tracing::warn!(%error, height, "the loop cannot publish its pair yet");
             }
             Ok(Bid::Sent(pair))
@@ -731,6 +1003,51 @@ mod tests {
         let mut history = FeeHistory::default();
         history.observe(90, 0);
         assert_eq!(history.income_per_block(100, 5_000, 7), Some(500));
+    }
+
+    fn rules() -> BidRules {
+        BidRules {
+            payee: Pubkey::new_from_array([7u8; 32]),
+            confirmations: 6,
+            bid_percent: 50,
+            min_bid_sats: 1,
+        }
+    }
+
+    #[test]
+    fn the_fees_of_a_tip_come_from_its_first_total() {
+        let mut memory = Memory::default();
+        memory.observe(93, 0);
+        let tip = (BlockHash::from_byte_array([1u8; 32]), 100);
+        assert_eq!(memory.fees_at(tip, 7_000_000, &rules()), 50_000);
+        assert_eq!(memory.fees_at(tip, 70_000_000, &rules()), 50_000);
+        assert_eq!(memory.cached_fees(&tip.0), Some(50_000));
+        let next = (BlockHash::from_byte_array([2u8; 32]), 101);
+        assert_eq!(memory.cached_fees(&next.0), None);
+        assert_eq!(memory.fees_at(next, 8_000_000, &rules()), 50_000);
+    }
+
+    #[test]
+    fn no_history_gives_zero_fees() {
+        let mut memory = Memory::default();
+        let tip = (BlockHash::from_byte_array([1u8; 32]), 100);
+        assert_eq!(memory.fees_at(tip, 7_000_000, &rules()), 0);
+    }
+
+    #[test]
+    fn a_settled_pair_is_not_published_but_stays_known() {
+        let mut memory = Memory::default();
+        let pair = Pair {
+            height: 100,
+            block: [3u8; 32],
+            payee: Pubkey::new_from_array([7u8; 32]),
+        };
+        memory.remember(pair);
+        assert_eq!(memory.pairs_to_publish(100, 105, 6), [pair]);
+        assert!(memory.pairs_to_publish(101, 105, 6).is_empty());
+        assert_eq!(memory.pair(&pair.commitment()), Some(pair));
+        assert!(memory.pairs_to_publish(101, 1_101, 6).is_empty());
+        assert_eq!(memory.pair(&pair.commitment()), None);
     }
 
     #[test]

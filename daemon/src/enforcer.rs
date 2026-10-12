@@ -268,6 +268,10 @@ impl Enforcer {
         })
     }
 
+    pub fn sidechain_id(&self) -> u32 {
+        self.sidechain_id
+    }
+
     /// Reads the network and the BIP300 thresholds.
     pub async fn chain_info(&mut self) -> Result<ChainInfo> {
         let response = self
