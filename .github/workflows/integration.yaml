@@ -50,6 +50,9 @@ jobs:
       - name: Build the patched solana-genesis and agave-validator
         run: bash patches/build-agave.sh
 
+      - name: Test the BMM crate of the patched Agave
+        run: cd ~/src/agave && cargo test --release -p sol-drivechain-bmm --features poller
+
       - name: Cache the enforcer build
         uses: actions/cache@v4
         with:
@@ -88,7 +91,91 @@ jobs:
         if: failure()
         run: |
           for log in "$HOME/peg-regtest/validator.log" "$HOME/peg-regtest/peg.log" \
+                     "$HOME/peg-regtest/validator-halted.log" \
                      "$HOME/peg-regtest/bitcoin-stack/enforcer/enforcer.log"; do
             echo "== $log =="
-            tail -60 "$log" 2>/dev/null || echo "(absent)"
+            grep -av datapoint "$log" 2>/dev/null | tail -60 || echo "(absent)"
+          done
+          echo "== errors of the halted node =="
+          grep -aE " (ERROR|WARN) " "$HOME/peg-regtest/validator-halted.log" 2>/dev/null \
+            | grep -av datapoint | tail -60 || echo "(absent)"
+
+  bmm-fork:
+    name: BMM fork choice on regtest
+    runs-on: ubuntu-latest
+    # The same cache keys as the peg job, so a cached build serves both jobs.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install the Agave CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler libudev-dev unzip jq \
+            clang libclang-dev cmake
+
+      - name: Cache the patched Agave build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/src/agave/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: agave-${{ env.AGAVE_TAG }}-${{ hashFiles('patches/agave-sol-drivechain.patch') }}
+
+      - name: Build the patched solana-genesis and agave-validator
+        run: bash patches/build-agave.sh
+
+      - name: Cache the enforcer build
+        uses: actions/cache@v4
+        with:
+          path: bip300301_enforcer/target
+          key: enforcer-${{ hashFiles('.gitmodules') }}-${{ github.event.pull_request.base.sha || github.sha }}
+          restore-keys: enforcer-${{ hashFiles('.gitmodules') }}-
+
+      - name: Build the enforcer
+        run: cargo build --release --manifest-path bip300301_enforcer/Cargo.toml --bin bip300301_enforcer
+
+      - name: Fetch the eCash Bitcoin build
+        run: |
+          ./bip300301_enforcer/scripts/fetch_ecash_bitcoin.sh \
+            "$ECASH_CHANNEL" x86_64-unknown-linux-gnu "$RUNNER_TEMP/bitcoin-bins"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build the bridge program
+        run: cargo-build-sbf --manifest-path programs/bridge/Cargo.toml --sbf-out-dir target/deploy
+
+      - name: Build the daemon
+        run: cargo build --release --manifest-path daemon/Cargo.toml
+
+      - name: Two validators in network namespaces
+        # The script makes network namespaces, so it runs as root.
+        run: |
+          sudo env "PATH=$PATH" \
+            ROOT="$RUNNER_TEMP/bmm-fork" \
+            BITCOIND="$RUNNER_TEMP/bitcoin-bins/bitcoind" \
+            BITCOIN_CLI="$RUNNER_TEMP/bitcoin-bins/bitcoin-cli" \
+            ENFORCER="$GITHUB_WORKSPACE/bip300301_enforcer/target/release/bip300301_enforcer" \
+            SOLANA_GENESIS="$HOME/src/agave/target/release/solana-genesis" \
+            AGAVE_VALIDATOR="$HOME/src/agave/target/release/agave-validator" \
+            bash scripts/regtest-bmm-fork.sh
+
+      - name: Show the logs on a failure
+        if: failure()
+        run: |
+          for log in "$RUNNER_TEMP/bmm-fork/m.log" "$RUNNER_TEMP/bmm-fork/h.log" \
+                     "$RUNNER_TEMP/bmm-fork/bitcoin-stack/enforcer/enforcer.log"; do
+            echo "== $log =="
+            sudo tail -80 "$log" 2>/dev/null || echo "(absent)"
           done
