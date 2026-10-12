@@ -417,6 +417,12 @@ enum Command {
         min_bid_sats: u64,
         #[arg(long, default_value_t = 2)]
         interval_secs: u64,
+        /// Serves the JSON-RPC for BitWindow and drivechaind on this address.
+        #[arg(long)]
+        rpc_listen: Option<std::net::SocketAddr>,
+        /// Sends no bid. drivechaind pays the bids through the JSON-RPC.
+        #[arg(long)]
+        no_bid: bool,
     },
     /// Runs the peg. It credits deposits, it proposes withdrawal bundles, and
     /// it marks the paid withdrawals.
@@ -1119,7 +1125,9 @@ fn main() -> Result<(), CliError> {
             program_id,
             wait_secs,
         } => runtime.block_on(async {
-            let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
+            let rpc = std::sync::Arc::new(
+                solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url),
+            );
             let mut enforcer = enforcer.open().await?;
             let mut tip = enforcer.tip().await?;
             let pair = match payee {
@@ -1244,6 +1252,8 @@ fn main() -> Result<(), CliError> {
             bid_percent,
             min_bid_sats,
             interval_secs,
+            rpc_listen,
+            no_bid,
         } => {
             let program_id = parse_pubkey(&program_id)?;
             let keypair = read_keypair_file(&identity).map_err(|_| CliError::NoIdentityKey {
@@ -1258,6 +1268,8 @@ fn main() -> Result<(), CliError> {
                 bid_percent,
                 min_bid_sats,
                 interval: Duration::from_secs(interval_secs.max(1)),
+                rpc_listen,
+                no_bid,
             };
             runtime.block_on(bmm::run(settings, keypair))?;
             Ok(())
@@ -1389,11 +1401,16 @@ fn read_state(path: &PathBuf) -> Result<migrate::State, CliError> {
 /// Waits for a recorded block of the followed branch that passes rule 3 for
 /// the next eCash block. Gives the eCash tip of the check and the block.
 async fn wait_for_bid_block(
-    rpc: &solana_rpc_client::nonblocking::rpc_client::RpcClient,
+    rpc: &std::sync::Arc<solana_rpc_client::nonblocking::rpc_client::RpcClient>,
     enforcer: &mut Enforcer,
     program_id: &Pubkey,
     wait_secs: u64,
 ) -> Result<((bitcoin::BlockHash, u32), bridge::RecordedBlock), CliError> {
+    let live = bmm::Live {
+        rpc: rpc.clone(),
+        enforcer: enforcer.clone(),
+        program_id: *program_id,
+    };
     let config_key = bridge::config_pda(program_id).0;
     let mut height = 0;
     for _ in 0..=wait_secs {
@@ -1413,7 +1430,7 @@ async fn wait_for_bid_block(
             .map(|account| account.data)
             .unwrap_or_default();
         let lag = bridge::Config::decode(&data)?.deposit_lag;
-        if let Some(block) = bmm::bid_block(rpc, enforcer, tip, height, lag).await? {
+        if let Some(block) = bmm::bid_block(&live, tip, height, lag).await? {
             return Ok((tip, block));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

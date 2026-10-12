@@ -231,6 +231,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -239,6 +241,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -2939,6 +2942,7 @@ name = "sol-drivechain-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "bip39",
  "bitcoin",
