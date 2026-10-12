@@ -208,6 +208,29 @@ commitments than the honest bidders since the split.
    credited blocks. It pays the whole treasury above its rent reserve to the
    payee, and it adds that amount to `bmm_paid_total`.
 
+### BMM through BitWindow
+
+BitWindow and drivechaind pay the bids, as for the other sidechains. Start the
+bids with `drivechain-cli bmm start --max-bid <sats> solana`. drivechaind takes
+a template from the daemon, sends the M8 from a BitWindow wallet, and the
+daemon settles the wins. Run the daemon with `bmm --rpc-listen
+127.0.0.1:6008 --no-bid`. `--no-bid` stops its own bids. The publish of the
+pairs and the settles continue.
+
+The rpc is JSON-RPC 2.0 over HTTP POST:
+
+| Method | Params | Result |
+|---|---|---|
+| `get_block_template` | none | `critical_hash` (h* in hex, the bytes of the M8), `block` (`prev_main_hash` as the explorers show it, `height` = tip + 1, `bank_hash`, `payee`, `slot`), and `fees_sats`, the bid that the fees allow. The daemon publishes the pair before it answers. |
+| `connect_block` | `[block, main_block_hash]` | `true` when the active eCash block at `block.height` is `main_block_hash` and commits to the pair. |
+| `get_bmm_inclusions` | `[critical_hash]` | The active eCash blocks that carry `critical_hash`. |
+| `template_valid` | `[block]` | `true` while the block record holds the bank, and the bank passes rule 3. |
+| `getblockcount` | none | `bmm_next_height - 1`, the last settled eCash height. |
+
+Code -32001 means that the daemon cannot give a template yet: the slot is
+not active, no block passes rule 3, or the enforcer does not answer. Code
+-32002 means that Solana settled the height already.
+
 `bmm_next_height` is a cursor. A settle at H moves it to H + 1, so no height
 below H can settle later. A commitment that nobody settles keeps its fees in
 the treasury, and the next settle takes them.
@@ -340,8 +363,11 @@ bash genesis/run-validator.sh
 5. To vote, create a vote account, peg in Bitcoin, and delegate stake to it.
    The stake activates at the next epoch. Stake makes blocks and gives
    `confirmed`, but BMM checkpoints select the branch.
-6. To earn fees, run `daemon bmm` beside the node. It bids, publishes the
-   pairs, and settles.
+6. To earn fees, run `daemon bmm --rpc-listen 127.0.0.1:6008 --no-bid`
+   beside the node, and start the bids in BitWindow or with
+   `drivechain-cli bmm start --max-bid <sats> solana`. The daemon publishes
+   the pairs and settles. Without `--no-bid`, it bids from the enforcer
+   wallet.
 
 Read the genesis hash from the chain: `solana -u <rpc> genesis-hash`.
 
@@ -449,6 +475,9 @@ treasury. More stages prove the hard cases:
 - Both validators run after a reorg deeper than N that drops settled eCash
   blocks.
 - The books close, and the supply never changes after slot 1.
+- One round through the JSON-RPC, as drivechaind does it: the template, the
+  M8 with its critical hash, `connect_block`, `get_bmm_inclusions`, and the
+  settle that pays the payee.
 - The chain halts with an open withdrawal. The halted node replays from the
   genesis through the settles of the dropped eCash blocks, and the chain
   migrates into a new genesis.
@@ -659,7 +688,7 @@ with mode 600.
 | `bridge-state` | Prints the bridge config, the vault, the treasury, and the BMM totals. With `--books`, it checks both balance equations. |
 | `credit` | Credits the deposits of each eCash height in order. Anyone can run it. |
 | `run` | Runs the peg: the credits, the withdrawal bundles, and `mark_paid`. |
-| `bmm` | Bids for eCash blocks, publishes the pairs, and settles the commitments in height order. |
+| `bmm` | Bids for eCash blocks, publishes the pairs, and settles the commitments in height order. With `--rpc-listen`, it serves the templates for drivechaind. |
 | `bid-bmm` | Sends one bid for the newest block that passes rule 3, and publishes its pair. |
 | `publish-pair` | Publishes one pair to a validator. |
 | `bmm-block` | Prints the newest block in the block record. |
