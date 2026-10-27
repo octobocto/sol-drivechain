@@ -173,6 +173,9 @@ for _ in $(seq 1 90); do
 done
 [ "$HEALTHY" = yes ] || fail "the Solana chain did not become healthy"
 echo "the Solana chain runs at slot $("$SOLANA" -u "$SOLANA_URL" slot)"
+SLOTS_PER_EPOCH="$(rpc getEpochSchedule '[]' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["slotsPerEpoch"])')"
+[ "$SLOTS_PER_EPOCH" = 432000 ] || fail "the genesis holds $SLOTS_PER_EPOCH slots per epoch, not 432000"
+echo "PASS: the genesis holds 432000 slots per epoch"
 
 step "the bridge config and the block record come from the genesis"
 "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID"

@@ -53,6 +53,10 @@ ORACLE_SOL="${ORACLE_SOL:-1}"
 ECASH_START_HEIGHT="${ECASH_START_HEIGHT:-}"
 DEPOSIT_CONFIRMATIONS="${DEPOSIT_CONFIRMATIONS:-6}"
 DEPOSIT_LAG="${DEPOSIT_LAG:-100}"
+# A validator leads only up to one epoch after its root, and a BMM root comes
+# 30 to 120 minutes after its block. The development default of 8192 slots is
+# about 55 minutes, so the chain stopped. 432000 slots is about 2 days.
+SLOTS_PER_EPOCH="${SLOTS_PER_EPOCH:-432000}"
 # The state file of a halted chain from `migrate-state`. The new genesis then
 # carries its balances, its open withdrawals, and its deposit cursor.
 STATE="${STATE:-}"
@@ -156,6 +160,7 @@ mkdir -p "$LEDGER"
 "$SOLANA_GENESIS" \
   --ledger "$LEDGER" \
   --cluster-type development \
+  --slots-per-epoch "$SLOTS_PER_EPOCH" \
   --bootstrap-validator \
     "$IDENTITY" \
     "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-vote.json")" \
