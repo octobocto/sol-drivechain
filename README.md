@@ -75,19 +75,23 @@ subtracts with a checked subtraction.
 
 ## Every network from the start
 
-`--network` takes `alphanet`, `betanet`, `mainnet`, `testnet`, `signet`, or
-`regtest`. The daemon asks the enforcer which network it runs, and it stops on
+`--network` takes `ecash`, `alphanet`, `betanet`, `mainnet`, `testnet`,
+`signet`, or `regtest`. The daemon asks the enforcer which network it runs, and it stops on
 a mismatch.
 
 eCash runs `chain=main`, so its networks report as mainnet. The enforcer tells
-alphanet and betanet apart with `--network-preset`, not with the chain name.
+them apart with `--fork` (`ecash`, `ecash-betanet`, `ecash-alphanet`), not
+with the chain name.
 The BIP300 thresholds do differ, and `status` prints them.
 
-Numbers read from the live eCash betanet on 2026-09-20:
+Numbers read from the live eCash betanet on 2026-09-20, and for eCash from
+`Thresholds::MAINNET` in the enforcer. On eCash, a withdrawal bundle waits at
+least 13151 blocks, about 91 days.
 
 | Network | Slot ACK votes | ACK window | Bundle votes | Bundle max age |
 |---|---|---|---|---|
 | eCash betanet | 1009 | 2016 | 13151 | 26300 |
+| eCash | 1816 | 2016 | 13151 | 26300 |
 | regtest | 6 | 10 | 6 | 10 |
 
 Only regtest is tested end to end.
@@ -287,18 +291,26 @@ demotes to read only.
 
 ## Depths
 
-| Value | Where | Betanet | What it does |
-|---|---|---|---|
-| D | `deposit_confirmations` in the bridge config, from the genesis | 6 | A credit waits for D eCash confirmations. |
-| lag | `deposit_lag` in the bridge config, from the genesis | 100 | A checkpoint at eCash height H counts only when its bank credited every deposit through H - lag. |
-| N | `--bmm-confirmations` on each validator and `bmm --confirmations` | 6 | A settle waits for N + 1 eCash blocks on top. |
-| K | `--bmm-root-depth` on each validator | 2 | A checkpoint becomes the root after K eCash confirmations, about 30 minutes. |
-| L | `--bmm-fallback-blocks` on each validator | 6 | After L eCash blocks without a checkpoint, about 1 hour, the stake votes move the root. |
+| Value | Where | Betanet | eCash | What it does |
+|---|---|---|---|---|
+| D | `deposit_confirmations` in the bridge config, from the genesis | 6 | 12 | A credit waits for D eCash confirmations. |
+| lag | `deposit_lag` in the bridge config, from the genesis | 100 | 100 | A checkpoint at eCash height H counts only when its bank credited every deposit through H - lag. |
+| N | `--bmm-confirmations` on each validator and `bmm --confirmations` | 6 | 6 | A settle waits for N + 1 eCash blocks on top. |
+| K | `--bmm-root-depth` on each validator | 2 | 3 | A checkpoint becomes the root after K eCash confirmations. |
+| L | `--bmm-fallback-blocks` on each validator | 6 | 12 | After L eCash blocks without a checkpoint, the stake votes move the root. |
+| epoch | `slots_per_epoch` in the genesis | 8192 | 432000 | A validator leads only up to one epoch after its root. |
 
 `build-genesis.sh` writes D and the lag into the bridge config
 (`DEPOSIT_CONFIRMATIONS`, `DEPOSIT_LAG`). Every validator reads the same config,
 so every validator uses the same values. `run-validator.sh` passes N, K, and L
 (`BMM_CONFIRMATIONS`, `BMM_ROOT_DEPTH`, `BMM_FALLBACK_BLOCKS`).
+
+`build-genesis.sh` sets 432000 slots per epoch (`SLOTS_PER_EPOCH`), about 2
+days. A BMM root comes 30 to 120 minutes after its block. When the root falls a
+full epoch behind, the leader has no schedule and the chain stops. Betanet has
+8192 slots, about 55 minutes, and it stopped this way. A later root does not
+start it again. A restart does, up to the end of the epoch after the newest
+root. An existing chain cannot change the value.
 
 ## Finality
 
