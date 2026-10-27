@@ -6,13 +6,15 @@ use bitcoin::Network;
 ///
 /// eCash is Bitcoin with drivechain enabled. Its networks run `chain=main`, so
 /// Bitcoin Core and the enforcer both report them as mainnet. The enforcer
-/// tells them apart with `--network-preset`, not with the chain name.
+/// tells them apart with `--fork`, not with the chain name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PegNetwork {
     /// eCash alphanet.
     Alphanet,
     /// eCash betanet.
     Betanet,
+    /// eCash, the network with real coins.
+    Ecash,
     Mainnet,
     Testnet,
     Signet,
@@ -20,13 +22,16 @@ pub enum PegNetwork {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("`{0}` is not a network. Use mainnet, testnet, signet, or regtest.")]
+#[error(
+    "`{0}` is not a network. Use ecash, betanet, alphanet, mainnet, testnet, signet, or regtest."
+)]
 pub struct UnknownNetwork(String);
 
 impl PegNetwork {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Alphanet,
         Self::Betanet,
+        Self::Ecash,
         Self::Mainnet,
         Self::Testnet,
         Self::Signet,
@@ -36,27 +41,28 @@ impl PegNetwork {
     /// Which network the enforcer reports for this peg network.
     ///
     /// eCash runs `chain=main`, so its networks come back as mainnet. Over
-    /// gRPC the enforcer cannot tell alphanet, betanet, and Bitcoin mainnet
+    /// gRPC the enforcer cannot tell the eCash networks and Bitcoin mainnet
     /// apart. The BIP300 thresholds do differ, and `status` prints them.
     pub fn reported_as(self) -> Self {
         match self {
-            Self::Alphanet | Self::Betanet => Self::Mainnet,
+            Self::Alphanet | Self::Betanet | Self::Ecash => Self::Mainnet,
             other => other,
         }
     }
 
-    /// The eCash networks that the enforcer selects with `--network-preset`.
-    pub fn preset(self) -> Option<&'static str> {
+    /// The value of the enforcer `--fork` flag for this network.
+    pub fn fork(self) -> &'static str {
         match self {
-            Self::Alphanet => Some("alphanet"),
-            Self::Betanet => Some("betanet"),
-            _ => None,
+            Self::Alphanet => "ecash-alphanet",
+            Self::Betanet => "ecash-betanet",
+            Self::Ecash => "ecash",
+            Self::Mainnet | Self::Testnet | Self::Signet | Self::Regtest => "bitcoin",
         }
     }
 
     pub fn bitcoin(self) -> Network {
         match self {
-            Self::Alphanet | Self::Betanet | Self::Mainnet => Network::Bitcoin,
+            Self::Alphanet | Self::Betanet | Self::Ecash | Self::Mainnet => Network::Bitcoin,
             Self::Testnet => Network::Testnet,
             Self::Signet => Network::Signet,
             Self::Regtest => Network::Regtest,
@@ -66,7 +72,7 @@ impl PegNetwork {
     /// The default `bitcoind` JSON-RPC port of this network.
     pub fn rpc_port(self) -> u16 {
         match self {
-            Self::Alphanet | Self::Betanet | Self::Mainnet => 8332,
+            Self::Alphanet | Self::Betanet | Self::Ecash | Self::Mainnet => 8332,
             Self::Testnet => 18332,
             Self::Signet => 38332,
             Self::Regtest => 18443,
@@ -76,7 +82,7 @@ impl PegNetwork {
     /// The default peer-to-peer port of this network.
     pub fn p2p_port(self) -> u16 {
         match self {
-            Self::Alphanet | Self::Betanet | Self::Mainnet => 8333,
+            Self::Alphanet | Self::Betanet | Self::Ecash | Self::Mainnet => 8333,
             Self::Testnet => 18333,
             Self::Signet => 38333,
             Self::Regtest => 18444,
@@ -86,7 +92,7 @@ impl PegNetwork {
     /// The BIP44 coin type. Every test network shares coin type 1.
     pub fn coin_type(self) -> u32 {
         match self {
-            Self::Alphanet | Self::Betanet | Self::Mainnet => 0,
+            Self::Alphanet | Self::Betanet | Self::Ecash | Self::Mainnet => 0,
             _ => 1,
         }
     }
@@ -95,6 +101,7 @@ impl PegNetwork {
         match self {
             Self::Alphanet => "alphanet",
             Self::Betanet => "betanet",
+            Self::Ecash => "ecash",
             Self::Mainnet => "mainnet",
             Self::Testnet => "testnet",
             Self::Signet => "signet",
@@ -112,6 +119,7 @@ impl PegNetwork {
     pub fn default_confirmations(self) -> u32 {
         match self {
             Self::Mainnet => 100,
+            Self::Ecash => 12,
             Self::Alphanet | Self::Betanet | Self::Testnet | Self::Signet => 6,
             Self::Regtest => 1,
         }
@@ -125,6 +133,7 @@ impl FromStr for PegNetwork {
         match text.to_ascii_lowercase().as_str() {
             "alphanet" => Ok(Self::Alphanet),
             "betanet" => Ok(Self::Betanet),
+            "ecash" => Ok(Self::Ecash),
             "mainnet" | "bitcoin" | "main" => Ok(Self::Mainnet),
             "testnet" | "test" => Ok(Self::Testnet),
             "signet" => Ok(Self::Signet),
@@ -184,6 +193,7 @@ mod tests {
             PegNetwork::Mainnet,
             PegNetwork::Alphanet,
             PegNetwork::Betanet,
+            PegNetwork::Ecash,
         ] {
             assert!(script_pubkey_of(A_MAINNET_ADDRESS, network).is_ok());
         }
@@ -231,6 +241,7 @@ mod tests {
     fn the_ecash_networks_report_as_mainnet() {
         assert_eq!(PegNetwork::Alphanet.reported_as(), PegNetwork::Mainnet);
         assert_eq!(PegNetwork::Betanet.reported_as(), PegNetwork::Mainnet);
+        assert_eq!(PegNetwork::Ecash.reported_as(), PegNetwork::Mainnet);
     }
 
     #[test]
@@ -246,17 +257,23 @@ mod tests {
     }
 
     #[test]
-    fn only_the_ecash_networks_hold_a_preset() {
-        assert_eq!(PegNetwork::Alphanet.preset(), Some("alphanet"));
-        assert_eq!(PegNetwork::Betanet.preset(), Some("betanet"));
-        for network in [PegNetwork::Mainnet, PegNetwork::Regtest] {
-            assert_eq!(network.preset(), None);
+    fn each_network_names_its_enforcer_fork() {
+        assert_eq!(PegNetwork::Alphanet.fork(), "ecash-alphanet");
+        assert_eq!(PegNetwork::Betanet.fork(), "ecash-betanet");
+        assert_eq!(PegNetwork::Ecash.fork(), "ecash");
+        for network in [
+            PegNetwork::Mainnet,
+            PegNetwork::Testnet,
+            PegNetwork::Signet,
+            PegNetwork::Regtest,
+        ] {
+            assert_eq!(network.fork(), "bitcoin");
         }
     }
 
     #[test]
     fn the_ecash_networks_run_the_bitcoin_chain() {
-        for network in [PegNetwork::Alphanet, PegNetwork::Betanet] {
+        for network in [PegNetwork::Alphanet, PegNetwork::Betanet, PegNetwork::Ecash] {
             assert_eq!(network.bitcoin(), Network::Bitcoin);
             assert_eq!(network.coin_type(), 0);
         }
@@ -272,7 +289,7 @@ mod tests {
 
     #[test]
     fn the_ecash_networks_share_the_mainnet_ports() {
-        for network in [PegNetwork::Alphanet, PegNetwork::Betanet] {
+        for network in [PegNetwork::Alphanet, PegNetwork::Betanet, PegNetwork::Ecash] {
             assert_eq!(network.rpc_port(), PegNetwork::Mainnet.rpc_port());
             assert_eq!(network.p2p_port(), PegNetwork::Mainnet.p2p_port());
         }
@@ -306,12 +323,14 @@ mod tests {
     #[test]
     fn mainnet_waits_the_longest_for_a_deposit() {
         assert_eq!(PegNetwork::Mainnet.default_confirmations(), 100);
+        assert_eq!(PegNetwork::Ecash.default_confirmations(), 12);
         assert_eq!(PegNetwork::Betanet.default_confirmations(), 6);
         assert_eq!(PegNetwork::Alphanet.default_confirmations(), 6);
         assert_eq!(PegNetwork::Regtest.default_confirmations(), 1);
         // A deposit on a chain with real money waits much longer than a BMM
         // settle, because a reorg that drops a credit rolls the chain back.
         assert!(PegNetwork::Mainnet.default_confirmations() > 6);
+        assert!(PegNetwork::Ecash.default_confirmations() > 6);
     }
 
     #[test]
