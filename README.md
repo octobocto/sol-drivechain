@@ -85,13 +85,13 @@ with the chain name.
 The BIP300 thresholds do differ, and `status` prints them.
 
 Numbers read from the live eCash betanet on 2026-09-20, and for eCash from
-`Thresholds::MAINNET` in the enforcer. On eCash, a withdrawal bundle waits at
-least 13151 blocks, about 91 days.
+`Thresholds::ECX_MAINNET` in the enforcer. On eCash, a withdrawal bundle waits at
+least 6049 blocks, about 42 days.
 
 | Network | Slot ACK votes | ACK window | Bundle votes | Bundle max age |
 |---|---|---|---|---|
 | eCash betanet | 1009 | 2016 | 13151 | 26300 |
-| eCash | 1816 | 2016 | 13151 | 26300 |
+| eCash | 1816 | 2016 | 6049 | 12096 |
 | regtest | 6 | 10 | 6 | 10 |
 
 Only regtest is tested end to end.
