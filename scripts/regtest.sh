@@ -111,6 +111,8 @@ start_enforcer() {
     --node-zmq-addr-sequence=tcp://127.0.0.1:"$ZMQ_PORT" \
     --serve-grpc-addr="$GRPC_BIND:$GRPC_PORT" \
     --serve-rpc-addr=127.0.0.1:"$ENFORCER_RPC_PORT" \
+    --enable-mempool \
+    --enable-block-template-server \
     --enable-wallet \
     --wallet-auto-create \
     --wallet-sync-source=disabled \
