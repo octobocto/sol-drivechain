@@ -134,6 +134,8 @@ export RUST_LOG="${RUST_LOG:-solana=info,agave_validator=info,agave_votor=info,s
 
 exec "$AGAVE_VALIDATOR" \
   --ledger "$LEDGER" \
+  --limit-ledger-size "${LEDGER_SHREDS:-50000000}" \
+  --disable-banking-trace \
   --identity "$KEYS/validator-identity.json" \
   "${VOTE_ARGS[@]}" \
   "${SNAPSHOT_ARGS[@]}" \
