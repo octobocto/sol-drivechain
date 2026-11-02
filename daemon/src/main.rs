@@ -182,8 +182,10 @@ enum Command {
         processed: bool,
         /// Prints the balance equations with each term, and fails when one
         /// does not hold. It reads eCash from the enforcer.
-        #[arg(long, requires = "slot")]
+        #[arg(long, requires_all = ["slot", "network"])]
         books: bool,
+        #[arg(long)]
+        network: Option<PegNetwork>,
         #[arg(long, default_value = "http://127.0.0.1:50051")]
         enforcer_url: String,
         #[arg(long)]
@@ -221,6 +223,8 @@ enum Command {
     },
     /// Credits the deposits of each eCash height in order. Anyone can run it.
     Credit {
+        #[arg(long)]
+        network: PegNetwork,
         #[arg(long, default_value = "http://127.0.0.1:50051")]
         enforcer_url: String,
         #[arg(long, default_value = "http://127.0.0.1:8899")]
@@ -408,6 +412,8 @@ enum Command {
     },
     /// Bids for eCash blocks, and settles each eCash height on Solana.
     Bmm {
+        #[arg(long)]
+        network: PegNetwork,
         #[arg(long, default_value = "http://127.0.0.1:50051")]
         enforcer_url: String,
         #[arg(long, default_value = "http://127.0.0.1:8899")]
@@ -428,6 +434,9 @@ enum Command {
         bid_percent: u64,
         #[arg(long, default_value_t = 1_000)]
         min_bid_sats: u64,
+        /// No bid and no template offers more sats than this.
+        #[arg(long)]
+        max_bid_sats: u64,
         #[arg(long, default_value_t = 2)]
         interval_secs: u64,
         /// Serves the JSON-RPC for BitWindow and drivechaind on this address.
@@ -790,6 +799,7 @@ fn main() -> Result<(), CliError> {
             program_id,
             processed,
             books,
+            network,
             enforcer_url,
             slot,
         } => {
@@ -871,6 +881,9 @@ fn main() -> Result<(), CliError> {
                         commitment,
                     );
                 let mut enforcer = Enforcer::connect(enforcer_url, u32::from(slot)).await?;
+                if let Some(network) = network {
+                    enforcer.check_network(network).await?;
+                }
                 Ok::<_, CliError>(books::read(&rpc, &mut enforcer, &program_id, commitment).await?)
             })?;
             print!("{}", books.report());
@@ -982,6 +995,7 @@ fn main() -> Result<(), CliError> {
             Ok(())
         }
         Command::Credit {
+            network,
             enforcer_url,
             solana_rpc_url,
             slot,
@@ -998,6 +1012,7 @@ fn main() -> Result<(), CliError> {
                     u32::from(slot),
                 )
                 .await?;
+                enforcer.check_network(network).await?;
                 credit::run(&mut enforcer, solana_rpc_url, program_id, &payer_key).await?;
                 Ok(())
             })
@@ -1315,6 +1330,7 @@ fn main() -> Result<(), CliError> {
             Ok(())
         }
         Command::Bmm {
+            network,
             enforcer_url,
             solana_rpc_url,
             slot,
@@ -1323,6 +1339,7 @@ fn main() -> Result<(), CliError> {
             confirmations,
             bid_percent,
             min_bid_sats,
+            max_bid_sats,
             interval_secs,
             rpc_listen,
             no_bid,
@@ -1332,6 +1349,7 @@ fn main() -> Result<(), CliError> {
                 path: identity.clone(),
             })?;
             let settings = bmm::Settings {
+                network,
                 enforcer_url,
                 solana_rpc_url,
                 sidechain_id: slot,
@@ -1339,6 +1357,7 @@ fn main() -> Result<(), CliError> {
                 confirmations,
                 bid_percent,
                 min_bid_sats,
+                max_bid_sats,
                 interval: Duration::from_secs(interval_secs.max(1)),
                 rpc_listen,
                 no_bid,
@@ -1501,11 +1520,7 @@ async fn wait_for_bid_block(
     program_id: &Pubkey,
     wait_secs: u64,
 ) -> Result<((bitcoin::BlockHash, u32), bridge::RecordedBlock), CliError> {
-    let live = bmm::Live {
-        rpc: rpc.clone(),
-        enforcer: enforcer.clone(),
-        program_id: *program_id,
-    };
+    let live = bmm::Live::new(rpc.clone(), enforcer.clone(), *program_id);
     let config_key = bridge::config_pda(program_id).0;
     let mut height = 0;
     for _ in 0..=wait_secs {
@@ -1741,5 +1756,68 @@ mod tests {
         assert!(write_secret(&path, b"[1,2,3]").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"keep");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn each_enforcer_command_asks_for_the_network() {
+        const ID: &str = "ARA8mQfWk85ULDLAujy3b8gLknFF2QzrsAKHYbc8beu";
+        let bmm = [
+            "daemon",
+            "bmm",
+            "--slot",
+            "8",
+            "--program-id",
+            ID,
+            "--identity",
+            "/tmp/id.json",
+            "--max-bid-sats",
+            "5000",
+        ];
+        assert!(Cli::try_parse_from(bmm).is_err());
+        let cli = Cli::try_parse_from(bmm.iter().chain(&["--network", "ecash"])).unwrap();
+        let Command::Bmm {
+            network,
+            max_bid_sats,
+            ..
+        } = cli.command
+        else {
+            panic!("the parser did not pick the bmm command");
+        };
+        assert_eq!((network, max_bid_sats), (PegNetwork::Ecash, 5000));
+        let no_cap = [
+            "daemon",
+            "bmm",
+            "--network",
+            "ecash",
+            "--slot",
+            "8",
+            "--program-id",
+            ID,
+            "--identity",
+            "/tmp/id.json",
+        ];
+        assert!(Cli::try_parse_from(no_cap).is_err());
+        let credit = [
+            "daemon",
+            "credit",
+            "--slot",
+            "8",
+            "--program-id",
+            ID,
+            "--payer",
+            "/tmp/p.json",
+        ];
+        assert!(Cli::try_parse_from(credit).is_err());
+        let books = [
+            "daemon",
+            "bridge-state",
+            "--program-id",
+            ID,
+            "--books",
+            "--slot",
+            "8",
+        ];
+        assert!(Cli::try_parse_from(books).is_err());
+        assert!(Cli::try_parse_from(books.iter().chain(&["--network", "ecash"])).is_ok());
     }
 }

@@ -27,6 +27,8 @@ pub enum PegNetwork {
 )]
 pub struct UnknownNetwork(String);
 
+const BITCOIN_BUNDLE_THRESHOLD: u32 = 13_150;
+
 impl PegNetwork {
     pub const ALL: [Self; 7] = [
         Self::Alphanet,
@@ -109,20 +111,37 @@ impl PegNetwork {
         }
     }
 
-    /// The default D: how many eCash confirmations a deposit waits before a
-    /// credit.
-    ///
-    /// An eCash reorg that drops a credited deposit rolls the Solana chain
-    /// back. So a chain that holds real money waits much longer than the BMM
-    /// depth N. Alphanet and betanet are test networks, and they wait 6
-    /// blocks.
-    pub fn default_confirmations(self) -> u32 {
+    /// The BIP300 marks that the enforcer of an eCash network reports: the
+    /// withdrawal bundle threshold and the activation height.
+    fn ecash_marks(self) -> Option<(u32, u32)> {
         match self {
-            Self::Mainnet => 100,
-            Self::Ecash => 12,
-            Self::Alphanet | Self::Betanet | Self::Testnet | Self::Signet => 6,
-            Self::Regtest => 1,
+            Self::Ecash => Some((6_048, 973_728)),
+            Self::Betanet => Some((13_150, 967_680)),
+            Self::Alphanet => Some((72, 963_648)),
+            _ => None,
         }
+    }
+
+    /// The network of an enforcer, from its chain and its BIP300 constants.
+    /// `None` means a chain that no network here matches.
+    pub fn identify(
+        reported: Option<Self>,
+        bundle_threshold: u32,
+        activation_height: u32,
+    ) -> Option<Self> {
+        if reported != Some(Self::Mainnet) {
+            return reported;
+        }
+        let marks = (bundle_threshold, activation_height);
+        if let Some(network) = [Self::Ecash, Self::Betanet, Self::Alphanet]
+            .into_iter()
+            .find(|network| network.ecash_marks() == Some(marks))
+        {
+            return Some(network);
+        }
+        // Bitcoin never activates BIP300. An older enforcer reports zero.
+        (bundle_threshold == BITCOIN_BUNDLE_THRESHOLD && matches!(activation_height, 0 | u32::MAX))
+            .then_some(Self::Mainnet)
     }
 }
 
@@ -321,16 +340,45 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_waits_the_longest_for_a_deposit() {
-        assert_eq!(PegNetwork::Mainnet.default_confirmations(), 100);
-        assert_eq!(PegNetwork::Ecash.default_confirmations(), 12);
-        assert_eq!(PegNetwork::Betanet.default_confirmations(), 6);
-        assert_eq!(PegNetwork::Alphanet.default_confirmations(), 6);
-        assert_eq!(PegNetwork::Regtest.default_confirmations(), 1);
-        // A deposit on a chain with real money waits much longer than a BMM
-        // settle, because a reorg that drops a credit rolls the chain back.
-        assert!(PegNetwork::Mainnet.default_confirmations() > 6);
-        assert!(PegNetwork::Ecash.default_confirmations() > 6);
+    fn each_ecash_network_has_its_own_marks() {
+        let mainnet = Some(PegNetwork::Mainnet);
+        assert_eq!(
+            PegNetwork::identify(mainnet, 6_048, 973_728),
+            Some(PegNetwork::Ecash)
+        );
+        assert_eq!(
+            PegNetwork::identify(mainnet, 13_150, 967_680),
+            Some(PegNetwork::Betanet)
+        );
+        assert_eq!(
+            PegNetwork::identify(mainnet, 72, 963_648),
+            Some(PegNetwork::Alphanet)
+        );
+        assert_eq!(
+            PegNetwork::identify(mainnet, 13_150, u32::MAX),
+            Some(PegNetwork::Mainnet)
+        );
+        assert_eq!(
+            PegNetwork::identify(mainnet, 13_150, 0),
+            Some(PegNetwork::Mainnet)
+        );
+    }
+
+    #[test]
+    fn a_mainnet_chain_with_other_marks_is_no_network() {
+        let mainnet = Some(PegNetwork::Mainnet);
+        assert_eq!(PegNetwork::identify(mainnet, 13_150, 973_728), None);
+        assert_eq!(PegNetwork::identify(mainnet, 6_048, 0), None);
+        assert_eq!(PegNetwork::identify(mainnet, 6_048, 967_680), None);
+        assert_eq!(PegNetwork::identify(mainnet, 5, 0), None);
+        assert_eq!(PegNetwork::identify(None, 6_048, 973_728), None);
+    }
+
+    #[test]
+    fn a_test_chain_is_its_own_network() {
+        for network in [PegNetwork::Testnet, PegNetwork::Signet, PegNetwork::Regtest] {
+            assert_eq!(PegNetwork::identify(Some(network), 5, 0), Some(network));
+        }
     }
 
     #[test]

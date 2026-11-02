@@ -238,11 +238,13 @@ pub struct SlotInfo {
 /// What the mainchain asks for before a slot activates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainInfo {
+    /// The network that the chain and the BIP300 constants identify.
     pub network: Option<PegNetwork>,
     pub unused_slot_activation_threshold: u32,
     pub unused_slot_proposal_max_age: u32,
     pub withdrawal_bundle_max_age: u32,
     pub withdrawal_bundle_inclusion_threshold: u32,
+    pub activation_height: u32,
 }
 
 #[derive(Clone)]
@@ -285,11 +287,16 @@ impl Enforcer {
             .into_inner();
         let constants = response.bip300_constants.unwrap_or_default();
         Ok(ChainInfo {
-            network: peg_network(response.network),
+            network: PegNetwork::identify(
+                peg_network(response.network),
+                constants.withdrawal_bundle_inclusion_threshold,
+                constants.activation_height,
+            ),
             unused_slot_activation_threshold: constants.unused_sidechain_slot_activation_threshold,
             unused_slot_proposal_max_age: constants.unused_sidechain_slot_proposal_max_age,
             withdrawal_bundle_max_age: constants.withdrawal_bundle_max_age,
             withdrawal_bundle_inclusion_threshold: constants.withdrawal_bundle_inclusion_threshold,
+            activation_height: constants.activation_height,
         })
     }
 
@@ -511,24 +518,18 @@ impl Enforcer {
             .collect())
     }
 
-    /// Fails when the enforcer runs another Bitcoin network than the daemon.
+    /// Fails when the enforcer runs another network than the daemon.
     pub async fn check_network(&mut self, want: PegNetwork) -> Result<()> {
-        let response = self
-            .validator
-            .get_chain_info(GetChainInfoRequest {})
-            .await
-            .map_err(|source| EnforcerError::Call {
-                call: "GetChainInfo",
-                source,
-            })?
-            .into_inner();
-        let found = peg_network(response.network);
-        if found != Some(want.reported_as()) {
+        let info = self.chain_info().await?;
+        if info.network != Some(want) {
             return Err(EnforcerError::WrongNetwork {
                 want: want.name(),
-                found: match found {
+                found: match info.network {
                     Some(network) => network.name().to_owned(),
-                    None => format!("code {}", response.network),
+                    None => format!(
+                        "an unknown chain (bundle threshold {}, activation height {})",
+                        info.withdrawal_bundle_inclusion_threshold, info.activation_height
+                    ),
                 },
             });
         }
