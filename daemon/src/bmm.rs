@@ -31,9 +31,11 @@ use tokio::sync::Mutex;
 use crate::{
     bridge::{self, Config, RecordedBlock},
     enforcer::{Enforcer, EnforcerError},
+    network::PegNetwork,
 };
 
 pub struct Settings {
+    pub network: PegNetwork,
     pub enforcer_url: String,
     pub solana_rpc_url: String,
     pub sidechain_id: u8,
@@ -45,6 +47,8 @@ pub struct Settings {
     pub bid_percent: u64,
     /// The loop makes no bid below this amount.
     pub min_bid_sats: u64,
+    /// No bid and no template offers more than this amount.
+    pub max_bid_sats: u64,
     pub interval: Duration,
     /// The address of the JSON-RPC for BitWindow and drivechaind. `None` turns
     /// it off.
@@ -67,10 +71,12 @@ pub enum BmmError {
     },
     #[error("the bid percent is {0}, and it must be from 1 to 100")]
     BadBidPercent(u64),
+    #[error("the max bid is {max} sats, and it must be at least 1 and at least the min bid of {min} sats")]
+    BadMaxBid { max: u64, min: u64 },
+    #[error("the validator sent a block of slot {slot} that does not decode: {reason}")]
+    BadBlock { slot: u64, reason: &'static str },
     #[error("eCash height {0} does not fit a u32")]
     HeightTooLarge(u64),
-    #[error("the validator gave a pair with a bad key: {0}")]
-    BadPair(String),
     #[error("the BMM rpc cannot listen on {addr}")]
     Listen {
         addr: SocketAddr,
@@ -104,8 +110,9 @@ pub fn pair_for(pairs: &[Pair], height: u64, commitment: &[u8; 32]) -> Option<Pa
         .copied()
 }
 
-/// The gross fee income that the loop saw at each eCash tip: the treasury
-/// balance plus every payout. Payouts do not hide income in this sum.
+/// The fees that the blocks of the validator paid into the treasury, as a
+/// running total at each eCash tip. A transfer to the treasury is no fee, so
+/// it does not count.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct FeeHistory {
     by_height: BTreeMap<u64, u64>,
@@ -113,18 +120,37 @@ pub struct FeeHistory {
 
 impl FeeHistory {
     /// Records the first total that the loop sees at a tip height.
-    pub fn observe(&mut self, tip_height: u64, gross: u64) {
-        self.by_height.entry(tip_height).or_insert(gross);
+    pub fn observe(&mut self, tip_height: u64, earned: u64) {
+        self.by_height.entry(tip_height).or_insert(earned);
     }
 
-    /// The fee income of one eCash block, from the growth of the total since
-    /// the newest tip at least `span` blocks back. `None` means that the loop
-    /// has not watched long enough.
-    pub fn income_per_block(&self, tip_height: u64, gross: u64, span: u64) -> Option<u64> {
+    /// The fee income of one eCash block: the median income per block since
+    /// the newest tip at least `span` blocks back. One block with a high fee
+    /// does not move the median. `None` means that the loop has not watched
+    /// long enough.
+    pub fn income_per_block(&self, tip_height: u64, earned: u64, span: u64) -> Option<u64> {
         let back = tip_height.checked_sub(span)?;
-        let (&old_height, &old_gross) = self.by_height.range(..=back).next_back()?;
-        let blocks = tip_height.checked_sub(old_height)?;
-        gross.checked_sub(old_gross)?.checked_div(blocks)
+        let (&start, _) = self.by_height.range(..=back).next_back()?;
+        let mut points: Vec<(u64, u64)> = self
+            .by_height
+            .range(start..tip_height)
+            .map(|(&height, &total)| (height, total))
+            .collect();
+        points.push((tip_height, earned));
+        let mut rates: Vec<(u64, u64)> = points
+            .windows(2)
+            .map(|pair| {
+                let blocks = pair[1].0 - pair[0].0;
+                (pair[1].1.saturating_sub(pair[0].1) / blocks, blocks)
+            })
+            .collect();
+        rates.sort_unstable();
+        let all_blocks = tip_height - start;
+        let mut counted = 0u64;
+        rates.into_iter().find_map(|(rate, blocks)| {
+            counted += blocks;
+            (counted * 2 >= all_blocks).then_some(rate)
+        })
     }
 
     /// Drops the totals that no estimate can use any more. It keeps the
@@ -141,10 +167,16 @@ impl FeeHistory {
     }
 }
 
-/// The bid for a block that earns `income_lamports`. `None` means no bid.
-pub fn bid_sats(income_lamports: u64, bid_percent: u64, min_bid_sats: u64) -> Option<u64> {
+/// The bid for a block that earns `income_lamports`, at most `max_bid_sats`.
+/// `None` means no bid.
+pub fn bid_sats(
+    income_lamports: u64,
+    bid_percent: u64,
+    min_bid_sats: u64,
+    max_bid_sats: u64,
+) -> Option<u64> {
     let income_sats = income_lamports / bridge::LAMPORTS_PER_SAT;
-    let bid = income_sats.checked_mul(bid_percent)? / 100;
+    let bid = (income_sats.saturating_mul(bid_percent) / 100).min(max_bid_sats);
     (bid >= min_bid_sats && bid > 0).then_some(bid)
 }
 
@@ -164,6 +196,23 @@ pub struct BidRules {
     pub confirmations: u64,
     pub bid_percent: u64,
     pub min_bid_sats: u64,
+    pub max_bid_sats: u64,
+}
+
+impl BidRules {
+    /// Fails when the bid percent or the bid limits cannot give a bid.
+    pub fn check(&self) -> Result<(), BmmError> {
+        if !(1..=100).contains(&self.bid_percent) {
+            return Err(BmmError::BadBidPercent(self.bid_percent));
+        }
+        if self.max_bid_sats == 0 || self.max_bid_sats < self.min_bid_sats {
+            return Err(BmmError::BadMaxBid {
+                max: self.max_bid_sats,
+                min: self.min_bid_sats,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// An inclusion answer can name a pair this many eCash blocks after its
@@ -174,14 +223,27 @@ const REMEMBERED_HEIGHTS: u64 = 1_000;
 /// the current tip, and the own pairs by commitment.
 #[derive(Debug, Default)]
 pub struct Memory {
+    generation: u64,
     history: FeeHistory,
     fees: Option<(BlockHash, u64)>,
     pairs: HashMap<[u8; 32], Pair>,
 }
 
 impl Memory {
-    pub fn observe(&mut self, tip_height: u64, gross: u64) {
-        self.history.observe(tip_height, gross);
+    pub fn observe(&mut self, tip_height: u64, earned: impl Into<Earned>) {
+        let earned = self.follow(earned.into());
+        self.history.observe(tip_height, earned);
+    }
+
+    /// A new meter generation drops the history and the bid, because they
+    /// count the fees of a branch that the chain left.
+    fn follow(&mut self, earned: Earned) -> u64 {
+        if earned.generation != self.generation {
+            self.generation = earned.generation;
+            self.history = FeeHistory::default();
+            self.fees = None;
+        }
+        earned.total
     }
 
     pub fn forget_fees_below(&mut self, height: u64) {
@@ -195,16 +257,29 @@ impl Memory {
 
     /// The bid for the block after `tip`, in sats. It stays the same for the
     /// whole tip. Zero means no bid.
-    pub fn fees_at(&mut self, tip: (BlockHash, u32), gross: u64, rules: &BidRules) -> u64 {
+    pub fn fees_at(
+        &mut self,
+        tip: (BlockHash, u32),
+        earned: impl Into<Earned>,
+        rules: &BidRules,
+    ) -> u64 {
+        let earned = self.follow(earned.into());
         if let Some(fees) = self.cached_fees(&tip.0) {
             return fees;
         }
         let tip_height = u64::from(tip.1);
-        self.history.observe(tip_height, gross);
+        self.history.observe(tip_height, earned);
         let fees = self
             .history
-            .income_per_block(tip_height, gross, rules.confirmations + 1)
-            .and_then(|income| bid_sats(income, rules.bid_percent, rules.min_bid_sats))
+            .income_per_block(tip_height, earned, rules.confirmations + 1)
+            .and_then(|income| {
+                bid_sats(
+                    income,
+                    rules.bid_percent,
+                    rules.min_bid_sats,
+                    rules.max_bid_sats,
+                )
+            })
             .unwrap_or(0);
         self.fees = Some((tip.0, fees));
         fees
@@ -249,7 +324,9 @@ pub trait Chain: Send + Sync {
     fn tip(&self) -> impl Future<Output = Result<(BlockHash, u32), BmmError>> + Send;
     fn slot_is_active(&self) -> impl Future<Output = Result<bool, BmmError>> + Send;
     fn config(&self) -> impl Future<Output = Result<Config, BmmError>> + Send;
-    fn treasury(&self) -> impl Future<Output = Result<u64, BmmError>> + Send;
+    /// The running total of the fees that the blocks of the validator paid
+    /// into the treasury since the loop started.
+    fn earned_fees(&self) -> impl Future<Output = Result<Earned, BmmError>> + Send;
     fn recorded_blocks(&self) -> impl Future<Output = Result<Vec<RecordedBlock>, BmmError>> + Send;
     /// The hash of the active eCash block at `height` below `tip`, in the
     /// internal byte order.
@@ -273,6 +350,354 @@ pub struct Live {
     pub rpc: Arc<RpcClient>,
     pub enforcer: Enforcer,
     pub program_id: Pubkey,
+    fees: Mutex<FeeMeter>,
+}
+
+impl Live {
+    pub fn new(rpc: Arc<RpcClient>, enforcer: Enforcer, program_id: Pubkey) -> Self {
+        Self {
+            rpc,
+            enforcer,
+            program_id,
+            fees: Mutex::new(FeeMeter::default()),
+        }
+    }
+}
+
+/// The deepest eCash block below the tip that the loop asks the enforcer
+/// for. The enforcer walks every header between the tip and the block.
+pub const MAX_WALK: u64 = 2_016;
+
+/// True when the loop may ask the enforcer for the block at `height`.
+pub fn within_walk(tip_height: u64, height: u64) -> bool {
+    tip_height
+        .checked_sub(height)
+        .is_some_and(|depth| depth <= MAX_WALK)
+}
+
+/// The most Solana slots that one fee read takes. A meter further behind
+/// skips the older slots, so it can count too little but never too much.
+pub const METER_SLOTS: u64 = 2_000;
+/// The most slots that a meter catches up. Older slots stay uncounted.
+pub const METER_BACKLOG: u64 = 20_000;
+/// The longest time that one fee read takes. A slow read stops there, and
+/// the next read goes on from the last block that it counted.
+pub const METER_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The fees that the blocks paid into the treasury since the meter started.
+/// A new generation starts when the confirmed branch drops a counted block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Earned {
+    pub generation: u64,
+    pub total: u64,
+}
+
+impl From<u64> for Earned {
+    fn from(total: u64) -> Self {
+        Self {
+            generation: 0,
+            total,
+        }
+    }
+}
+
+/// One block for the fee meter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockFees {
+    pub blockhash: String,
+    pub previous: String,
+    pub fees: u64,
+}
+
+/// Counts the fees of each confirmed block from the slot after its start.
+#[derive(Debug, Default)]
+pub struct FeeMeter {
+    next_slot: Option<u64>,
+    /// The slot and the hash of the newest counted block.
+    last: Option<(u64, String)>,
+    /// The ledger did not hold a block after `last`.
+    gap: bool,
+    earned: Earned,
+}
+
+/// What a fee read starts from. The read applies only when the meter is
+/// still in this state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeterMark {
+    next_slot: Option<u64>,
+    last: Option<(u64, String)>,
+    gap: bool,
+    earned: Earned,
+}
+
+/// The blocks that one fee read got, oldest first. `None` is a block that
+/// the ledger does not hold. `covered` is the newest slot that the read
+/// finished.
+#[derive(Debug, Default)]
+pub struct MeterScan {
+    pub blocks: Vec<(u64, Option<BlockFees>)>,
+    pub covered: Option<u64>,
+}
+
+impl FeeMeter {
+    pub fn earned(&self) -> Earned {
+        self.earned
+    }
+
+    fn mark(&self) -> MeterMark {
+        MeterMark {
+            next_slot: self.next_slot,
+            last: self.last.clone(),
+            gap: self.gap,
+            earned: self.earned,
+        }
+    }
+
+    fn restart(&mut self, slot: u64) {
+        self.next_slot = Some(slot.saturating_add(1));
+        self.last = None;
+        self.gap = false;
+        self.earned = Earned {
+            generation: self.earned.generation + 1,
+            total: self.earned.total,
+        };
+    }
+
+    /// The slots to read when the confirmed slot is `slot`, and the mark of
+    /// the read. A confirmed slot below the last counted block means that
+    /// the validator went back, so the meter starts a new generation.
+    pub fn plan(&mut self, slot: u64) -> Option<((u64, u64), MeterMark)> {
+        let Some(next) = self.next_slot else {
+            self.next_slot = Some(slot.saturating_add(1));
+            return None;
+        };
+        if self.last.as_ref().is_some_and(|(last, _)| *last > slot) {
+            self.restart(slot);
+            return None;
+        }
+        if slot < next {
+            return None;
+        }
+        let start = next.max(slot.saturating_sub(METER_BACKLOG - 1));
+        Some(((start, slot.min(start + METER_SLOTS - 1)), self.mark()))
+    }
+
+    /// Counts the blocks of a read that started at `mark`. A block that does
+    /// not name the last counted block as its parent can come from another
+    /// branch, so the meter starts a new generation from `confirmed`. A
+    /// missing block in between hides the parent, so that also starts one.
+    pub fn apply(&mut self, mark: &MeterMark, scan: MeterScan, confirmed: u64) -> Earned {
+        if self.mark() != *mark {
+            return self.earned;
+        }
+        let Some(covered) = scan.covered else {
+            return self.earned;
+        };
+        let mut fees = 0u64;
+        let mut last = self.last.clone();
+        let mut gap = self.gap;
+        for (slot, block) in scan.blocks.into_iter().filter(|(slot, _)| *slot <= covered) {
+            let Some(block) = block else {
+                gap = last.is_some();
+                continue;
+            };
+            let linked = match &last {
+                None => true,
+                Some((_, hash)) => !gap && *hash == block.previous,
+            };
+            if !linked {
+                self.restart(confirmed);
+                return self.earned;
+            }
+            fees = fees.saturating_add(block.fees);
+            gap = false;
+            last = Some((slot, block.blockhash));
+        }
+        self.next_slot = Some(covered.saturating_add(1));
+        self.last = last;
+        self.gap = gap;
+        self.earned.total = self.earned.total.saturating_add(fees);
+        self.earned
+    }
+}
+
+/// The confirmed blocks of the validator, for the fee meter.
+pub trait FeeSource: Send + Sync {
+    fn confirmed_slot(&self) -> impl Future<Output = Result<u64, BmmError>> + Send;
+    fn blocks(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> impl Future<Output = Result<Vec<u64>, BmmError>> + Send;
+    /// `None` when the ledger does not hold the block.
+    fn block(&self, slot: u64) -> impl Future<Output = Result<Option<BlockFees>, BmmError>> + Send;
+}
+
+fn too_slow(call: &'static str) -> BmmError {
+    BmmError::Rpc {
+        call,
+        source: ErrorKind::Custom(format!("the fee read took longer than {METER_DEADLINE:?}"))
+            .into(),
+    }
+}
+
+/// Reads the fees of the new confirmed blocks into `meter`. The lock never
+/// holds over a call to the source, and the whole read ends at `deadline`.
+/// An error other than a missing block stops the read, and the blocks
+/// before it still count.
+pub async fn read_fees<S: FeeSource>(
+    meter: &Mutex<FeeMeter>,
+    source: &S,
+    deadline: Duration,
+) -> Result<Earned, BmmError> {
+    let until = tokio::time::Instant::now() + deadline;
+    let confirmed = tokio::time::timeout_at(until, source.confirmed_slot())
+        .await
+        .map_err(|_| too_slow("getSlot"))??;
+    let Some(((start, end), mark)) = meter.lock().await.plan(confirmed) else {
+        return Ok(meter.lock().await.earned());
+    };
+    let slots = tokio::time::timeout_at(until, source.blocks(start, end))
+        .await
+        .map_err(|_| too_slow("getBlocks"))??;
+    let mut scan = MeterScan::default();
+    let mut stop = None;
+    for slot in slots
+        .into_iter()
+        .filter(|slot| (start..=end).contains(slot))
+    {
+        match tokio::time::timeout_at(until, source.block(slot)).await {
+            Ok(Ok(block)) => scan.blocks.push((slot, block)),
+            Ok(Err(error)) => {
+                stop = Some((slot, error));
+                break;
+            }
+            Err(_) => {
+                stop = Some((slot, too_slow("getBlock")));
+                break;
+            }
+        }
+    }
+    scan.covered = match &stop {
+        None => Some(end),
+        Some((slot, _)) => slot.checked_sub(1).filter(|covered| *covered >= start),
+    };
+    let earned = meter.lock().await.apply(&mark, scan, confirmed);
+    match stop {
+        Some((_, error)) => Err(error),
+        None => Ok(earned),
+    }
+}
+
+/// True when an rpc error means that the ledger does not hold the block.
+fn block_is_missing(error: &solana_rpc_client_api::client_error::Error) -> bool {
+    use solana_rpc_client_api::{custom_error::*, request::RpcError};
+    matches!(
+        error.kind(),
+        ErrorKind::RpcError(RpcError::RpcResponseError { code, .. })
+            if [
+                JSON_RPC_SERVER_ERROR_BLOCK_CLEANED_UP,
+                JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+                JSON_RPC_SERVER_ERROR_SLOT_SKIPPED,
+                JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED,
+            ]
+            .contains(code)
+    )
+}
+
+/// The hashes and the treasury fees of one block of `getBlock`.
+pub fn block_fees(
+    slot: u64,
+    block: &serde_json::Value,
+    treasury: &Pubkey,
+) -> Result<BlockFees, BmmError> {
+    let bad = |reason| BmmError::BadBlock { slot, reason };
+    let text = |key| {
+        block
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .ok_or(bad("no block hash"))
+    };
+    let rewards = block
+        .get("rewards")
+        .and_then(|rewards| rewards.as_array())
+        .ok_or(bad("no rewards list"))?;
+    let treasury = treasury.to_string();
+    let mut fees = 0u64;
+    for reward in rewards {
+        if reward.get("rewardType").and_then(|kind| kind.as_str()) != Some("Fee")
+            || reward.get("pubkey").and_then(|key| key.as_str()) != Some(treasury.as_str())
+        {
+            continue;
+        }
+        let lamports = reward
+            .get("lamports")
+            .and_then(|lamports| lamports.as_u64())
+            .ok_or(bad("a fee reward without lamports"))?;
+        fees = fees.checked_add(lamports).ok_or(bad("the fees overflow"))?;
+    }
+    Ok(BlockFees {
+        blockhash: text("blockhash")?,
+        previous: text("previousBlockhash")?,
+        fees,
+    })
+}
+
+/// The fee source behind the Solana rpc of the validator.
+pub struct RpcFees<'a> {
+    pub rpc: &'a RpcClient,
+    pub treasury: Pubkey,
+}
+
+impl FeeSource for RpcFees<'_> {
+    async fn confirmed_slot(&self) -> Result<u64, BmmError> {
+        self.rpc
+            .get_slot_with_commitment(CommitmentConfig::confirmed())
+            .await
+            .map_err(|source| BmmError::Rpc {
+                call: "getSlot",
+                source,
+            })
+    }
+
+    async fn blocks(&self, start: u64, end: u64) -> Result<Vec<u64>, BmmError> {
+        self.rpc
+            .send(
+                RpcRequest::GetBlocks,
+                json!([start, end, {"commitment": "confirmed"}]),
+            )
+            .await
+            .map_err(|source| BmmError::Rpc {
+                call: "getBlocks",
+                source,
+            })
+    }
+
+    async fn block(&self, slot: u64) -> Result<Option<BlockFees>, BmmError> {
+        match self
+            .rpc
+            .send::<serde_json::Value>(
+                RpcRequest::GetBlock,
+                json!([slot, {
+                    "commitment": "confirmed",
+                    "transactionDetails": "none",
+                    "rewards": true,
+                    "maxSupportedTransactionVersion": 0,
+                }]),
+            )
+            .await
+        {
+            // Agave answers null for a block that it does not hold.
+            Ok(serde_json::Value::Null) => Ok(None),
+            Ok(block) => block_fees(slot, &block, &self.treasury).map(Some),
+            Err(source) if block_is_missing(&source) => Ok(None),
+            Err(source) => Err(BmmError::Rpc {
+                call: "getBlock",
+                source,
+            }),
+        }
+    }
 }
 
 fn height_u32(height: u64) -> Result<u32, BmmError> {
@@ -298,8 +723,12 @@ impl Chain for Live {
         read_config(&self.rpc, &self.program_id).await
     }
 
-    async fn treasury(&self) -> Result<u64, BmmError> {
-        treasury_balance(&self.rpc, &self.program_id).await
+    async fn earned_fees(&self) -> Result<Earned, BmmError> {
+        let source = RpcFees {
+            rpc: &self.rpc,
+            treasury: bridge::treasury_pda(&self.program_id).0,
+        };
+        read_fees(&self.fees, &source, METER_DEADLINE).await
     }
 
     async fn recorded_blocks(&self) -> Result<Vec<RecordedBlock>, BmmError> {
@@ -311,6 +740,9 @@ impl Chain for Live {
         tip: (BlockHash, u32),
         height: u64,
     ) -> Result<Option<[u8; 32]>, BmmError> {
+        if !within_walk(u64::from(tip.1), height) {
+            return Ok(None);
+        }
         match self
             .enforcer
             .clone()
@@ -328,6 +760,9 @@ impl Chain for Live {
         tip: (BlockHash, u32),
         height: u64,
     ) -> Result<Option<ActiveBlock>, BmmError> {
+        if !within_walk(u64::from(tip.1), height) {
+            return Ok(None);
+        }
         match self
             .enforcer
             .clone()
@@ -346,28 +781,29 @@ impl Chain for Live {
 }
 
 pub async fn run(settings: Settings, identity: Keypair) -> Result<(), BmmError> {
-    if !(1..=100).contains(&settings.bid_percent) {
-        return Err(BmmError::BadBidPercent(settings.bid_percent));
-    }
-    let live = Arc::new(Live {
-        rpc: Arc::new(RpcClient::new_with_commitment(
-            settings.solana_rpc_url.clone(),
-            CommitmentConfig::confirmed(),
-        )),
-        enforcer: Enforcer::connect(
-            settings.enforcer_url.clone(),
-            u32::from(settings.sidechain_id),
-        )
-        .await?,
-        program_id: settings.program_id,
-    });
-    let memory = Arc::new(Mutex::new(Memory::default()));
     let rules = BidRules {
         payee: identity.pubkey(),
         confirmations: settings.confirmations,
         bid_percent: settings.bid_percent,
         min_bid_sats: settings.min_bid_sats,
+        max_bid_sats: settings.max_bid_sats,
     };
+    rules.check()?;
+    let mut enforcer = Enforcer::connect(
+        settings.enforcer_url.clone(),
+        u32::from(settings.sidechain_id),
+    )
+    .await?;
+    enforcer.check_network(settings.network).await?;
+    let live = Arc::new(Live::new(
+        Arc::new(RpcClient::new_with_commitment(
+            settings.solana_rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        )),
+        enforcer,
+        settings.program_id,
+    ));
+    let memory = Arc::new(Mutex::new(Memory::default()));
     tracing::info!(payee = %rules.payee, no_bid = settings.no_bid, "the BMM loop starts");
     let rounds = rounds(&settings, &identity, &live, &memory, &rules);
     let Some(addr) = settings.rpc_listen else {
@@ -396,55 +832,83 @@ async fn rounds(
     memory: &Mutex<Memory>,
     rules: &BidRules,
 ) -> Result<(), BmmError> {
-    let rpc = &live.rpc;
-    let mut enforcer = live.enforcer.clone();
     let mut last_bid_tip: Option<BlockHash> = None;
+    let mut reads = SettleReads::default();
     loop {
-        let tip = enforcer.tip().await?;
-        let tip_height = u64::from(tip.1);
-        let config = read_config(rpc, &settings.program_id).await?;
-        let gross = treasury_balance(rpc, &settings.program_id)
-            .await?
-            .saturating_add(config.bmm_paid_total);
-        memory.lock().await.observe(tip_height, gross);
-
-        if !settings.no_bid && last_bid_tip != Some(tip.0) {
-            let retry = match bid(live, &mut enforcer, memory, rules, tip).await {
-                // The credits of the branch can catch up before the next
-                // eCash block, so the next round tries the same tip again.
-                Ok(Bid::NoBlock) => true,
-                Ok(_) => false,
-                Err(error) => {
-                    if bid_error_is_fatal(&error) {
-                        return Err(error);
-                    }
-                    // A bid is an offer, not a duty. The loop must keep the
-                    // settles going when the eCash wallet or the enforcer
-                    // refuses one bid.
-                    tracing::warn!(%error, "the bid failed, and the loop goes on");
-                    false
-                }
-            };
-            if !retry {
-                last_bid_tip = Some(tip.0);
+        let result = round(
+            settings,
+            identity,
+            live,
+            memory,
+            rules,
+            &mut last_bid_tip,
+            &mut reads,
+        )
+        .await;
+        if let Err(error) = result {
+            if round_error_is_fatal(&error) {
+                return Err(error);
             }
+            tracing::warn!(%error, "the round failed, and the loop goes on");
         }
-        let pairs = memory.lock().await.pairs_to_publish(
-            config.bmm_next_height,
-            tip_height,
-            settings.confirmations,
-        );
-        // A validator that was away when the loop published gets the pair now.
-        if let Err(error) = publish_pairs(rpc, &pairs).await {
-            tracing::warn!(%error, "the loop cannot publish its pairs");
-        }
-        settle(rpc, &mut enforcer, settings, identity, tip, &config).await?;
-        memory
-            .lock()
-            .await
-            .forget_fees_below(tip_height.saturating_sub(settings.confirmations + 1));
         tokio::time::sleep(settings.interval).await;
     }
+}
+
+async fn round(
+    settings: &Settings,
+    identity: &Keypair,
+    live: &Live,
+    memory: &Mutex<Memory>,
+    rules: &BidRules,
+    last_bid_tip: &mut Option<BlockHash>,
+    reads: &mut SettleReads,
+) -> Result<(), BmmError> {
+    let rpc = &live.rpc;
+    let mut enforcer = live.enforcer.clone();
+    let tip = enforcer.tip().await?;
+    let tip_height = u64::from(tip.1);
+    let config = read_config(rpc, &settings.program_id).await?;
+    match live.earned_fees().await {
+        Ok(earned) => memory.lock().await.observe(tip_height, earned),
+        Err(error) => tracing::warn!(%error, "the loop cannot read the fees of the blocks"),
+    }
+
+    if !settings.no_bid && *last_bid_tip != Some(tip.0) {
+        let retry = match bid(live, &mut enforcer, memory, rules, tip).await {
+            // The credits of the branch can catch up before the next
+            // eCash block, so the next round tries the same tip again.
+            Ok(Bid::NoBlock) => true,
+            Ok(_) => false,
+            Err(error) => {
+                if round_error_is_fatal(&error) {
+                    return Err(error);
+                }
+                // A bid is an offer, not a duty. The loop must keep the
+                // settles going when the eCash wallet or the enforcer
+                // refuses one bid.
+                tracing::warn!(%error, "the bid failed, and the loop goes on");
+                false
+            }
+        };
+        if !retry {
+            *last_bid_tip = Some(tip.0);
+        }
+    }
+    let pairs = memory.lock().await.pairs_to_publish(
+        config.bmm_next_height,
+        tip_height,
+        settings.confirmations,
+    );
+    // A validator that was away when the loop published gets the pair now.
+    if let Err(error) = publish_pairs(rpc, &pairs).await {
+        tracing::warn!(%error, "the loop cannot publish its pairs");
+    }
+    memory
+        .lock()
+        .await
+        .forget_fees_below(tip_height.saturating_sub(settings.confirmations + 1));
+    settle(live, settings, identity, tip, &config, reads).await
 }
 
 /// What one round of the loop did about the bid for the next eCash block.
@@ -564,11 +1028,8 @@ pub async fn template<C: Chain>(
     let fees_sats = match cached {
         Some(fees) => fees,
         None => {
-            let gross = chain
-                .treasury()
-                .await?
-                .saturating_add(config.bmm_paid_total);
-            memory.lock().await.fees_at(tip, gross, rules)
+            let earned = chain.earned_fees().await?;
+            memory.lock().await.fees_at(tip, earned, rules)
         }
     };
     let block = bid_block(chain, tip, height, config.deposit_lag)
@@ -641,10 +1102,13 @@ async fn bid(
     }
 }
 
-/// True when a failed bid must stop the loop. Only the eCash side of a bid
-/// may fail without a stop, because the loop settles without it.
-pub fn bid_error_is_fatal(error: &BmmError) -> bool {
-    !matches!(error, BmmError::Enforcer(_))
+/// True when a failed round must stop the loop. The enforcer and the Solana
+/// rpc may fail for one round, and the next round reads them again.
+pub fn round_error_is_fatal(error: &BmmError) -> bool {
+    !matches!(
+        error,
+        BmmError::Enforcer(_) | BmmError::Rpc { .. } | BmmError::BadBlock { .. }
+    )
 }
 
 /// True when the enforcer refused a bid because its `prev_bytes` names a block
@@ -658,34 +1122,107 @@ pub fn tip_moved(error: &crate::enforcer::EnforcerError) -> bool {
     }
 }
 
+/// The most new enforcer reads of one settle round.
+pub const SETTLE_READS: usize = 16;
+
+/// The active eCash blocks that the settle loop read below one tip.
+#[derive(Debug, Default)]
+pub struct SettleReads {
+    tip: Option<(BlockHash, u32)>,
+    blocks: HashMap<u64, Option<ActiveBlock>>,
+}
+
+/// The heights of `pairs` that a settle at eCash tip `tip_height` can take,
+/// oldest first.
+pub fn settle_heights(
+    pairs: &[Pair],
+    next_height: u64,
+    tip_height: u64,
+    confirmations: u64,
+) -> Vec<u64> {
+    let floor = next_height.max(tip_height.saturating_sub(MAX_WALK));
+    let mut heights: Vec<u64> = pairs
+        .iter()
+        .map(|pair| pair.height)
+        .filter(|&height| height >= floor && settle_is_ready(height, tip_height, confirmations))
+        .collect();
+    heights.sort_unstable();
+    heights.dedup();
+    heights
+}
+
+/// The settles that the pairs allow below `tip`, oldest first: each height
+/// whose active block commits to one of the pairs. It asks the chain for at
+/// most `max_reads` blocks that `reads` does not hold yet.
+pub async fn settle_targets<C: Chain>(
+    chain: &C,
+    tip: (BlockHash, u32),
+    pairs: &[Pair],
+    heights: &[u64],
+    reads: &mut SettleReads,
+    max_reads: usize,
+) -> Result<Vec<(BlockHash, Pair)>, BmmError> {
+    if let Some(old) = reads.tip.filter(|old| *old != tip) {
+        // A tip that extends the old one keeps every read below it. After a
+        // reorg the loop reads again.
+        let extends = old.1 < tip.1
+            && chain
+                .active_block(tip, u64::from(old.1))
+                .await?
+                .is_some_and(|(hash, _)| hash == old.0);
+        if !extends {
+            reads.blocks.clear();
+        }
+    }
+    reads.tip = Some(tip);
+    let mut fresh = 0;
+    let mut targets = Vec::new();
+    for &height in heights {
+        let found = match reads.blocks.get(&height) {
+            Some(found) => *found,
+            None if fresh == max_reads => break,
+            None => {
+                fresh += 1;
+                let found = chain.active_block(tip, height).await?;
+                reads.blocks.insert(height, found);
+                found
+            }
+        };
+        if let Some((block_hash, Some(commitment))) = found {
+            if let Some(pair) = pair_for(pairs, height, &commitment) {
+                targets.push((block_hash, pair));
+            }
+        }
+    }
+    Ok(targets)
+}
+
 /// Settles each commitment with a known pair from the cursor up, in eCash
 /// height order. A commitment without a pair stays unsettled, and a later
 /// settle moves the cursor past it.
 async fn settle(
-    rpc: &RpcClient,
-    enforcer: &mut Enforcer,
+    live: &Live,
     settings: &Settings,
     identity: &Keypair,
     tip: (BlockHash, u32),
     config: &Config,
+    reads: &mut SettleReads,
 ) -> Result<(), BmmError> {
+    let rpc = &live.rpc;
     let tip_height = u64::from(tip.1);
     if !settle_is_ready(config.bmm_next_height, tip_height, settings.confirmations) {
         return Ok(());
     }
     let pairs = fetch_pairs(rpc, config.bmm_next_height).await?;
-    let mut heights: Vec<u64> = pairs.iter().map(|pair| pair.height).collect();
-    heights.dedup();
-    for height in heights {
-        if !settle_is_ready(height, tip_height, settings.confirmations) {
-            break;
-        }
-        let height_u32 = u32::try_from(height).map_err(|_| BmmError::HeightTooLarge(height))?;
-        let (block_hash, commitment) = enforcer.active_block(tip, height_u32).await?;
-        let Some(pair) = commitment.and_then(|commitment| pair_for(&pairs, height, &commitment))
-        else {
-            continue;
-        };
+    let heights = settle_heights(
+        &pairs,
+        config.bmm_next_height,
+        tip_height,
+        settings.confirmations,
+    );
+    let targets = settle_targets(live, tip, &pairs, &heights, reads, SETTLE_READS).await?;
+    for (block_hash, pair) in targets {
+        let height = pair.height;
         let before = read_config(rpc, &settings.program_id).await?.bmm_paid_total;
         let instruction = bridge::settle_bmm_ix(
             &settings.program_id,
@@ -780,18 +1317,18 @@ pub async fn fetch_pairs(rpc: &RpcClient, from_height: u64) -> Result<Vec<Pair>,
             call: "bmmGetPairs",
             source,
         })?;
+    Ok(parse_pairs(list))
+}
+
+/// The pairs of a `bmmGetPairs` answer. Anyone can publish a pair, so a pair
+/// with a bad key drops out and the others stay.
+pub fn parse_pairs(list: Vec<(u64, String, String)>) -> Vec<Pair> {
     list.into_iter()
-        .map(|(height, block, payee)| {
-            let block = block
-                .parse::<Pubkey>()
-                .map_err(|_| BmmError::BadPair(block.clone()))?;
-            let payee = payee
-                .parse::<Pubkey>()
-                .map_err(|_| BmmError::BadPair(payee.clone()))?;
-            Ok(Pair {
+        .filter_map(|(height, block, payee)| {
+            Some(Pair {
                 height,
-                block: block.to_bytes(),
-                payee,
+                block: block.parse::<Pubkey>().ok()?.to_bytes(),
+                payee: payee.parse::<Pubkey>().ok()?,
             })
         })
         .collect()
@@ -820,15 +1357,6 @@ async fn read_config(rpc: &RpcClient, program_id: &Pubkey) -> Result<Config, Bmm
             source,
         })?;
     Ok(Config::decode(&data)?)
-}
-
-async fn treasury_balance(rpc: &RpcClient, program_id: &Pubkey) -> Result<u64, BmmError> {
-    rpc.get_balance(&bridge::treasury_pda(program_id).0)
-        .await
-        .map_err(|source| BmmError::Rpc {
-            call: "getBalance",
-            source,
-        })
 }
 
 async fn send(
@@ -861,14 +1389,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_ecash_bid_failure_does_not_stop_the_loop() {
+    fn an_enforcer_or_rpc_failure_does_not_stop_the_loop() {
         let refused = BmmError::Enforcer(crate::enforcer::EnforcerError::Call {
             call: "CreateBmmCriticalDataTransaction",
             source: tonic::Status::unknown("bad-txns-inputs-missingorspent"),
         });
-        assert!(!bid_error_is_fatal(&refused));
-        assert!(bid_error_is_fatal(&BmmError::BadBidPercent(0)));
-        assert!(bid_error_is_fatal(&BmmError::HeightTooLarge(1)));
+        assert!(!round_error_is_fatal(&refused));
+        let rpc = BmmError::Rpc {
+            call: "getSlot",
+            source: ErrorKind::Custom("the validator restarts".to_owned()).into(),
+        };
+        assert!(!round_error_is_fatal(&rpc));
+        let block = BmmError::BadBlock {
+            slot: 9,
+            reason: "no rewards list",
+        };
+        assert!(!round_error_is_fatal(&block));
+        assert!(round_error_is_fatal(&BmmError::BadBidPercent(0)));
+        assert!(round_error_is_fatal(&BmmError::HeightTooLarge(1)));
     }
 
     #[test]
@@ -956,17 +1494,45 @@ mod tests {
 
     #[test]
     fn a_bid_offers_its_percent_of_one_block_of_fees_in_sats() {
-        assert_eq!(bid_sats(10_000_000, 90, 1), Some(900_000));
+        assert_eq!(bid_sats(10_000_000, 90, 1, u64::MAX), Some(900_000));
     }
 
     #[test]
     fn fees_below_the_minimum_give_no_bid() {
-        assert_eq!(bid_sats(10_000, 90, 1_000), None);
+        assert_eq!(bid_sats(10_000, 90, 1_000, u64::MAX), None);
     }
 
     #[test]
     fn no_fees_give_no_bid() {
-        assert_eq!(bid_sats(0, 100, 0), None);
+        assert_eq!(bid_sats(0, 100, 0, u64::MAX), None);
+    }
+
+    #[test]
+    fn the_max_bid_caps_each_bid() {
+        assert_eq!(bid_sats(10_000_000, 90, 1, 5_000), Some(5_000));
+        assert_eq!(bid_sats(u64::MAX, 100, 1, 5_000), Some(5_000));
+    }
+
+    #[test]
+    fn the_rules_refuse_a_max_bid_that_allows_no_bid() {
+        assert!(rules().check().is_ok());
+        let zero = BidRules {
+            max_bid_sats: 0,
+            min_bid_sats: 0,
+            ..rules()
+        };
+        assert!(matches!(zero.check(), Err(BmmError::BadMaxBid { .. })));
+        let below = BidRules {
+            max_bid_sats: 10,
+            min_bid_sats: 11,
+            ..rules()
+        };
+        assert!(matches!(below.check(), Err(BmmError::BadMaxBid { .. })));
+        let percent = BidRules {
+            bid_percent: 101,
+            ..rules()
+        };
+        assert!(matches!(percent.check(), Err(BmmError::BadBidPercent(101))));
     }
 
     #[test]
@@ -1011,6 +1577,7 @@ mod tests {
             confirmations: 6,
             bid_percent: 50,
             min_bid_sats: 1,
+            max_bid_sats: 1_000_000,
         }
     }
 
@@ -1059,5 +1626,500 @@ mod tests {
         history.forget_below(96);
         assert_eq!(history.income_per_block(103, 1_300, 7), Some(100));
         assert_eq!(history.income_per_block(103, 1_300, 12), None);
+    }
+
+    #[test]
+    fn a_fee_spike_in_one_block_does_not_move_the_median() {
+        let mut history = FeeHistory::default();
+        let mut earned = 0;
+        for height in 100..107 {
+            history.observe(height, earned);
+            earned += if height == 103 { 1_000_000_000 } else { 1_000 };
+        }
+        assert_eq!(history.income_per_block(107, earned, 7), Some(1_000));
+    }
+
+    #[test]
+    fn fees_in_most_blocks_set_the_median() {
+        let mut history = FeeHistory::default();
+        let mut earned = 0;
+        for height in 100..107 {
+            history.observe(height, earned);
+            earned += if height % 2 == 0 { 5_000 } else { 0 };
+        }
+        assert_eq!(history.income_per_block(107, earned, 7), Some(5_000));
+    }
+
+    #[test]
+    fn the_max_bid_caps_the_fees_of_a_tip() {
+        let mut memory = Memory::default();
+        memory.observe(93, 0);
+        let tip = (BlockHash::from_byte_array([1u8; 32]), 100);
+        let rules = BidRules {
+            max_bid_sats: 20_000,
+            ..rules()
+        };
+        assert_eq!(memory.fees_at(tip, 7_000_000, &rules), 20_000);
+    }
+
+    fn treasury() -> Pubkey {
+        Pubkey::new_from_array([5u8; 32])
+    }
+
+    fn a_block_json(rewards: serde_json::Value) -> serde_json::Value {
+        json!({"blockhash": "B", "previousBlockhash": "A", "rewards": rewards})
+    }
+
+    #[test]
+    fn only_a_fee_reward_to_the_treasury_counts() {
+        let block = a_block_json(json!([
+            {"pubkey": treasury().to_string(), "lamports": 7_000, "rewardType": "Fee"},
+            {"pubkey": treasury().to_string(), "lamports": 9_000, "rewardType": "Rent"},
+            {"pubkey": Pubkey::new_from_array([6u8; 32]).to_string(), "lamports": 9_000, "rewardType": "Fee"},
+            {"pubkey": treasury().to_string(), "lamports": 3_000, "rewardType": "Fee"},
+        ]));
+        assert_eq!(
+            block_fees(9, &block, &treasury()).unwrap(),
+            BlockFees {
+                blockhash: "B".to_owned(),
+                previous: "A".to_owned(),
+                fees: 10_000
+            }
+        );
+        assert_eq!(
+            block_fees(9, &a_block_json(json!([])), &treasury())
+                .unwrap()
+                .fees,
+            0
+        );
+    }
+
+    #[test]
+    fn a_block_without_rewards_or_hashes_does_not_decode() {
+        assert!(matches!(
+            block_fees(
+                9,
+                &json!({"blockhash": "B", "previousBlockhash": "A"}),
+                &treasury()
+            ),
+            Err(BmmError::BadBlock { slot: 9, .. })
+        ));
+        assert!(block_fees(9, &json!({"rewards": []}), &treasury()).is_err());
+        let negative = a_block_json(json!([
+            {"pubkey": treasury().to_string(), "lamports": -1, "rewardType": "Fee"},
+        ]));
+        assert!(block_fees(9, &negative, &treasury()).is_err());
+    }
+
+    #[test]
+    fn a_missing_block_is_only_a_missing_block_error() {
+        use solana_rpc_client_api::request::{RpcError, RpcResponseErrorData};
+        let response = |code| {
+            solana_rpc_client_api::client_error::Error::from(ErrorKind::RpcError(
+                RpcError::RpcResponseError {
+                    code,
+                    message: String::new(),
+                    data: RpcResponseErrorData::Empty,
+                },
+            ))
+        };
+        assert!(block_is_missing(&response(-32007)));
+        assert!(block_is_missing(&response(-32004)));
+        assert!(
+            !block_is_missing(&response(-32011)),
+            "no history is a setup error"
+        );
+        assert!(!block_is_missing(
+            &ErrorKind::Custom("refused".to_owned()).into()
+        ));
+    }
+
+    fn fees_block(hash: &str, previous: &str, fees: u64) -> Option<BlockFees> {
+        Some(BlockFees {
+            blockhash: hash.to_owned(),
+            previous: previous.to_owned(),
+            fees,
+        })
+    }
+
+    fn scan(blocks: Vec<(u64, Option<BlockFees>)>, covered: u64) -> MeterScan {
+        MeterScan {
+            blocks,
+            covered: Some(covered),
+        }
+    }
+
+    #[test]
+    fn the_meter_counts_a_chain_of_blocks() {
+        let mut meter = FeeMeter::default();
+        assert!(meter.plan(500).is_none());
+        let ((start, end), mark) = meter.plan(510).unwrap();
+        assert_eq!((start, end), (501, 510));
+        let read = scan(
+            vec![
+                (505, None),
+                (507, fees_block("d", "c", 30)),
+                (509, fees_block("e", "d", 40)),
+            ],
+            510,
+        );
+        assert_eq!(meter.apply(&mark, read, 510).total, 70);
+        let ((start, _), mark) = meter.plan(520).unwrap();
+        assert_eq!(start, 511);
+        let next = scan(vec![(512, fees_block("f", "e", 5))], 520);
+        assert_eq!(
+            meter.apply(&mark, next, 520),
+            Earned {
+                generation: 0,
+                total: 75
+            }
+        );
+    }
+
+    #[test]
+    fn a_block_of_another_branch_starts_a_new_generation() {
+        let mut meter = FeeMeter::default();
+        meter.plan(500);
+        let (_, mark) = meter.plan(510).unwrap();
+        meter.apply(
+            &mark,
+            scan(vec![(508, fees_block("x", "w", 900))], 510),
+            510,
+        );
+        let (_, mark) = meter.plan(520).unwrap();
+        let other = scan(vec![(512, fees_block("y2", "w2", 5))], 520);
+        let earned = meter.apply(&mark, other, 520);
+        assert_eq!(earned.generation, 1);
+        assert_eq!(meter.plan(520), None, "the new generation starts after 520");
+        let (range, _) = meter.plan(530).unwrap();
+        assert_eq!(range, (521, 530));
+    }
+
+    fn after_a_gap(next: Option<BlockFees>) -> Earned {
+        let mut meter = FeeMeter::default();
+        meter.plan(500);
+        let (_, mark) = meter.plan(501).unwrap();
+        meter.apply(
+            &mark,
+            scan(vec![(501, fees_block("h501", "h500", 10))], 501),
+            501,
+        );
+        let (_, mark) = meter.plan(502).unwrap();
+        meter.apply(&mark, scan(vec![(502, None)], 502), 502);
+        let (_, mark) = meter.plan(503).unwrap();
+        meter.apply(&mark, scan(vec![(503, next)], 503), 503)
+    }
+
+    #[test]
+    fn a_block_after_a_missing_parent_starts_a_new_generation() {
+        assert_eq!(after_a_gap(fees_block("x503", "x502", 7)).generation, 1);
+        // The honest case resets too: no read proves that 502 descends from 501.
+        assert_eq!(after_a_gap(fees_block("h503", "h502", 7)).generation, 1);
+    }
+
+    #[tokio::test]
+    async fn a_null_block_is_a_missing_block() {
+        let rpc = RpcClient::new_mock_with_mocks(
+            "succeeds".to_owned(),
+            HashMap::from([(RpcRequest::GetBlock, serde_json::Value::Null)]),
+        );
+        let source = RpcFees {
+            rpc: &rpc,
+            treasury: treasury(),
+        };
+        assert_eq!(source.block(9).await.unwrap(), None);
+    }
+
+    #[test]
+    fn a_rollback_below_the_last_block_starts_a_new_generation() {
+        let mut meter = FeeMeter::default();
+        meter.plan(500);
+        let (_, mark) = meter.plan(510).unwrap();
+        meter.apply(
+            &mark,
+            scan(vec![(509, fees_block("x", "w", 900))], 510),
+            510,
+        );
+        assert_eq!(meter.plan(505), None);
+        assert_eq!(meter.earned().generation, 1);
+        let (range, _) = meter.plan(515).unwrap();
+        assert_eq!(range, (506, 515));
+    }
+
+    #[test]
+    fn a_new_generation_drops_the_fee_history() {
+        let mut memory = Memory::default();
+        memory.observe(93, 0);
+        let tip = (BlockHash::from_byte_array([1u8; 32]), 100);
+        assert_eq!(memory.fees_at(tip, 7_000_000, &rules()), 50_000);
+        let rolled = Earned {
+            generation: 1,
+            total: 7_000_000,
+        };
+        assert_eq!(memory.fees_at(tip, rolled, &rules()), 0);
+        let next = (BlockHash::from_byte_array([2u8; 32]), 101);
+        assert_eq!(memory.fees_at(next, rolled, &rules()), 0);
+    }
+
+    #[test]
+    fn a_stale_read_does_not_apply() {
+        let mut meter = FeeMeter::default();
+        meter.plan(500);
+        let (_, mark) = meter.plan(510).unwrap();
+        let (_, same) = meter.plan(510).unwrap();
+        meter.apply(&mark, scan(vec![(509, fees_block("x", "w", 9))], 510), 510);
+        let late = meter.apply(&same, scan(vec![(509, fees_block("x", "w", 9))], 510), 510);
+        assert_eq!(
+            late.total, 9,
+            "the second read of the same slots counts nothing"
+        );
+    }
+
+    #[test]
+    fn the_meter_reads_a_bounded_range() {
+        let mut meter = FeeMeter::default();
+        meter.plan(0);
+        let ((start, end), mark) = meter.plan(5_000).unwrap();
+        assert_eq!((start, end), (1, METER_SLOTS));
+        meter.apply(&mark, scan(Vec::new(), end), 5_000);
+        let far = 1_000_000;
+        let ((start, end), _) = meter.plan(far).unwrap();
+        assert_eq!(start, far - METER_BACKLOG + 1);
+        assert_eq!(end, start + METER_SLOTS - 1);
+    }
+
+    struct FakeFees {
+        meter: Arc<Mutex<FeeMeter>>,
+        confirmed: u64,
+        blocks: Vec<u64>,
+        fail_at: Option<u64>,
+        slow_at: Option<u64>,
+    }
+
+    impl FeeSource for FakeFees {
+        async fn confirmed_slot(&self) -> Result<u64, BmmError> {
+            Ok(self.confirmed)
+        }
+        async fn blocks(&self, start: u64, end: u64) -> Result<Vec<u64>, BmmError> {
+            Ok(self
+                .blocks
+                .iter()
+                .copied()
+                .filter(|slot| (start..=end).contains(slot))
+                .collect())
+        }
+        async fn block(&self, slot: u64) -> Result<Option<BlockFees>, BmmError> {
+            assert!(
+                self.meter.try_lock().is_ok(),
+                "the read holds the meter lock"
+            );
+            if self.fail_at == Some(slot) {
+                return Err(BmmError::Rpc {
+                    call: "getBlock",
+                    source: ErrorKind::Custom("connection reset".to_owned()).into(),
+                });
+            }
+            if self.slow_at == Some(slot) {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            Ok(fees_block(&slot.to_string(), &(slot - 1).to_string(), 10))
+        }
+    }
+
+    fn fake_fees(fail_at: Option<u64>, slow_at: Option<u64>) -> FakeFees {
+        FakeFees {
+            meter: Arc::new(Mutex::new(FeeMeter::default())),
+            confirmed: 100,
+            blocks: (101..=110).collect(),
+            fail_at,
+            slow_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_stops_the_read_and_keeps_the_blocks_before_it() {
+        let mut source = fake_fees(Some(105), None);
+        let meter = source.meter.clone();
+        read_fees(&meter, &source, METER_DEADLINE).await.unwrap();
+        source.confirmed = 110;
+        assert!(read_fees(&meter, &source, METER_DEADLINE).await.is_err());
+        assert_eq!(meter.lock().await.earned().total, 40);
+        source.fail_at = None;
+        let earned = read_fees(&meter, &source, METER_DEADLINE).await.unwrap();
+        assert_eq!(earned.total, 100);
+        assert_eq!(earned.generation, 0);
+    }
+
+    #[tokio::test]
+    async fn a_slow_read_stops_at_its_deadline() {
+        let mut source = fake_fees(None, Some(103));
+        let meter = source.meter.clone();
+        read_fees(&meter, &source, METER_DEADLINE).await.unwrap();
+        source.confirmed = 110;
+        let started = std::time::Instant::now();
+        assert!(read_fees(&meter, &source, Duration::from_millis(200))
+            .await
+            .is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(meter.lock().await.earned().total, 20);
+    }
+
+    #[test]
+    fn the_walk_stops_at_its_depth() {
+        assert!(within_walk(5_000, 5_000));
+        assert!(within_walk(5_000, 5_000 - MAX_WALK));
+        assert!(!within_walk(5_000, 5_000 - MAX_WALK - 1));
+        assert!(!within_walk(5_000, 0));
+        assert!(!within_walk(5_000, 5_001));
+    }
+
+    fn pair_at(height: u64, block: u8) -> Pair {
+        Pair {
+            height,
+            block: [block; 32],
+            payee: Pubkey::new_from_array([7u8; 32]),
+        }
+    }
+
+    #[test]
+    fn a_settle_takes_ready_heights_inside_the_walk_once() {
+        let pairs = [
+            pair_at(4_000, 1),
+            pair_at(4_000, 2),
+            pair_at(3_500, 1),
+            pair_at(4_993, 1),
+            pair_at(4_994, 1),
+            pair_at(2_000, 1),
+        ];
+        assert_eq!(
+            settle_heights(&pairs, 2_000, 5_000, 6),
+            [3_500, 4_000, 4_993]
+        );
+        assert_eq!(settle_heights(&pairs, 3_600, 5_000, 6), [4_000, 4_993]);
+    }
+
+    #[test]
+    fn a_pair_with_a_bad_key_drops_out() {
+        let good = pair_at(9, 1);
+        let pairs = parse_pairs(vec![
+            (9, "not a key".to_owned(), good.payee.to_string()),
+            (
+                9,
+                Pubkey::new_from_array(good.block).to_string(),
+                good.payee.to_string(),
+            ),
+            (
+                9,
+                Pubkey::new_from_array(good.block).to_string(),
+                "x".to_owned(),
+            ),
+        ]);
+        assert_eq!(pairs, [good]);
+    }
+
+    struct FakeChain {
+        commitments: HashMap<u64, [u8; 32]>,
+        reads: std::sync::Mutex<usize>,
+    }
+
+    impl Chain for FakeChain {
+        async fn tip(&self) -> Result<(BlockHash, u32), BmmError> {
+            unreachable!()
+        }
+        async fn slot_is_active(&self) -> Result<bool, BmmError> {
+            unreachable!()
+        }
+        async fn config(&self) -> Result<Config, BmmError> {
+            unreachable!()
+        }
+        async fn earned_fees(&self) -> Result<Earned, BmmError> {
+            unreachable!()
+        }
+        async fn recorded_blocks(&self) -> Result<Vec<RecordedBlock>, BmmError> {
+            unreachable!()
+        }
+        async fn block_hash_at(
+            &self,
+            _tip: (BlockHash, u32),
+            _height: u64,
+        ) -> Result<Option<[u8; 32]>, BmmError> {
+            unreachable!()
+        }
+        async fn active_block(
+            &self,
+            _tip: (BlockHash, u32),
+            height: u64,
+        ) -> Result<Option<ActiveBlock>, BmmError> {
+            *self.reads.lock().unwrap() += 1;
+            Ok(Some((
+                BlockHash::from_byte_array([height as u8; 32]),
+                self.commitments.get(&height).copied(),
+            )))
+        }
+        async fn publish(&self, _pairs: &[Pair]) -> Result<(), BmmError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn junk_pairs_cost_a_bounded_number_of_reads_per_round() {
+        let won = pair_at(130, 9);
+        let mut pairs: Vec<Pair> = (100..130).map(|height| pair_at(height, 1)).collect();
+        pairs.push(won);
+        let chain = FakeChain {
+            commitments: HashMap::from([(130, won.commitment())]),
+            reads: std::sync::Mutex::new(0),
+        };
+        let tip = (BlockHash::from_byte_array([1u8; 32]), 200);
+        let heights = settle_heights(&pairs, 100, 200, 6);
+        let mut reads = SettleReads::default();
+        let mut found = Vec::new();
+        for _ in 0..3 {
+            found = settle_targets(&chain, tip, &pairs, &heights, &mut reads, 16)
+                .await
+                .unwrap();
+        }
+        assert_eq!(*chain.reads.lock().unwrap(), 31, "each height is read once");
+        assert_eq!(found, [(BlockHash::from_byte_array([130; 32]), won)]);
+
+        let first = settle_targets(&chain, tip, &pairs, &heights, &mut reads, 0)
+            .await
+            .unwrap();
+        assert_eq!(first, found, "the reads of the tip stay");
+        let next = (BlockHash::from_byte_array([2u8; 32]), 201);
+        let fresh = settle_targets(&chain, next, &pairs, &heights, &mut reads, 4)
+            .await
+            .unwrap();
+        assert!(fresh.is_empty(), "a reorg reads again");
+        assert_eq!(*chain.reads.lock().unwrap(), 36);
+    }
+
+    #[tokio::test]
+    async fn a_tip_that_extends_the_old_one_keeps_the_reads() {
+        let won = pair_at(130, 9);
+        let mut pairs: Vec<Pair> = (100..130).map(|height| pair_at(height, 1)).collect();
+        pairs.push(won);
+        let chain = FakeChain {
+            commitments: HashMap::from([(130, won.commitment())]),
+            reads: std::sync::Mutex::new(0),
+        };
+        let mut reads = SettleReads::default();
+        let mut found = Vec::new();
+        for tip_height in 200u32..203 {
+            let tip = (
+                BlockHash::from_byte_array([tip_height as u8; 32]),
+                tip_height,
+            );
+            let heights = settle_heights(&pairs, 100, u64::from(tip_height), 6);
+            found = settle_targets(&chain, tip, &pairs, &heights, &mut reads, 16)
+                .await
+                .unwrap();
+        }
+        assert_eq!(found, [(BlockHash::from_byte_array([130; 32]), won)]);
+        assert_eq!(
+            *chain.reads.lock().unwrap(),
+            31 + 2,
+            "one check per new tip"
+        );
     }
 }

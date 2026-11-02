@@ -319,8 +319,8 @@ mod tests {
         tip: (BlockHash, u32),
         slot_active: bool,
         config: Config,
-        treasury: u64,
-        treasury_reads: usize,
+        earned: u64,
+        earned_reads: usize,
         recorded: Vec<RecordedBlock>,
         blocks: BTreeMap<u64, (BlockHash, Option<[u8; 32]>)>,
         published: Vec<Pair>,
@@ -347,10 +347,10 @@ mod tests {
             Ok(self.with(|fake| fake.config))
         }
 
-        async fn treasury(&self) -> Result<u64, BmmError> {
+        async fn earned_fees(&self) -> Result<bmm::Earned, BmmError> {
             Ok(self.with(|fake| {
-                fake.treasury_reads += 1;
-                fake.treasury
+                fake.earned_reads += 1;
+                fake.earned.into()
             }))
         }
 
@@ -448,8 +448,8 @@ mod tests {
                 tip: (ecash_hash(TIP_HEIGHT as u8), TIP_HEIGHT),
                 slot_active: true,
                 config: config(90),
-                treasury: 0,
-                treasury_reads: 0,
+                earned: 0,
+                earned_reads: 0,
                 recorded: vec![recorded(BANK, 98)],
                 blocks,
                 published: Vec::new(),
@@ -460,6 +460,7 @@ mod tests {
                 confirmations: 6,
                 bid_percent: 50,
                 min_bid_sats: 1,
+                max_bid_sats: 1_000_000,
             },
             sidechain_id: 8,
         }
@@ -542,19 +543,23 @@ mod tests {
     async fn the_fees_stay_the_same_for_the_whole_tip() {
         let server = server();
         server.memory.lock().await.observe(93, 0);
-        server.chain.with(|fake| fake.treasury = 7_000_000);
+        server.chain.with(|fake| fake.earned = 7_000_000);
         let first = server.get_block_template().await.unwrap();
         assert_eq!(first["fees_sats"], json!(50_000));
 
-        server.chain.with(|fake| fake.treasury = 70_000_000);
+        server.chain.with(|fake| fake.earned = 70_000_000);
         let again = server.get_block_template().await.unwrap();
         assert_eq!(again["fees_sats"], json!(50_000));
-        assert_eq!(server.chain.with(|fake| fake.treasury_reads), 1);
+        assert_eq!(server.chain.with(|fake| fake.earned_reads), 1);
 
         mine(&server, None);
         let next = server.get_block_template().await.unwrap();
-        assert_ne!(next["fees_sats"], json!(50_000));
-        assert_eq!(server.chain.with(|fake| fake.treasury_reads), 2);
+        assert_eq!(
+            next["fees_sats"],
+            json!(50_000),
+            "one high block keeps the median"
+        );
+        assert_eq!(server.chain.with(|fake| fake.earned_reads), 2);
     }
 
     #[tokio::test]
