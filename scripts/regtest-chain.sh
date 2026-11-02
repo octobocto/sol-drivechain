@@ -200,11 +200,12 @@ up() {
 
   echo "== the Solana chain"
   if [ ! -d "$ROOT/ledger" ]; then
-    LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$(btc getblockcount)" BUNDLE_MIN_SLOTS=0 \
+    NETWORK=regtest LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" \
+      ECASH_START_HEIGHT="$(btc getblockcount)" BUNDLE_MIN_SLOTS=0 \
       bash "$REPO/genesis/build-genesis.sh" >/dev/null
   fi
   start_process validator env \
-    LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
+    NETWORK=regtest LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
     GOSSIP_PORT="$SOLANA_GOSSIP_PORT" DYNAMIC_PORT_RANGE="$DYNAMIC_PORT_RANGE" \
     XDP=0 RPC_BIND_ADDRESS="$SOLANA_RPC_BIND_ADDRESS" \
     ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
@@ -218,10 +219,11 @@ up() {
   start_process peg "$D" run --network regtest --enforcer-url "$ENFORCER_URL" \
     --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$(program_id)" \
     --oracle "$ROOT/keys/oracle.json" --bundle-interval-secs 10
-  start_process bmm "$D" bmm --enforcer-url "$ENFORCER_URL" \
+  start_process bmm "$D" bmm --network regtest --enforcer-url "$ENFORCER_URL" \
     --solana-rpc-url "$SOLANA_URL" --slot "$SLOT" --program-id "$(program_id)" \
     --identity "$ROOT/keys/validator-identity.json" \
-    --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --interval-secs 2
+    --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --max-bid-sats 100000000 \
+    --interval-secs 2
   start_process miner bash "$0" mine-loop
 
   echo "== the faucet"

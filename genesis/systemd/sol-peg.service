@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=root
 Environment=HOME=/root
-Environment=PEG_NETWORK=betanet
+Environment=PEG_NETWORK=ecash
 Environment=PEG_SLOT=8
 Environment=ENFORCER_URL=http://127.0.0.1:50051
 Environment=SOLANA_RPC_URL=http://127.0.0.1:8899

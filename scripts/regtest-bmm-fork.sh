@@ -126,7 +126,7 @@ wait_credited() {
 start_credit() {
   local node=$1
   in_ns "$(ns_of "$node")" bash -c 'while true; do
-      "$0" credit --enforcer-url "$1" --solana-rpc-url "$2" --slot "$3" \
+      "$0" credit --network regtest --enforcer-url "$1" --solana-rpc-url "$2" --slot "$3" \
         --program-id "$4" --payer "$5"
       sleep 2
     done' "$D" "http://$(enforcer_of "$node"):$GRPC_PORT" "$(url_of "$node")" "$SLOT" \
@@ -369,7 +369,7 @@ start_validator() {
     ip netns exec "$ns" env \
       LEDGER="$ledger" KEYS="$keys" RPC_PORT="$SOLANA_RPC_PORT" GOSSIP_PORT=8001 \
       XDP=0 BIND_ADDRESS="$ip" RPC_BIND_ADDRESS="$ip" ALLOW_PRIVATE_ADDR=1 NO_SNAPSHOT_FETCH=1 \
-      ENFORCER_URL="http://$enforcer:$GRPC_PORT" SIDECHAIN_SLOT="$SLOT" \
+      NETWORK=regtest ENFORCER_URL="http://$enforcer:$GRPC_PORT" SIDECHAIN_SLOT="$SLOT" \
       BMM_ROOT_DEPTH="$K" BMM_FALLBACK_BLOCKS="$L" BMM_CONFIRMATIONS="$N" \
       FULL_SNAPSHOT_INTERVAL_SLOTS=100 INCREMENTAL_SNAPSHOT_INTERVAL_SLOTS=50 \
       FULL_SNAPSHOTS_TO_RETAIN=100 \
