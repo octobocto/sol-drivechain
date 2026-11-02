@@ -180,7 +180,7 @@ enum Command {
         /// Reads the branch that the validator follows, not the confirmed one.
         #[arg(long)]
         processed: bool,
-        /// Prints both balance equations with each term, and fails when one
+        /// Prints the balance equations with each term, and fails when one
         /// does not hold. It reads eCash from the enforcer.
         #[arg(long, requires = "slot")]
         books: bool,
@@ -188,9 +188,17 @@ enum Command {
         enforcer_url: String,
         #[arg(long)]
         slot: Option<u8>,
-        /// The supply of the chain, which the genesis put in the vault.
-        #[arg(long, default_value_t = 21_000_000)]
-        supply_sol: u64,
+    },
+    /// Sends the lamports to the vault that the genesis float still needs, so
+    /// withdrawals open.
+    BackFloat {
+        #[arg(long, default_value = "http://127.0.0.1:8899")]
+        solana_rpc_url: String,
+        #[arg(long)]
+        program_id: String,
+        /// The keypair that pays the gift.
+        #[arg(long)]
+        payer: PathBuf,
     },
     /// Reads the state of a halted chain into a file for the genesis of its
     /// successor: the system balances, the withdrawal records, and the deposit
@@ -201,11 +209,6 @@ enum Command {
         solana_rpc_url: String,
         #[arg(long)]
         program_id: String,
-        /// The enforcer finds the cursor of a chain from the oracle era.
-        #[arg(long)]
-        enforcer_url: Option<String>,
-        #[arg(long, requires = "enforcer_url")]
-        slot: Option<u8>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -279,12 +282,22 @@ enum Command {
         /// The supply of the chain. The vault holds it at the start.
         #[arg(long, default_value_t = 21_000_000)]
         vault_sol: u64,
-        /// The key that marks a withdrawal paid.
+        /// The key that seals a bundle and marks it paid.
         #[arg(long)]
         oracle: String,
-        /// The SOL that the oracle gets to pay its tx fees.
-        #[arg(long, default_value_t = 1)]
-        oracle_sol: u64,
+        /// The lamports that the oracle of a new chain gets to pay its tx fees.
+        #[arg(long)]
+        oracle_lamports: u64,
+        /// The spendable lamports that `solana-genesis` adds and no deposit
+        /// backs: the identity, the vote and stake accounts, and the faucet.
+        #[arg(long)]
+        float_lamports: u64,
+        /// The fewest slots between a bundle seal and its `bundle_paid`.
+        #[arg(long)]
+        bundle_min_slots: u64,
+        /// The DEX accounts file. A carried account of the same key wins.
+        #[arg(long)]
+        dex_accounts: Option<PathBuf>,
         /// The rent of the genesis. Each account gets its rent-exempt minimum.
         #[arg(long)]
         lamports_per_byte_year: u64,
@@ -510,6 +523,8 @@ enum CliError {
     Books(#[from] books::BooksError),
     #[error("the books do not close")]
     BooksOpen,
+    #[error("the vault holds less than the supply less the pegged lamports, so no gift is safe")]
+    VaultShort,
     #[error("the state file `{path}` is not valid")]
     BadState {
         path: PathBuf,
@@ -777,7 +792,6 @@ fn main() -> Result<(), CliError> {
             books,
             enforcer_url,
             slot,
-            supply_sol,
         } => {
             let program_id = parse_pubkey(&program_id)?;
             let commitment = if processed {
@@ -831,13 +845,25 @@ fn main() -> Result<(), CliError> {
             println!("stranded lamports {}", config.stranded_lamports);
             println!("deposit confirmations {}", config.deposit_confirmations);
             println!("deposit lag       {}", config.deposit_lag);
+            println!("vault supply      {}", config.vault_supply);
+            println!("float lamports    {}", config.float_lamports);
+            println!(
+                "float backed      {}",
+                if config.float_backed(vault) {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            println!("paid through      {}", config.paid_through);
+            println!("bundled through   {}", config.bundled_through);
+            println!("bundle sealed at  {}", config.bundle_sealed_height);
+            println!("bundle sealed slot {}", config.bundle_sealed_slot);
+            println!("bundle min slots  {}", config.bundle_min_slots);
             if !books {
                 return Ok(());
             }
             let slot = slot.ok_or(CliError::NoSlot)?;
-            let supply = supply_sol
-                .checked_mul(LAMPORTS_PER_SOL)
-                .ok_or(CliError::VaultTooLarge(supply_sol))?;
             let books = runtime.block_on(async {
                 let rpc =
                     solana_rpc_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
@@ -845,31 +871,61 @@ fn main() -> Result<(), CliError> {
                         commitment,
                     );
                 let mut enforcer = Enforcer::connect(enforcer_url, u32::from(slot)).await?;
-                Ok::<_, CliError>(books::read(&rpc, &mut enforcer, &program_id, supply).await?)
+                Ok::<_, CliError>(books::read(&rpc, &mut enforcer, &program_id, commitment).await?)
             })?;
             print!("{}", books.report());
-            if books.vault_holds() && books.treasury_holds() {
+            if books.hold() {
                 Ok(())
             } else {
                 Err(CliError::BooksOpen)
             }
         }
+        Command::BackFloat {
+            solana_rpc_url,
+            program_id,
+            payer,
+        } => {
+            let program_id = parse_pubkey(&program_id)?;
+            let payer_key = read_keypair_file(&payer).map_err(|_| CliError::NoIdentityKey {
+                path: payer.clone(),
+            })?;
+            let vault_key = bridge::vault_pda(&program_id).0;
+            let (config, vault) = runtime.block_on(async {
+                let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(
+                    solana_rpc_url.clone(),
+                );
+                peg::config_and_vault(
+                    &rpc,
+                    &program_id,
+                    solana_commitment_config::CommitmentConfig::processed(),
+                )
+                .await
+            })?;
+            let gift = float_shortfall(&config, vault).ok_or(CliError::VaultShort)?;
+            if gift == 0 {
+                println!("the float is backed, and withdrawals are open");
+                return Ok(());
+            }
+            let instruction = bridge::transfer_ix(&payer_key.pubkey(), &vault_key, gift);
+            send_one(
+                &blocking_rpc(&solana_rpc_url),
+                &payer_key,
+                instruction,
+                "transfer",
+            )?;
+            println!("sent {gift} lamports to the vault, and withdrawals are open");
+            Ok(())
+        }
         Command::MigrateState {
             solana_rpc_url,
             program_id,
-            enforcer_url,
-            slot,
             out,
         } => {
             let program_id = parse_pubkey(&program_id)?;
             let state = runtime.block_on(async {
                 let rpc =
                     solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
-                let mut enforcer = match (enforcer_url, slot) {
-                    (Some(url), Some(slot)) => Some(Enforcer::connect(url, u32::from(slot)).await?),
-                    _ => None,
-                };
-                Ok::<_, CliError>(migrate::export(&rpc, &program_id, enforcer.as_mut()).await?)
+                Ok::<_, CliError>(migrate::export(&rpc, &program_id).await?)
             })?;
             let body =
                 serde_json::to_string_pretty(&state).map_err(|source| CliError::BadState {
@@ -883,7 +939,7 @@ fn main() -> Result<(), CliError> {
             let copied: u64 = state
                 .balances
                 .values()
-                .chain(state.records.iter().map(|record| &record.lamports))
+                .chain(state.accounts.iter().map(|account| &account.lamports))
                 .fold(0, |sum, lamports| sum.saturating_add(*lamports));
             println!("slot              {}", state.slot);
             println!("pegged lamports   {}", state.cursor.pegged_lamports);
@@ -895,11 +951,19 @@ fn main() -> Result<(), CliError> {
             println!("credit index      {}", state.cursor.credit_index);
             println!("deposit high water {}", state.cursor.deposit_high_water);
             println!("withdrawals       {}", state.cursor.withdrawal_count);
-            println!("open withdrawals  {}", state.records.len());
+            println!(
+                "open withdrawals  {}",
+                state
+                    .cursor
+                    .withdrawal_count
+                    .saturating_sub(state.cursor.paid_through)
+            );
+            println!("carried accounts  {}", state.accounts.len());
             println!("system accounts   {}", state.balances.len());
             println!(
-                "copied lamports   {copied} of a supply of {}",
-                state.supply_lamports
+                "copied lamports   {copied}, and {} in programs and sysvars that the genesis \
+                 makes again, of a supply of {}",
+                state.fixed_lamports, state.supply_lamports
             );
             println!("the state is in {}", out.display());
             Ok(())
@@ -959,12 +1023,7 @@ fn main() -> Result<(), CliError> {
             let keypair = seed::keypair_from_mnemonic(&phrase, "", account)?;
             let body = serde_json::to_string(&seed::keypair_file_bytes(&keypair))
                 .expect("a byte array always serializes");
-            std::fs::write(&out, body).map_err(|source| CliError::Write {
-                path: out.clone(),
-                source,
-            })?;
-            let readable = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&out, readable).map_err(|source| CliError::Write {
+            write_secret(&out, body.as_bytes()).map_err(|source| CliError::Write {
                 path: out.clone(),
                 source,
             })?;
@@ -995,7 +1054,10 @@ fn main() -> Result<(), CliError> {
             program_id,
             vault_sol,
             oracle,
-            oracle_sol,
+            oracle_lamports,
+            float_lamports,
+            bundle_min_slots,
+            dex_accounts,
             lamports_per_byte_year,
             ecash_start_height,
             deposit_confirmations,
@@ -1009,16 +1071,26 @@ fn main() -> Result<(), CliError> {
                     .checked_mul(LAMPORTS_PER_SOL)
                     .ok_or(CliError::VaultTooLarge(vault_sol))?,
                 oracle: parse_pubkey(&oracle)?,
-                oracle_lamports: oracle_sol
-                    .checked_mul(LAMPORTS_PER_SOL)
-                    .ok_or(CliError::VaultTooLarge(oracle_sol))?,
+                oracle_lamports,
+                float_lamports,
+                bundle_min_slots,
                 lamports_per_byte_year,
                 ecash_start_height,
                 deposit_confirmations,
                 deposit_lag,
             };
             let state = state.as_ref().map(read_state).transpose()?;
-            let accounts = genesis::accounts(&params, state.as_ref())?;
+            let extra = match &dex_accounts {
+                Some(path) => {
+                    let text = std::fs::read_to_string(path).map_err(|source| CliError::Read {
+                        path: path.clone(),
+                        source,
+                    })?;
+                    genesis::parse_yaml(&text)?
+                }
+                None => Vec::new(),
+            };
+            let accounts = genesis::accounts(&params, state.as_ref(), &extra)?;
             std::fs::write(&out, genesis::yaml(&accounts)).map_err(|source| CliError::Write {
                 path: out.clone(),
                 source,
@@ -1045,10 +1117,10 @@ fn main() -> Result<(), CliError> {
             }
             if let Some(state) = &state {
                 println!(
-                    "the state of slot {} adds {} balances and {} withdrawal records",
+                    "the state of slot {} adds {} balances and {} carried accounts",
                     state.slot,
                     state.balances.len(),
-                    state.records.len()
+                    state.accounts.len()
                 );
             }
             println!(
@@ -1303,6 +1375,29 @@ fn send_one(
     rpc.send_and_confirm_transaction(&transaction)
         .map_err(|source| CliError::Rpc { call, source })?;
     Ok(())
+}
+
+/// The lamports that a gift to the vault must add to back the float, read
+/// from one bank. `None` when the vault holds less than the books allow.
+fn float_shortfall(config: &bridge::Config, vault: u64) -> Option<u64> {
+    let gifts = config.vault_surplus(vault)?;
+    Some(config.float_lamports.saturating_sub(gifts))
+}
+
+/// Writes a secret file that only the owner reads. The file must be new, and
+/// it has mode 600 before the first byte lands.
+fn write_secret(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(body)?;
+    file.sync_all()
 }
 
 /// Reads a seed phrase out of a file, and keeps it out of the process list.
@@ -1566,5 +1661,85 @@ mod tests {
         assert_eq!(network, PegNetwork::Regtest);
         assert_eq!(slot, 8);
         assert_eq!(bundle_interval_secs, 30);
+    }
+
+    fn a_config(pegged_lamports: u64, float_lamports: u64) -> bridge::Config {
+        bridge::Config {
+            oracle: Pubkey::default(),
+            deposit_high_water: 0,
+            pegged_lamports,
+            withdrawal_count: 0,
+            bmm_next_height: 0,
+            bmm_paid_total: 0,
+            deposit_confirmations: 6,
+            deposit_lag: 100,
+            credited_height: 0,
+            credited_block: [0u8; 32],
+            credit_index: 0,
+            credit_part_block: [0u8; 32],
+            stranded_lamports: 0,
+            bump: 0,
+            vault_bump: 0,
+            treasury_bump: 0,
+            vault_supply: 1_000_000,
+            float_lamports,
+            paid_through: 0,
+            bundled_through: 0,
+            bundle_sealed_height: 0,
+            bundle_sealed_slot: 0,
+            bundle_min_slots: 0,
+        }
+    }
+
+    #[test]
+    fn the_shortfall_is_the_float_less_the_gifts() {
+        let config = a_config(400_000, 5_000);
+        assert_eq!(float_shortfall(&config, 600_000), Some(5_000));
+        assert_eq!(float_shortfall(&config, 603_000), Some(2_000));
+        assert_eq!(float_shortfall(&config, 605_000), Some(0));
+        assert_eq!(float_shortfall(&config, 700_000), Some(0));
+        assert!(config.float_backed(600_000 + 5_000));
+    }
+
+    #[test]
+    fn a_credit_between_two_reads_gives_no_extra_gift() {
+        // A credit moves lamports from the vault to pegged in one bank, so
+        // the shortfall of one bank stays the same.
+        let before = a_config(400_000, 5_000);
+        let mut after = before;
+        after.pegged_lamports += 30_000;
+        assert_eq!(float_shortfall(&before, 600_000), Some(5_000));
+        assert_eq!(float_shortfall(&after, 570_000), Some(5_000));
+        // The config of the old bank and the vault of the new one look short,
+        // so no gift goes out.
+        assert_eq!(float_shortfall(&before, 570_000), None);
+    }
+
+    fn a_temp_path(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sol-drivechain-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.json");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn a_secret_file_lands_with_mode_600() {
+        let path = a_temp_path("mode");
+        write_secret(&path, b"[1,2,3]").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"[1,2,3]");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_secret_file_never_replaces_a_file() {
+        let path = a_temp_path("exists");
+        std::fs::write(&path, b"keep").unwrap();
+        assert!(write_secret(&path, b"[1,2,3]").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        std::fs::remove_file(&path).unwrap();
     }
 }

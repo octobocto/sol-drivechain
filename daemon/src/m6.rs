@@ -18,7 +18,15 @@ pub enum M6Error {
     ZeroPayout,
     #[error("the total payout overflows a u64")]
     PayoutOverflow,
+    #[error("the bundle weighs {0} weight units, above the limit of {MAX_BLINDED_WEIGHT}")]
+    TooHeavy(usize),
+    #[error("the first record {0} of the bundle does not fit the lock time")]
+    FirstRecordTooLarge(u64),
 }
+
+/// The heaviest blinded M6 that the daemon proposes, in weight units. The
+/// finalized M6 adds the treasury inputs, and a standard tx stays below 400,000.
+pub const MAX_BLINDED_WEIGHT: usize = 300_000;
 
 /// Builds the blinded M6 transaction for a withdrawal bundle.
 ///
@@ -49,12 +57,18 @@ pub fn build_blinded_m6(fee_sats: u64, payouts: &[Payout]) -> Result<Transaction
         });
     }
 
-    Ok(Transaction {
+    let blinded = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: Vec::new(),
         output,
-    })
+    };
+    // Each byte of a blinded M6 is non-witness data, so it weighs four units.
+    let weight = serialize_legacy(&blinded).len() * 4;
+    if weight > MAX_BLINDED_WEIGHT {
+        return Err(M6Error::TooHeavy(weight));
+    }
+    Ok(blinded)
 }
 
 /// The M6ID is the txid of the blinded transaction.
@@ -189,6 +203,25 @@ mod tests {
         let payouts = [a_payout(u64::MAX), a_payout(1)];
         let error = build_blinded_m6(1_000, &payouts).unwrap_err();
         assert!(matches!(error, M6Error::PayoutOverflow));
+    }
+
+    #[test]
+    fn a_bundle_of_the_record_cap_with_the_longest_scripts_fits_the_weight() {
+        let longest = Payout {
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 34]),
+            sats: 1_000,
+        };
+        let cap = usize::try_from(crate::bridge::MAX_BUNDLE_RECORDS).unwrap();
+        let payouts = vec![longest; cap];
+        let tx = build_blinded_m6(1_000, &payouts).unwrap();
+        assert!(serialize_legacy(&tx).len() * 4 <= MAX_BLINDED_WEIGHT);
+    }
+
+    #[test]
+    fn a_bundle_above_the_weight_limit_fails() {
+        let payouts = vec![a_payout(1_000); 7_000];
+        let error = build_blinded_m6(1_000, &payouts).unwrap_err();
+        assert!(matches!(error, M6Error::TooHeavy(_)));
     }
 
     #[test]

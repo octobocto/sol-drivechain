@@ -419,6 +419,13 @@ mod tests {
             bump: 0,
             vault_bump: 0,
             treasury_bump: 0,
+            vault_supply: 0,
+            float_lamports: 0,
+            paid_through: 0,
+            bundled_through: 0,
+            bundle_sealed_height: 0,
+            bundle_sealed_slot: 0,
+            bundle_min_slots: 0,
         }
     }
 

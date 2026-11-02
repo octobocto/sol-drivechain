@@ -1,10 +1,14 @@
 //! Reads the state of a halted chain for the genesis of its successor: the
-//! system balances, the withdrawal records, and the deposit cursor.
+//! system balances, every account that carries over byte for byte, and the
+//! cursor of the bridge.
+//!
+//! No lamport of a user stays behind. A stake or vote account turns into
+//! plain lamports for its withdrawer, and an account that no rule carries
+//! stops the export.
 
 use std::collections::BTreeMap;
 
 use base64::Engine as _;
-use bitcoin::hashes::Hash as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use solana_commitment_config::CommitmentConfig;
@@ -12,10 +16,7 @@ use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_api::request::RpcRequest;
 use solana_sdk::pubkey::Pubkey;
 
-use crate::{
-    bridge::{self, Config, OracleEraConfig, WithdrawalRecord},
-    enforcer::{Enforcer, PegEvent},
-};
+use crate::bridge::{self, Config, WithdrawalRecord};
 
 /// The state of a halted chain at one slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,12 +24,17 @@ pub struct State {
     pub slot: u64,
     pub cursor: Cursor,
     /// The lamports of each system account without data, the vault and the
-    /// treasury too.
+    /// treasury too, plus the lamports of each stake and vote account that
+    /// names it as withdrawer.
     pub balances: BTreeMap<String, u64>,
-    pub records: Vec<RecordAccount>,
-    /// The total supply of the old chain. The gap to the copied lamports is
-    /// in vote, stake, token, and program accounts, which stay behind.
+    /// The accounts that carry over byte for byte: the withdrawal records,
+    /// the nonce accounts, and the token and DEX accounts.
+    pub accounts: Vec<CarriedAccount>,
+    /// The total supply of the old chain.
     pub supply_lamports: u64,
+    /// The lamports of the programs, the sysvars, and the other accounts that
+    /// the new genesis makes again. Nobody can spend them.
+    pub fixed_lamports: u64,
 }
 
 /// The counters of the bridge config that carry over.
@@ -47,16 +53,60 @@ pub struct Cursor {
     #[serde(default)]
     pub credit_part_block: [u8; 32],
     pub stranded_lamports: u64,
+    pub vault_supply: u64,
+    pub float_lamports: u64,
+    pub paid_through: u64,
+    pub bundled_through: u64,
+    pub bundle_sealed_height: u64,
 }
 
-/// One open withdrawal record, as the old chain holds it.
+/// One account that carries over byte for byte.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordAccount {
+pub struct CarriedAccount {
     pub pubkey: String,
     pub lamports: u64,
+    pub owner: String,
     /// The account data in base64.
     pub data: String,
 }
+
+/// What the export does with the accounts of one owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rule {
+    /// Carry each account byte for byte.
+    Carry,
+    /// Give the lamports to the withdrawer of a stake account.
+    StakeToWithdrawer,
+    /// Give the lamports to the withdrawer of a vote account.
+    VoteToWithdrawer,
+    /// The new genesis makes these accounts again, and nobody can spend them.
+    Fixed,
+    /// The export cannot carry these accounts, so one with lamports stops it.
+    Refuse,
+}
+
+const OWNER_RULES: &[(&str, Rule)] = &[
+    (
+        "Stake11111111111111111111111111111111111111",
+        Rule::StakeToWithdrawer,
+    ),
+    (
+        "Vote111111111111111111111111111111111111111",
+        Rule::VoteToWithdrawer,
+    ),
+    ("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", Rule::Carry),
+    ("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C", Rule::Carry),
+    ("Sysvar1111111111111111111111111111111111111", Rule::Fixed),
+    ("NativeLoader1111111111111111111111111111111", Rule::Fixed),
+    ("BPFLoader2111111111111111111111111111111111", Rule::Fixed),
+    ("BPFLoader1111111111111111111111111111111111", Rule::Fixed),
+    ("Feature111111111111111111111111111111111111", Rule::Fixed),
+    ("Config1111111111111111111111111111111111111", Rule::Fixed),
+    ("BPFLoaderUpgradeab1e11111111111111111111111", Rule::Refuse),
+    ("LoaderV411111111111111111111111111111111111", Rule::Refuse),
+    ("AddressLookupTab1e1111111111111111111111111", Rule::Refuse),
+    ("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", Rule::Refuse),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrateError {
@@ -77,25 +127,29 @@ pub enum MigrateError {
     NoConfig,
     #[error(transparent)]
     Bridge(#[from] bridge::BridgeError),
-    #[error(transparent)]
-    Enforcer(#[from] crate::enforcer::EnforcerError),
     #[error(
-        "the config is from the oracle era, so the daemon needs the enforcer to find the cursor"
+        "account {pubkey} of {owner} holds {lamports} lamports that the migration cannot carry"
     )]
-    NoEnforcer,
-    #[error("the oracle credited no deposit, so no eCash height marks the cursor")]
-    NoDepositCredited,
-    #[error("no eCash block on the active chain holds deposit {0}")]
-    NoBlockForDeposit(u64),
-    #[error(
-        "eCash block {height} holds deposit {credited} that the oracle credited and deposit \
-         {open} that it did not"
-    )]
-    SplitBlock {
-        height: u32,
-        credited: u64,
-        open: u64,
+    CannotCarry {
+        pubkey: Pubkey,
+        owner: Pubkey,
+        lamports: u64,
     },
+    #[error("the {kind} account {pubkey} names no withdrawer that the migration can read")]
+    NoWithdrawer { kind: &'static str, pubkey: Pubkey },
+    #[error(
+        "withdrawer {0} holds data, so it cannot take the lamports of a stake or vote account"
+    )]
+    WithdrawerHoldsData(Pubkey),
+    #[error(
+        "the supply is {supply} lamports, and the accounts that the migration reads hold \
+         {found}. Accounts of another program hold the rest, so the migration stops"
+    )]
+    Uncarried { supply: u64, found: u64 },
+    #[error("the lamports overflow a u64")]
+    Overflow,
+    #[error("the bridge holds account {0}, which is no withdrawal record")]
+    NotARecord(Pubkey),
 }
 
 /// One account of a `getProgramAccounts` answer.
@@ -106,24 +160,29 @@ struct RawAccount {
 }
 
 /// Reads the state of a halted chain. Every read must see the same slot.
-pub async fn export(
-    rpc: &RpcClient,
-    program_id: &Pubkey,
-    enforcer: Option<&mut Enforcer>,
-) -> Result<State, MigrateError> {
+pub async fn export(rpc: &RpcClient, program_id: &Pubkey) -> Result<State, MigrateError> {
     let first = slot(rpc).await?;
-    let (bridge_slot, bridge_accounts) = program_accounts(rpc, program_id, None).await?;
-    let (system_slot, system_accounts) =
-        program_accounts(rpc, &bridge::SYSTEM_PROGRAM_ID, Some(0)).await?;
-    let (supply_slot, supply_lamports) = supply(rpc).await?;
-    let last = slot(rpc).await?;
-    if [bridge_slot, system_slot, supply_slot, last]
-        .iter()
-        .any(|seen| *seen != first)
-    {
+    let mut slots = Vec::new();
+    let (seen, bridge_accounts) = program_accounts(rpc, program_id).await?;
+    slots.push(seen);
+    let (seen, system_accounts) = program_accounts(rpc, &bridge::SYSTEM_PROGRAM_ID).await?;
+    slots.push(seen);
+    let mut owned = Vec::new();
+    for (owner, rule) in OWNER_RULES {
+        let owner: Pubkey = owner
+            .parse()
+            .map_err(|_| MigrateError::BadAnswer("owner"))?;
+        let (seen, accounts) = program_accounts(rpc, &owner).await?;
+        slots.push(seen);
+        owned.push((owner, *rule, accounts));
+    }
+    let (seen, supply_lamports) = supply(rpc).await?;
+    slots.push(seen);
+    slots.push(slot(rpc).await?);
+    if slots.iter().any(|seen| *seen != first) {
         return Err(MigrateError::NotHalted {
             first,
-            last: bridge_slot.max(system_slot).max(supply_slot).max(last),
+            last: slots.into_iter().max().unwrap_or(first),
         });
     }
 
@@ -132,111 +191,189 @@ pub async fn export(
         .iter()
         .find(|account| account.pubkey == config_key)
         .ok_or(MigrateError::NoConfig)?;
-    let cursor = match Config::decode(&config.data) {
-        Ok(config) => Cursor {
-            pegged_lamports: config.pegged_lamports,
-            deposit_high_water: config.deposit_high_water,
-            withdrawal_count: config.withdrawal_count,
-            bmm_next_height: config.bmm_next_height,
-            bmm_paid_total: config.bmm_paid_total,
-            credited_height: config.credited_height,
-            credited_block: config.credited_block,
-            credit_index: config.credit_index,
-            credit_part_block: config.credit_part_block,
-            stranded_lamports: config.stranded_lamports,
-        },
-        Err(_) => {
-            let old = OracleEraConfig::decode(&config.data)?;
-            let enforcer = enforcer.ok_or(MigrateError::NoEnforcer)?;
-            let tip = enforcer.tip().await?;
-            let events = enforcer.two_way_peg_data(None, tip.0).await?;
-            let (credited_height, credited_block) =
-                oracle_era_cursor(&events, old.deposit_high_water)?;
-            Cursor {
-                pegged_lamports: old.pegged_lamports,
-                deposit_high_water: old.deposit_high_water,
-                withdrawal_count: old.withdrawal_count,
-                bmm_next_height: old.bmm_next_height,
-                bmm_paid_total: old.bmm_paid_total,
-                credited_height,
-                credited_block,
-                credit_index: 0,
-                credit_part_block: [0u8; 32],
-                stranded_lamports: 0,
-            }
-        }
+    let config_lamports = config.lamports;
+    let config = Config::decode(&config.data)?;
+    let cursor = Cursor {
+        pegged_lamports: config.pegged_lamports,
+        deposit_high_water: config.deposit_high_water,
+        withdrawal_count: config.withdrawal_count,
+        bmm_next_height: config.bmm_next_height,
+        bmm_paid_total: config.bmm_paid_total,
+        credited_height: config.credited_height,
+        credited_block: config.credited_block,
+        credit_index: config.credit_index,
+        credit_part_block: config.credit_part_block,
+        stranded_lamports: config.stranded_lamports,
+        vault_supply: config.vault_supply,
+        float_lamports: config.float_lamports,
+        paid_through: config.paid_through,
+        bundled_through: config.bundled_through,
+        bundle_sealed_height: config.bundle_sealed_height,
     };
 
-    let mut records = Vec::new();
-    for account in &bridge_accounts {
+    let mut carried = Carried {
+        fixed: config_lamports,
+        read: config_lamports,
+        ..Carried::default()
+    };
+    for account in bridge_accounts {
         if account.pubkey == config_key {
             continue;
         }
-        let record = WithdrawalRecord::decode(&account.data)?;
+        let record = WithdrawalRecord::decode(&account.data)
+            .map_err(|_| MigrateError::NotARecord(account.pubkey))?;
         tracing::info!(
             index = record.index,
             burned = record.burned_lamports,
-            "the old chain holds an open withdrawal"
+            "the old chain holds a withdrawal record"
         );
-        records.push(RecordAccount {
+        carried.carry(account, *program_id);
+    }
+    for account in system_accounts {
+        carried.system(account);
+    }
+    for (owner, rule, accounts) in owned {
+        for account in accounts {
+            carried.apply(owner, rule, account)?;
+        }
+    }
+    let state = carried.finish(first, cursor, supply_lamports)?;
+    Ok(state)
+}
+
+/// The accounts that the export collects, sorted by what happens to them.
+#[derive(Default)]
+struct Carried {
+    balances: BTreeMap<Pubkey, u64>,
+    accounts: Vec<CarriedAccount>,
+    /// The lamports of stake and vote accounts, by withdrawer.
+    converted: BTreeMap<Pubkey, u64>,
+    fixed: u64,
+    /// Every lamport that the export read.
+    read: u64,
+}
+
+impl Carried {
+    fn system(&mut self, account: RawAccount) {
+        if account.data.is_empty() {
+            self.read = self.read.saturating_add(account.lamports);
+            if account.lamports > 0 {
+                self.balances.insert(account.pubkey, account.lamports);
+            }
+        } else {
+            self.carry(account, bridge::SYSTEM_PROGRAM_ID);
+        }
+    }
+
+    fn carry(&mut self, account: RawAccount, owner: Pubkey) {
+        self.read = self.read.saturating_add(account.lamports);
+        self.accounts.push(CarriedAccount {
             pubkey: account.pubkey.to_string(),
             lamports: account.lamports,
+            owner: owner.to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&account.data),
         });
     }
-    let balances = system_accounts
-        .into_iter()
-        .filter(|account| account.lamports > 0)
-        .map(|account| (account.pubkey.to_string(), account.lamports))
-        .collect();
-    Ok(State {
-        slot: first,
-        cursor,
-        balances,
-        records,
-        supply_lamports,
-    })
-}
 
-/// The cursor of a chain whose oracle credited each deposit by sequence
-/// number: the eCash height and block that hold the last credited deposit.
-/// `events` holds the peg events of the active chain, oldest first.
-pub fn oracle_era_cursor(
-    events: &[PegEvent],
-    deposit_high_water: u64,
-) -> Result<(u64, [u8; 32]), MigrateError> {
-    let last = deposit_high_water
-        .checked_sub(1)
-        .ok_or(MigrateError::NoDepositCredited)?;
-    for event in events {
-        let PegEvent::Connect {
-            block_hash,
-            height,
-            deposits,
-            ..
-        } = event
-        else {
-            continue;
-        };
-        if !deposits
-            .iter()
-            .any(|deposit| deposit.sequence_number == last)
-        {
-            continue;
+    fn apply(
+        &mut self,
+        owner: Pubkey,
+        rule: Rule,
+        account: RawAccount,
+    ) -> Result<(), MigrateError> {
+        match rule {
+            Rule::Carry => self.carry(account, owner),
+            Rule::Fixed => {
+                self.read = self.read.saturating_add(account.lamports);
+                self.fixed = self.fixed.saturating_add(account.lamports);
+            }
+            Rule::Refuse if account.lamports == 0 => {}
+            Rule::Refuse => {
+                return Err(MigrateError::CannotCarry {
+                    pubkey: account.pubkey,
+                    owner,
+                    lamports: account.lamports,
+                })
+            }
+            Rule::StakeToWithdrawer | Rule::VoteToWithdrawer => {
+                let (kind, withdrawer) = if rule == Rule::StakeToWithdrawer {
+                    ("stake", stake_withdrawer(&account.data))
+                } else {
+                    ("vote", vote_withdrawer(&account.data))
+                };
+                let withdrawer = withdrawer.ok_or(MigrateError::NoWithdrawer {
+                    kind,
+                    pubkey: account.pubkey,
+                })?;
+                tracing::info!(
+                    account = %account.pubkey,
+                    %withdrawer,
+                    lamports = account.lamports,
+                    "the {kind} account turns into lamports for its withdrawer"
+                );
+                self.read = self.read.saturating_add(account.lamports);
+                let entry = self.converted.entry(withdrawer).or_default();
+                *entry = entry
+                    .checked_add(account.lamports)
+                    .ok_or(MigrateError::Overflow)?;
+            }
         }
-        if let Some(open) = deposits
-            .iter()
-            .find(|deposit| deposit.sequence_number >= deposit_high_water)
-        {
-            return Err(MigrateError::SplitBlock {
-                height: *height,
-                credited: last,
-                open: open.sequence_number,
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        slot: u64,
+        cursor: Cursor,
+        supply_lamports: u64,
+    ) -> Result<State, MigrateError> {
+        for (withdrawer, lamports) in std::mem::take(&mut self.converted) {
+            let text = withdrawer.to_string();
+            if self.accounts.iter().any(|account| account.pubkey == text) {
+                return Err(MigrateError::WithdrawerHoldsData(withdrawer));
+            }
+            let entry = self.balances.entry(withdrawer).or_default();
+            *entry = entry.checked_add(lamports).ok_or(MigrateError::Overflow)?;
+        }
+        if self.read != supply_lamports {
+            return Err(MigrateError::Uncarried {
+                supply: supply_lamports,
+                found: self.read,
             });
         }
-        return Ok((u64::from(*height), block_hash.to_byte_array()));
+        Ok(State {
+            slot,
+            cursor,
+            balances: self
+                .balances
+                .into_iter()
+                .map(|(pubkey, lamports)| (pubkey.to_string(), lamports))
+                .collect(),
+            accounts: self.accounts,
+            supply_lamports,
+            fixed_lamports: self.fixed,
+        })
     }
-    Err(MigrateError::NoBlockForDeposit(last))
+}
+
+/// The withdrawer of a stake account: `Initialized` or `Stake`, after the
+/// tag, the rent reserve, and the staker.
+pub fn stake_withdrawer(data: &[u8]) -> Option<Pubkey> {
+    let tag = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+    if !(1..=2).contains(&tag) {
+        return None;
+    }
+    Some(Pubkey::new_from_array(data.get(44..76)?.try_into().ok()?))
+}
+
+/// The withdrawer of a vote account. Each version since 1.14.11 keeps it
+/// after the tag and the node pubkey.
+pub fn vote_withdrawer(data: &[u8]) -> Option<Pubkey> {
+    let tag = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+    if !(1..=3).contains(&tag) {
+        return None;
+    }
+    Some(Pubkey::new_from_array(data.get(36..68)?.try_into().ok()?))
 }
 
 async fn slot(rpc: &RpcClient) -> Result<u64, MigrateError> {
@@ -268,21 +405,16 @@ async fn supply(rpc: &RpcClient) -> Result<(u64, u64), MigrateError> {
     Ok((slot, total))
 }
 
-/// The accounts of a program and the slot of the read. `data_size` keeps
-/// only the accounts with that much data.
+/// The accounts of a program and the slot of the read.
 async fn program_accounts(
     rpc: &RpcClient,
     program_id: &Pubkey,
-    data_size: Option<u64>,
 ) -> Result<(u64, Vec<RawAccount>), MigrateError> {
-    let mut config = json!({
+    let config = json!({
         "commitment": "processed",
         "encoding": "base64",
         "withContext": true,
     });
-    if let Some(size) = data_size {
-        config["filters"] = json!([{ "dataSize": size }]);
-    }
     let answer: Value = rpc
         .send(
             RpcRequest::GetProgramAccounts,
@@ -320,55 +452,174 @@ async fn program_accounts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enforcer::DepositEvent;
-    use bitcoin::BlockHash;
 
-    fn a_block(height: u32, sequence_numbers: &[u64]) -> PegEvent {
-        PegEvent::Connect {
-            block_hash: BlockHash::from_byte_array([height as u8; 32]),
-            height,
-            deposits: sequence_numbers
-                .iter()
-                .map(|sequence_number| DepositEvent {
-                    sequence_number: *sequence_number,
-                    address: Vec::new(),
-                    value_sats: 1_000,
-                })
-                .collect(),
-            bundles: Vec::new(),
+    fn raw(byte: u8, lamports: u64, data: Vec<u8>) -> RawAccount {
+        RawAccount {
+            pubkey: Pubkey::new_from_array([byte; 32]),
+            lamports,
+            data,
         }
     }
 
-    #[test]
-    fn the_cursor_is_the_block_of_the_last_credited_deposit() {
-        let events = [a_block(10, &[0]), a_block(14, &[1, 2]), a_block(20, &[3])];
-        assert_eq!(oracle_era_cursor(&events, 3).unwrap(), (14, [14u8; 32]));
-        assert_eq!(oracle_era_cursor(&events, 4).unwrap(), (20, [20u8; 32]));
+    fn a_cursor() -> Cursor {
+        Cursor {
+            pegged_lamports: 1,
+            deposit_high_water: 2,
+            withdrawal_count: 3,
+            bmm_next_height: 4,
+            bmm_paid_total: 5,
+            credited_height: 6,
+            credited_block: [7u8; 32],
+            credit_index: 0,
+            credit_part_block: [0u8; 32],
+            stranded_lamports: 8,
+            vault_supply: 9,
+            float_lamports: 10,
+            paid_through: 1,
+            bundled_through: 2,
+            bundle_sealed_height: 3,
+        }
+    }
+
+    fn a_stake_account(withdrawer: Pubkey) -> Vec<u8> {
+        let mut data = vec![0u8; 200];
+        data[..4].copy_from_slice(&2u32.to_le_bytes());
+        data[12..44].copy_from_slice(&[0xaa; 32]);
+        data[44..76].copy_from_slice(withdrawer.as_ref());
+        data
+    }
+
+    fn a_vote_account(withdrawer: Pubkey) -> Vec<u8> {
+        let mut data = vec![0u8; 3762];
+        data[..4].copy_from_slice(&3u32.to_le_bytes());
+        data[4..36].copy_from_slice(&[0xbb; 32]);
+        data[36..68].copy_from_slice(withdrawer.as_ref());
+        data
+    }
+
+    fn owner(name: &str) -> Pubkey {
+        name.parse().unwrap()
     }
 
     #[test]
-    fn a_block_with_a_credited_and_an_open_deposit_fails() {
-        let events = [a_block(14, &[1, 2])];
+    fn stake_and_vote_lamports_go_to_the_withdrawer() {
+        let withdrawer = Pubkey::new_from_array([4u8; 32]);
+        let mut carried = Carried::default();
+        carried.system(raw(4, 1_000, Vec::new()));
+        carried
+            .apply(
+                owner("Stake11111111111111111111111111111111111111"),
+                Rule::StakeToWithdrawer,
+                raw(5, 300, a_stake_account(withdrawer)),
+            )
+            .unwrap();
+        carried
+            .apply(
+                owner("Vote111111111111111111111111111111111111111"),
+                Rule::VoteToWithdrawer,
+                raw(6, 20, a_vote_account(withdrawer)),
+            )
+            .unwrap();
+        let state = carried.finish(1, a_cursor(), 1_320).unwrap();
+        assert_eq!(state.balances[&withdrawer.to_string()], 1_320);
+        assert!(state.accounts.is_empty());
+    }
+
+    #[test]
+    fn token_and_nonce_accounts_carry_byte_for_byte() {
+        let mut carried = Carried::default();
+        carried.system(raw(1, 1_500, vec![1u8; 80]));
+        let token = owner("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+        carried
+            .apply(token, Rule::Carry, raw(2, 2_344, vec![2u8; 165]))
+            .unwrap();
+        let state = carried.finish(1, a_cursor(), 3_844).unwrap();
+        assert_eq!(state.accounts.len(), 2);
+        assert_eq!(
+            state.accounts[0].owner,
+            bridge::SYSTEM_PROGRAM_ID.to_string()
+        );
+        assert_eq!(state.accounts[1].owner, token.to_string());
+        assert_eq!(state.accounts[1].lamports, 2_344);
+        assert!(state.balances.is_empty());
+    }
+
+    #[test]
+    fn an_account_that_no_rule_carries_stops_the_export() {
+        let mut carried = Carried::default();
+        let loader = owner("BPFLoaderUpgradeab1e11111111111111111111111");
+        carried
+            .apply(loader, Rule::Refuse, raw(3, 0, Vec::new()))
+            .unwrap();
         assert!(matches!(
-            oracle_era_cursor(&events, 2),
-            Err(MigrateError::SplitBlock {
-                height: 14,
-                credited: 1,
-                open: 2
+            carried.apply(loader, Rule::Refuse, raw(3, 10, Vec::new())),
+            Err(MigrateError::CannotCarry { lamports: 10, .. })
+        ));
+    }
+
+    #[test]
+    fn lamports_outside_every_read_stop_the_export() {
+        let mut carried = Carried::default();
+        carried.system(raw(1, 1_000, Vec::new()));
+        carried
+            .apply(
+                owner("Sysvar1111111111111111111111111111111111111"),
+                Rule::Fixed,
+                raw(2, 50, Vec::new()),
+            )
+            .unwrap();
+        assert!(matches!(
+            carried.finish(1, a_cursor(), 1_051),
+            Err(MigrateError::Uncarried {
+                supply: 1_051,
+                found: 1_050
             })
         ));
     }
 
     #[test]
-    fn a_chain_without_a_credit_or_without_the_deposit_fails() {
+    fn a_stake_account_without_a_withdrawer_stops_the_export() {
+        let mut carried = Carried::default();
+        let stake = owner("Stake11111111111111111111111111111111111111");
         assert!(matches!(
-            oracle_era_cursor(&[a_block(10, &[0])], 0),
-            Err(MigrateError::NoDepositCredited)
+            carried.apply(stake, Rule::StakeToWithdrawer, raw(5, 300, vec![0u8; 200])),
+            Err(MigrateError::NoWithdrawer { kind: "stake", .. })
         ));
+    }
+
+    #[test]
+    fn a_withdrawer_with_data_stops_the_export() {
+        let withdrawer = Pubkey::new_from_array([1u8; 32]);
+        let mut carried = Carried::default();
+        carried.system(raw(1, 1_500, vec![1u8; 80]));
+        carried
+            .apply(
+                owner("Stake11111111111111111111111111111111111111"),
+                Rule::StakeToWithdrawer,
+                raw(5, 300, a_stake_account(withdrawer)),
+            )
+            .unwrap();
         assert!(matches!(
-            oracle_era_cursor(&[a_block(10, &[0])], 5),
-            Err(MigrateError::NoBlockForDeposit(4))
+            carried.finish(1, a_cursor(), 1_800),
+            Err(MigrateError::WithdrawerHoldsData(_))
         ));
+    }
+
+    #[test]
+    fn the_withdrawer_offsets_match_the_interface_layouts() {
+        let withdrawer = Pubkey::new_from_array([9u8; 32]);
+        assert_eq!(
+            stake_withdrawer(&a_stake_account(withdrawer)),
+            Some(withdrawer)
+        );
+        assert_eq!(
+            vote_withdrawer(&a_vote_account(withdrawer)),
+            Some(withdrawer)
+        );
+        let mut old_vote = a_vote_account(withdrawer);
+        old_vote[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(vote_withdrawer(&old_vote), None);
+        assert_eq!(stake_withdrawer(&[1, 0, 0, 0]), None);
     }
 
     #[test]
@@ -377,25 +628,16 @@ mod tests {
         balances.insert(Pubkey::new_from_array([1u8; 32]).to_string(), 5);
         let state = State {
             slot: 9,
-            cursor: Cursor {
-                pegged_lamports: 1,
-                deposit_high_water: 2,
-                withdrawal_count: 3,
-                bmm_next_height: 4,
-                bmm_paid_total: 5,
-                credited_height: 6,
-                credited_block: [7u8; 32],
-                credit_index: 0,
-                credit_part_block: [0u8; 32],
-                stranded_lamports: 8,
-            },
+            cursor: a_cursor(),
             balances,
-            records: vec![RecordAccount {
+            accounts: vec![CarriedAccount {
                 pubkey: Pubkey::new_from_array([2u8; 32]).to_string(),
                 lamports: 10,
+                owner: Pubkey::new_from_array([3u8; 32]).to_string(),
                 data: "AQID".into(),
             }],
             supply_lamports: 100,
+            fixed_lamports: 85,
         };
         let text = serde_json::to_string(&state).unwrap();
         assert_eq!(serde_json::from_str::<State>(&text).unwrap(), state);

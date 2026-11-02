@@ -200,7 +200,7 @@ up() {
 
   echo "== the Solana chain"
   if [ ! -d "$ROOT/ledger" ]; then
-    LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$(btc getblockcount)" \
+    LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$(btc getblockcount)" BUNDLE_MIN_SLOTS=0 \
       bash "$REPO/genesis/build-genesis.sh" >/dev/null
   fi
   start_process validator env \

@@ -10,6 +10,9 @@ pub const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
 /// The peg is 1 SOL to 1 BTC, so one satoshi is ten lamports.
 pub const LAMPORTS_PER_SAT: u64 = 10;
 
+/// The most records in one bundle. It must match the bridge program.
+pub const MAX_BUNDLE_RECORDS: u64 = 1_500;
+
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";
@@ -104,6 +107,11 @@ pub enum BridgeError {
         want: usize,
         found: usize,
     },
+    #[error(
+        "the config holds {found} bytes, and the current layout holds {want}. Only a chain of \
+         the current layout migrates"
+    )]
+    NotTheLayout { want: usize, found: usize },
     #[error("the account discriminator does not name `{0}`")]
     WrongDiscriminator(&'static str),
     #[error("the script pubkey claims {0} bytes, but the account stops before that")]
@@ -158,10 +166,37 @@ pub struct Config {
     pub bump: u8,
     pub vault_bump: u8,
     pub treasury_bump: u8,
+    pub vault_supply: u64,
+    pub float_lamports: u64,
+    pub paid_through: u64,
+    pub bundled_through: u64,
+    pub bundle_sealed_height: u64,
+    pub bundle_sealed_slot: u64,
+    pub bundle_min_slots: u64,
 }
 
 impl Config {
-    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1;
+    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 7;
+
+    /// The record indices of the live bundle, if one is live.
+    pub fn live_bundle(&self) -> Option<std::ops::Range<u64>> {
+        (self.bundled_through > self.paid_through)
+            .then_some(self.paid_through..self.bundled_through)
+    }
+
+    /// The lamports that gifts put in the vault: `vault + pegged - supply`.
+    pub fn vault_surplus(&self, vault: u64) -> Option<u64> {
+        vault
+            .checked_add(self.pegged_lamports)?
+            .checked_sub(self.vault_supply)
+    }
+
+    /// True when gifts to the vault back the whole float, so withdrawals are
+    /// open.
+    pub fn float_backed(&self, vault: u64) -> bool {
+        self.vault_surplus(vault)
+            .is_some_and(|surplus| surplus >= self.float_lamports)
+    }
 
     /// The account data in the Anchor layout, as the genesis writes it.
     pub fn encode(&self) -> Vec<u8> {
@@ -184,13 +219,23 @@ impl Config {
         data.extend_from_slice(&self.credit_part_block);
         data.extend_from_slice(&self.stranded_lamports.to_le_bytes());
         data.extend_from_slice(&[self.bump, self.vault_bump, self.treasury_bump]);
+        for value in [
+            self.vault_supply,
+            self.float_lamports,
+            self.paid_through,
+            self.bundled_through,
+            self.bundle_sealed_height,
+            self.bundle_sealed_slot,
+            self.bundle_min_slots,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
         data
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, BridgeError> {
-        if data.len() < Self::LEN {
-            return Err(BridgeError::ShortAccount {
-                name: "Config",
+        if data.len() != Self::LEN {
+            return Err(BridgeError::NotTheLayout {
                 want: Self::LEN,
                 found: data.len(),
             });
@@ -220,49 +265,13 @@ impl Config {
             bump: reader.u8().ok_or_else(|| cut("bump"))?,
             vault_bump: reader.u8().ok_or_else(|| cut("vault_bump"))?,
             treasury_bump: reader.u8().ok_or_else(|| cut("treasury_bump"))?,
-        })
-    }
-}
-
-/// The bridge config of a chain from before the BMM checkpoints. The oracle
-/// credited each deposit by its sequence number, and no field holds an eCash
-/// height.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OracleEraConfig {
-    pub oracle: Pubkey,
-    pub deposit_high_water: u64,
-    pub pegged_lamports: u64,
-    pub withdrawal_count: u64,
-    pub bmm_next_height: u64,
-    pub bmm_paid_total: u64,
-}
-
-impl OracleEraConfig {
-    pub const LEN: usize = 8 + 32 + 8 * 5 + 1 + 1 + 1;
-
-    pub fn decode(data: &[u8]) -> Result<Self, BridgeError> {
-        if data.len() != Self::LEN {
-            return Err(BridgeError::ShortAccount {
-                name: "OracleEraConfig",
-                want: Self::LEN,
-                found: data.len(),
-            });
-        }
-        if data[..8] != discriminator("account", "Config") {
-            return Err(BridgeError::WrongDiscriminator("Config"));
-        }
-        let mut reader = Reader::new(&data[8..]);
-        let cut = |field| BridgeError::TruncatedField {
-            name: "OracleEraConfig",
-            field,
-        };
-        Ok(Self {
-            oracle: Pubkey::new_from_array(reader.array32().ok_or_else(|| cut("oracle"))?),
-            deposit_high_water: reader.u64().ok_or_else(|| cut("deposit_high_water"))?,
-            pegged_lamports: reader.u64().ok_or_else(|| cut("pegged_lamports"))?,
-            withdrawal_count: reader.u64().ok_or_else(|| cut("withdrawal_count"))?,
-            bmm_next_height: reader.u64().ok_or_else(|| cut("bmm_next_height"))?,
-            bmm_paid_total: reader.u64().ok_or_else(|| cut("bmm_paid_total"))?,
+            vault_supply: reader.u64().ok_or_else(|| cut("vault_supply"))?,
+            float_lamports: reader.u64().ok_or_else(|| cut("float_lamports"))?,
+            paid_through: reader.u64().ok_or_else(|| cut("paid_through"))?,
+            bundled_through: reader.u64().ok_or_else(|| cut("bundled_through"))?,
+            bundle_sealed_height: reader.u64().ok_or_else(|| cut("bundle_sealed_height"))?,
+            bundle_sealed_slot: reader.u64().ok_or_else(|| cut("bundle_sealed_slot"))?,
+            bundle_min_slots: reader.u64().ok_or_else(|| cut("bundle_min_slots"))?,
         })
     }
 }
@@ -380,13 +389,47 @@ pub fn withdraw_ix(
     }
 }
 
-pub fn mark_paid_ix(
-    program_id: &Pubkey,
-    oracle: &Pubkey,
-    owner: &Pubkey,
-    index: u64,
-) -> Instruction {
-    let mut data = discriminator("global", "mark_paid").to_vec();
+/// A System Program transfer of `lamports` from `from` to `to`.
+pub fn transfer_ix(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
+    let mut data = 2u32.to_le_bytes().to_vec();
+    data.extend_from_slice(&lamports.to_le_bytes());
+    Instruction {
+        program_id: SYSTEM_PROGRAM_ID,
+        accounts: vec![AccountMeta::new(*from, true), AccountMeta::new(*to, false)],
+        data,
+    }
+}
+
+/// Puts the oldest open records into the live bundle. The oracle signs.
+pub fn seal_bundle_ix(program_id: &Pubkey, oracle: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(config_pda(program_id).0, false),
+            AccountMeta::new_readonly(*oracle, true),
+        ],
+        data: discriminator("global", "seal_bundle").to_vec(),
+    }
+}
+
+/// Marks the live bundle, which ends at `through`, paid. The oracle signs.
+pub fn bundle_paid_ix(program_id: &Pubkey, oracle: &Pubkey, through: u64) -> Instruction {
+    let mut data = discriminator("global", "bundle_paid").to_vec();
+    data.extend_from_slice(&through.to_le_bytes());
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(config_pda(program_id).0, false),
+            AccountMeta::new_readonly(*oracle, true),
+        ],
+        data,
+    }
+}
+
+/// Closes the record of a paid withdrawal, and gives its rent back to the
+/// owner. Anyone can send it.
+pub fn close_record_ix(program_id: &Pubkey, owner: &Pubkey, index: u64) -> Instruction {
+    let mut data = discriminator("global", "close_record").to_vec();
     data.extend_from_slice(&index.to_le_bytes());
     Instruction {
         program_id: *program_id,
@@ -394,7 +437,6 @@ pub fn mark_paid_ix(
             AccountMeta::new_readonly(config_pda(program_id).0, false),
             AccountMeta::new(withdrawal_pda(program_id, index).0, false),
             AccountMeta::new(*owner, false),
-            AccountMeta::new_readonly(*oracle, true),
         ],
         data,
     }
@@ -499,7 +541,14 @@ mod tests {
 
     #[test]
     fn each_instruction_carries_its_own_discriminator() {
-        let names = ["credit_deposits", "withdraw", "mark_paid", "settle_bmm"];
+        let names = [
+            "credit_deposits",
+            "withdraw",
+            "seal_bundle",
+            "bundle_paid",
+            "close_record",
+            "settle_bmm",
+        ];
         let mut seen: Vec<[u8; 8]> = names
             .iter()
             .map(|name| discriminator("global", name))
@@ -527,6 +576,13 @@ mod tests {
             bump: 254,
             vault_bump: 253,
             treasury_bump: 252,
+            vault_supply: 21_000_000_000_000_000,
+            float_lamports: 120_000,
+            paid_through: 4,
+            bundled_through: 9,
+            bundle_sealed_height: 990,
+            bundle_sealed_slot: 77,
+            bundle_min_slots: 1_000,
         }
     }
 
@@ -581,8 +637,22 @@ mod tests {
         let data = discriminator("account", "Config").to_vec();
         assert!(matches!(
             Config::decode(&data),
-            Err(BridgeError::ShortAccount { .. })
+            Err(BridgeError::NotTheLayout { .. })
         ));
+    }
+
+    #[test]
+    fn a_config_of_an_old_layout_fails() {
+        let current = a_config().encode();
+        for old in [&current[..187], &current[..75]] {
+            assert!(matches!(
+                Config::decode(old),
+                Err(BridgeError::NotTheLayout { found, .. }) if found == old.len()
+            ));
+        }
+        let mut long = current;
+        long.push(0);
+        assert!(Config::decode(&long).is_err());
     }
 
     #[test]
@@ -633,7 +703,7 @@ mod tests {
             assert!(
                 matches!(
                     error,
-                    BridgeError::ShortAccount { .. } | BridgeError::TruncatedField { .. }
+                    BridgeError::NotTheLayout { .. } | BridgeError::TruncatedField { .. }
                 ),
                 "a {cut} byte account gave {error}"
             );
@@ -783,7 +853,7 @@ mod tests {
     fn the_config_sits_at_the_offsets_that_the_validator_reads() {
         let data = a_config().encode();
         let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        assert_eq!(data.len(), 187);
+        assert_eq!(data.len(), 243);
         assert_eq!(&data[8..40], &[7u8; 32]);
         assert_eq!(at(64), 900);
         assert_eq!(at(80), 6);
@@ -793,30 +863,33 @@ mod tests {
         assert_eq!(at(136), 2);
         assert_eq!(&data[144..176], &[5u8; 32]);
         assert_eq!(data[184..187], [254, 253, 252]);
+        assert_eq!(at(187), 21_000_000_000_000_000);
+        assert_eq!(at(195), 120_000);
+        assert_eq!(at(203), 4);
+        assert_eq!(at(211), 9);
+        assert_eq!(at(219), 990);
+        assert_eq!(at(227), 77);
+        assert_eq!(at(235), 1_000);
     }
 
     #[test]
-    fn an_oracle_era_config_decodes_its_counters() {
+    fn the_live_bundle_spans_the_sealed_records_that_are_not_paid() {
+        let mut config = a_config();
+        assert_eq!(config.live_bundle(), Some(4..9));
+        config.paid_through = 9;
+        assert_eq!(config.live_bundle(), None);
+    }
+
+    #[test]
+    fn the_float_is_backed_once_the_vault_surplus_covers_it() {
         let config = a_config();
-        let mut data = discriminator("account", "Config").to_vec();
-        data.extend_from_slice(config.oracle.as_ref());
-        for value in [12u64, 30_000_000, 2, 900, 7_000] {
-            data.extend_from_slice(&value.to_le_bytes());
-        }
-        data.extend_from_slice(&[254, 253, 252]);
-        assert_eq!(
-            OracleEraConfig::decode(&data).unwrap(),
-            OracleEraConfig {
-                oracle: config.oracle,
-                deposit_high_water: 12,
-                pegged_lamports: 30_000_000,
-                withdrawal_count: 2,
-                bmm_next_height: 900,
-                bmm_paid_total: 7_000,
-            }
-        );
-        assert!(OracleEraConfig::decode(&config.encode()).is_err());
-        assert!(Config::decode(&data).is_err());
+        let even = config.vault_supply - config.pegged_lamports;
+        assert_eq!(config.vault_surplus(even), Some(0));
+        assert!(!config.float_backed(even));
+        assert!(!config.float_backed(even + 119_999));
+        assert!(config.float_backed(even + 120_000));
+        assert_eq!(config.vault_surplus(even - 1), None);
+        assert!(!config.float_backed(even - 1));
     }
 
     #[test]
@@ -851,13 +924,29 @@ mod tests {
     }
 
     #[test]
-    fn the_mark_paid_instruction_gives_the_rent_back_to_the_owner() {
+    fn the_close_instruction_gives_the_rent_back_to_the_owner() {
         let program_id = a_program_id();
-        let oracle = Pubkey::new_from_array([1u8; 32]);
         let owner = Pubkey::new_from_array([6u8; 32]);
-        let ix = mark_paid_ix(&program_id, &oracle, &owner, 5);
+        let ix = close_record_ix(&program_id, &owner, 5);
         assert_eq!(&ix.data[8..16], &5u64.to_le_bytes());
+        assert_eq!(ix.accounts[1].pubkey, withdrawal_pda(&program_id, 5).0);
         assert_eq!(ix.accounts[2].pubkey, owner);
         assert!(ix.accounts[2].is_writable);
+        assert!(ix.accounts.iter().all(|meta| !meta.is_signer));
+    }
+
+    #[test]
+    fn the_oracle_signs_the_seal_and_the_payment() {
+        let program_id = a_program_id();
+        let oracle = Pubkey::new_from_array([1u8; 32]);
+        let seal = seal_bundle_ix(&program_id, &oracle);
+        assert_eq!(seal.data, discriminator("global", "seal_bundle"));
+        let paid = bundle_paid_ix(&program_id, &oracle, 9);
+        assert_eq!(&paid.data[8..16], &9u64.to_le_bytes());
+        for ix in [seal, paid] {
+            assert!(ix.accounts[0].is_writable);
+            assert_eq!(ix.accounts[1].pubkey, oracle);
+            assert!(ix.accounts[1].is_signer);
+        }
     }
 }

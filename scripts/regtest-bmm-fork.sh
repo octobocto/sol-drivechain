@@ -440,6 +440,7 @@ PAYEE="$M_ID"
 # the eCash tip, and the credits start after it.
 "$D" genesis --program-id "$PROGRAM_ID" \
   --oracle "$("$SOLANA_KEYGEN" pubkey "$ROOT/oracle.json")" \
+  --oracle-lamports 1000000000 --float-lamports 0 --bundle-min-slots 0 \
   --lamports-per-byte-year "$LAMPORTS_PER_BYTE_YEAR" --ecash-start-height "$(tip)" \
   --deposit-confirmations "$DEPOSIT_D" --deposit-lag "$LAG" \
   --out "$ROOT/primordial.yaml" >/dev/null

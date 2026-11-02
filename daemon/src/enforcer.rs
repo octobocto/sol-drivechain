@@ -536,8 +536,9 @@ impl Enforcer {
     }
 
     /// The peg events of each block after `start` up to `end`, oldest first.
-    /// The enforcer leaves out a block without an event for this slot.
-    pub async fn two_way_peg_data(
+    /// The enforcer leaves out a block without an event for this slot. A call
+    /// reads the whole range, so only `peg_data_from` and one block use it.
+    async fn two_way_peg_data(
         &mut self,
         start: Option<BlockHash>,
         end: BlockHash,
@@ -589,42 +590,24 @@ impl Enforcer {
     }
 
     /// The hash and the parent hash of the active block at `height` below
-    /// `tip`.
+    /// `tip`. The walk reads at most `PAGE_BLOCKS` headers in one call.
     pub async fn block_at(
         &mut self,
         tip: (BlockHash, u32),
         height: u32,
     ) -> Result<(BlockHash, BlockHash)> {
-        let depth = tip
-            .1
-            .checked_sub(height)
-            .ok_or(EnforcerError::NoBlockAtHeight(height))?;
-        let headers = self
-            .validator
-            .get_block_header_info(GetBlockHeaderInfoRequest {
-                block_hash: Some(crate::proto::common::ReverseHex {
-                    hex: Some(tip.0.to_string()),
-                }),
-                max_ancestors: Some(depth),
-            })
-            .await
-            .map_err(|source| EnforcerError::Call {
-                call: "GetBlockHeaderInfo",
-                source,
-            })?
-            .into_inner()
-            .header_infos;
-        let header = headers
-            .into_iter()
-            .find(|header| header.height == height)
-            .ok_or(EnforcerError::NoBlockAtHeight(height))?;
-        Ok((
-            decode_reverse_hash(header.block_hash.and_then(|hash| hash.hex), "block_hash")?,
-            decode_reverse_hash(
-                header.prev_block_hash.and_then(|hash| hash.hex),
-                "prev_block_hash",
-            )?,
-        ))
+        let header = header_at(self, tip, height).await?;
+        Ok((header.hash, header.prev))
+    }
+
+    /// The peg events of each active block above `start_height` up to `tip`,
+    /// oldest first, read in pages of at most `PAGE_BLOCKS` blocks.
+    pub async fn peg_data_from(
+        &mut self,
+        tip: (BlockHash, u32),
+        start_height: u32,
+    ) -> Result<Vec<PegEvent>> {
+        peg_data_from(self, tip, start_height).await
     }
 
     pub async fn chain_tip(&mut self) -> Result<BlockHash> {
@@ -713,31 +696,7 @@ impl Enforcer {
         tip: (BlockHash, u32),
         height: u32,
     ) -> Result<(BlockHash, Option<[u8; 32]>)> {
-        let depth = tip
-            .1
-            .checked_sub(height)
-            .ok_or(EnforcerError::NoBlockAtHeight(height))?;
-        let headers = self
-            .validator
-            .get_block_header_info(GetBlockHeaderInfoRequest {
-                block_hash: Some(crate::proto::common::ReverseHex {
-                    hex: Some(tip.0.to_string()),
-                }),
-                max_ancestors: Some(depth),
-            })
-            .await
-            .map_err(|source| EnforcerError::Call {
-                call: "GetBlockHeaderInfo",
-                source,
-            })?
-            .into_inner()
-            .header_infos;
-        let header = headers
-            .into_iter()
-            .find(|header| header.height == height)
-            .ok_or(EnforcerError::NoBlockAtHeight(height))?;
-        let block_hash =
-            decode_reverse_hash(header.block_hash.and_then(|hash| hash.hex), "block_hash")?;
+        let block_hash = header_at(self, tip, height).await?.hash;
 
         let response = self
             .validator
@@ -898,6 +857,111 @@ impl Enforcer {
             })
             .collect()
     }
+}
+
+/// The most blocks that one enforcer call reads. A larger answer can pass
+/// the 4 MiB message limit of the gRPC client.
+pub const PAGE_BLOCKS: u32 = 1_000;
+
+/// One block header of the active chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub height: u32,
+    pub hash: BlockHash,
+    pub prev: BlockHash,
+}
+
+/// The reads that a paged walk of the active chain needs.
+pub(crate) trait ChainPages {
+    /// `from` and up to `max_ancestors` of its ancestors, newest first.
+    async fn headers(&mut self, from: BlockHash, max_ancestors: u32) -> Result<Vec<Header>>;
+    /// The peg events of each block after `start` up to `end`, oldest first.
+    async fn peg_events(&mut self, start: BlockHash, end: BlockHash) -> Result<Vec<PegEvent>>;
+}
+
+impl ChainPages for Enforcer {
+    async fn headers(&mut self, from: BlockHash, max_ancestors: u32) -> Result<Vec<Header>> {
+        self.validator
+            .get_block_header_info(GetBlockHeaderInfoRequest {
+                block_hash: Some(crate::proto::common::ReverseHex {
+                    hex: Some(from.to_string()),
+                }),
+                max_ancestors: Some(max_ancestors),
+            })
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "GetBlockHeaderInfo",
+                source,
+            })?
+            .into_inner()
+            .header_infos
+            .into_iter()
+            .map(|header| {
+                Ok(Header {
+                    height: header.height,
+                    hash: decode_reverse_hash(
+                        header.block_hash.and_then(|hash| hash.hex),
+                        "block_hash",
+                    )?,
+                    prev: decode_reverse_hash(
+                        header.prev_block_hash.and_then(|hash| hash.hex),
+                        "prev_block_hash",
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    async fn peg_events(&mut self, start: BlockHash, end: BlockHash) -> Result<Vec<PegEvent>> {
+        self.two_way_peg_data(Some(start), end).await
+    }
+}
+
+/// The active header at `height` below `tip`, read in pages.
+pub(crate) async fn header_at(
+    chain: &mut impl ChainPages,
+    tip: (BlockHash, u32),
+    height: u32,
+) -> Result<Header> {
+    if height > tip.1 {
+        return Err(EnforcerError::NoBlockAtHeight(height));
+    }
+    let mut cursor = tip;
+    loop {
+        let span = (cursor.1 - height).min(PAGE_BLOCKS);
+        let headers = chain.headers(cursor.0, span).await?;
+        if let Some(header) = headers.iter().find(|header| header.height == height) {
+            return Ok(*header);
+        }
+        let oldest = headers
+            .last()
+            .filter(|oldest| oldest.height > height && oldest.height <= cursor.1)
+            .ok_or(EnforcerError::NoBlockAtHeight(height))?;
+        cursor = (oldest.prev, oldest.height - 1);
+    }
+}
+
+/// The peg events of each active block above `start_height` up to `tip`,
+/// oldest first. Each call reads at most `PAGE_BLOCKS` blocks, and every page
+/// hangs off the same tip.
+pub(crate) async fn peg_data_from(
+    chain: &mut impl ChainPages,
+    tip: (BlockHash, u32),
+    start_height: u32,
+) -> Result<Vec<PegEvent>> {
+    let mut pages = Vec::new();
+    let mut upper = tip;
+    while upper.1 > start_height {
+        let lower_height = upper.1.saturating_sub(PAGE_BLOCKS).max(start_height);
+        let lower = header_at(chain, upper, lower_height).await?;
+        pages.push((lower.hash, upper.0));
+        upper = (lower.hash, lower.height);
+    }
+    let mut events = Vec::new();
+    for (start, end) in pages.into_iter().rev() {
+        events.extend(chain.peg_events(start, end).await?);
+    }
+    Ok(events)
 }
 
 /// Reads the Bitcoin network out of the enforcer answer.
@@ -1116,6 +1180,118 @@ fn decode_txid(hex: Option<String>, field: &'static str) -> Result<Txid> {
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::hashes::Hash as _;
+
+    /// A chain of `len` blocks that answers like the enforcer, with a bundle
+    /// event at every hundredth height. It keeps the largest span of a call.
+    struct FakeChain {
+        len: u32,
+        widest: u32,
+        calls: usize,
+    }
+
+    fn hash_of(height: u32) -> BlockHash {
+        let mut bytes = [0xccu8; 32];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
+        BlockHash::from_byte_array(bytes)
+    }
+
+    fn height_of(hash: BlockHash) -> u32 {
+        u32::from_le_bytes(hash.to_byte_array()[..4].try_into().unwrap())
+    }
+
+    impl ChainPages for FakeChain {
+        async fn headers(&mut self, from: BlockHash, max_ancestors: u32) -> Result<Vec<Header>> {
+            self.calls += 1;
+            self.widest = self.widest.max(max_ancestors);
+            let top = height_of(from);
+            assert!(top < self.len);
+            Ok((top.saturating_sub(max_ancestors)..=top)
+                .rev()
+                .map(|height| Header {
+                    height,
+                    hash: hash_of(height),
+                    prev: hash_of(height.wrapping_sub(1)),
+                })
+                .collect())
+        }
+
+        async fn peg_events(&mut self, start: BlockHash, end: BlockHash) -> Result<Vec<PegEvent>> {
+            self.calls += 1;
+            let (low, high) = (height_of(start), height_of(end));
+            assert!(low < high);
+            self.widest = self.widest.max(high - low);
+            Ok((low + 1..=high)
+                .filter(|height| height % 100 == 0)
+                .map(|height| PegEvent::Connect {
+                    block_hash: hash_of(height),
+                    height,
+                    deposits: Vec::new(),
+                    bundles: vec![BundleEvent::Submitted(Txid::from_byte_array([1; 32]))],
+                })
+                .collect())
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    #[test]
+    fn a_long_walk_reads_the_chain_in_pages() {
+        let mut chain = FakeChain {
+            len: 25_001,
+            widest: 0,
+            calls: 0,
+        };
+        let tip = (hash_of(25_000), 25_000);
+        let header = block_on(header_at(&mut chain, tip, 7)).unwrap();
+        assert_eq!((header.height, header.hash), (7, hash_of(7)));
+        assert!(chain.widest <= PAGE_BLOCKS);
+        assert!(chain.calls >= 25);
+    }
+
+    #[test]
+    fn peg_data_of_a_long_range_comes_in_pages_and_misses_no_block() {
+        let mut chain = FakeChain {
+            len: 25_001,
+            widest: 0,
+            calls: 0,
+        };
+        let tip = (hash_of(25_000), 25_000);
+        let events = block_on(peg_data_from(&mut chain, tip, 150)).unwrap();
+        let heights: Vec<u32> = events
+            .iter()
+            .map(|event| match event {
+                PegEvent::Connect { height, .. } => *height,
+                PegEvent::Disconnect { .. } => unreachable!(),
+            })
+            .collect();
+        let want: Vec<u32> = (151..=25_000).filter(|height| height % 100 == 0).collect();
+        assert_eq!(heights, want);
+        assert!(chain.widest <= PAGE_BLOCKS);
+    }
+
+    #[test]
+    fn peg_data_from_the_tip_is_empty_and_a_height_above_the_tip_fails() {
+        let mut chain = FakeChain {
+            len: 10,
+            widest: 0,
+            calls: 0,
+        };
+        let tip = (hash_of(9), 9);
+        assert!(block_on(peg_data_from(&mut chain, tip, 9))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            block_on(header_at(&mut chain, tip, 10)),
+            Err(EnforcerError::NoBlockAtHeight(10))
+        ));
+    }
+
     use super::*;
 
     /// The enforcer answered with this hash for the same title and
