@@ -12,6 +12,14 @@ pub const MAX_SCRIPT_PUBKEY_LEN: usize = 34;
 /// A payout below this value is dust, and a wallet cannot spend it.
 pub const MIN_PAYOUT_SATS: u64 = 546;
 
+/// The lowest mainchain fee of one withdrawal. It pays for the 43 bytes of
+/// its output at more than 20 sat/vB, so a flood of records costs real money.
+pub const MIN_FEE_SATS: u64 = 1_000;
+
+/// The most records in one bundle. Each payout output is at most 43 bytes,
+/// so a bundle stays near 260,000 weight units, below the standard 400,000.
+pub const MAX_BUNDLE_RECORDS: u64 = 1_500;
+
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";
@@ -132,10 +140,16 @@ pub mod bridge {
         require!(answer.credits_active, BridgeError::CreditsDropped);
 
         let treasury = &ctx.accounts.treasury;
+        let config = &ctx.accounts.config;
         let payout = treasury
             .lamports()
             .saturating_sub(Rent::get()?.minimum_balance(0));
-        if payout > 0 && can_hold(payee, treasury.key(), payout)? {
+        let excluded = [
+            treasury.key(),
+            ctx.accounts.config.key(),
+            vault_pda(config.vault_bump)?,
+        ];
+        if payout > 0 && can_hold(payee, &excluded, payout)? {
             let treasury_bump = ctx.accounts.config.treasury_bump;
             let signer_seeds: &[&[&[u8]]] = &[&[TREASURY_SEED, &[treasury_bump]]];
             transfer(
@@ -337,10 +351,22 @@ pub mod bridge {
             .checked_sub(fee_sats)
             .ok_or(BridgeError::FeeAboveAmount)?;
         require!(payout_sats >= MIN_PAYOUT_SATS, BridgeError::PayoutIsDust);
+        require_gte!(fee_sats, MIN_FEE_SATS, BridgeError::FeeTooLow);
 
-        // The genesis gives the validator lamports that no Bitcoin backs. This
-        // subtraction is what stops a peg-out of those lamports.
         let config = &mut ctx.accounts.config;
+        // The genesis float circulates beside the pegged lamports, so no
+        // lamport pegs out until gifts to the vault back the whole float.
+        let backed = ctx
+            .accounts
+            .vault
+            .lamports()
+            .checked_add(config.pegged_lamports)
+            .ok_or(BridgeError::AmountOverflow)?;
+        let needed = config
+            .vault_supply
+            .checked_add(config.float_lamports)
+            .ok_or(BridgeError::AmountOverflow)?;
+        require_gte!(backed, needed, BridgeError::FloatNotBacked);
         config.pegged_lamports = config
             .pegged_lamports
             .checked_sub(lamports)
@@ -369,10 +395,81 @@ pub mod bridge {
         )
     }
 
-    pub fn mark_paid(_ctx: Context<MarkPaid>, index: u64) -> Result<()> {
-        msg!("the mainchain paid withdrawal {}", index);
+    /// Puts the oldest open records into the live bundle. Only one bundle
+    /// is live at a time, and a record never leaves its bundle, so no two
+    /// bundles that eCash can pay hold the same record.
+    pub fn seal_bundle(ctx: Context<SealBundle>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require_eq!(
+            config.bundled_through,
+            config.paid_through,
+            BridgeError::BundleLive
+        );
+        require_gt!(
+            config.withdrawal_count,
+            config.bundled_through,
+            BridgeError::NothingToSeal
+        );
+        let through = config
+            .paid_through
+            .checked_add(MAX_BUNDLE_RECORDS)
+            .ok_or(BridgeError::AmountOverflow)?
+            .min(config.withdrawal_count);
+        config.bundled_through = through;
+        config.bundle_sealed_height = config.credited_height;
+        config.bundle_sealed_slot = Clock::get()?.slot;
+        msg!(
+            "the bundle holds records {} to {}",
+            config.paid_through,
+            through
+        );
         Ok(())
     }
+
+    /// Marks the live bundle paid. `through` must name its end, so a repeat
+    /// fails. The bundle must be at least `bundle_min_slots` old, so a stolen
+    /// oracle key closes at most one bundle in that time.
+    pub fn bundle_paid(ctx: Context<BundlePaid>, through: u64) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require_gt!(
+            config.bundled_through,
+            config.paid_through,
+            BridgeError::NoLiveBundle
+        );
+        require_eq!(
+            through,
+            config.bundled_through,
+            BridgeError::NotTheLiveBundle
+        );
+        let ripe = config
+            .bundle_sealed_slot
+            .checked_add(config.bundle_min_slots)
+            .ok_or(BridgeError::AmountOverflow)?;
+        require_gte!(Clock::get()?.slot, ripe, BridgeError::BundleTooYoung);
+        msg!(
+            "the mainchain paid records {} to {}",
+            config.paid_through,
+            through
+        );
+        config.paid_through = through;
+        Ok(())
+    }
+
+    /// Closes the record of a paid withdrawal and returns its rent to the
+    /// owner. Anyone can send it.
+    pub fn close_record(ctx: Context<CloseRecord>, index: u64) -> Result<()> {
+        require_gt!(
+            ctx.accounts.config.paid_through,
+            index,
+            BridgeError::RecordNotPaid
+        );
+        Ok(())
+    }
+}
+
+fn vault_pda(bump: u8) -> Result<Pubkey> {
+    Pubkey::create_program_address(&[VAULT_SEED, &[bump]], &crate::ID)
+        .map_err(|_| error!(BridgeError::BadBump))
 }
 
 /// h* of a BMM bid: SHA-256(Solana block ‖ payee).
@@ -514,12 +611,21 @@ fn can_take(target: &AccountInfo, vault: &Pubkey, lamports: u64, rent: &Rent) ->
     Ok(rent.is_exempt(after, target.data_len()))
 }
 
-/// True when the payee can take the payout. A payee that cannot take it gets
-/// nothing, and the fees go to the next winner.
-fn can_hold(payee: &UncheckedAccount, treasury: Pubkey, payout: u64) -> Result<bool> {
-    if !payee.is_writable || payee.executable || payee.key() == treasury {
+/// True when the payee can take the payout. A payee that the key or the
+/// account rules out gets nothing, and the fees go to the next winner. The
+/// writable flag of the tx never decides: a payee that could take the payout
+/// and comes read-only fails the tx, so no sender can cancel a payout.
+fn can_hold(payee: &UncheckedAccount, excluded: &[Pubkey], payout: u64) -> Result<bool> {
+    if excluded.contains(payee.key)
+        || payee.executable
+        || *payee.owner == crate::ID
+        || *payee.owner == SYSVAR_OWNER
+        || *payee.owner == NATIVE_LOADER
+        || RESERVED_KEYS.contains(payee.key)
+    {
         return Ok(false);
     }
+    require!(payee.is_writable, BridgeError::PayeeNotWritable);
     let Some(after) = payee.lamports().checked_add(payout) else {
         return Ok(false);
     };
@@ -532,9 +638,9 @@ pub struct SettleBmm<'info> {
     pub config: Account<'info, Config>,
     #[account(mut, seeds = [TREASURY_SEED], bump = config.treasury_bump)]
     pub treasury: SystemAccount<'info>,
-    /// CHECK: the program hashes this key into the commitment, and it pays
-    /// only an account that the runtime lets it write. A `mut` constraint would
-    /// fail the tx for a payee that the runtime demotes, for example a program.
+    /// CHECK: the program hashes this key into the commitment. A `mut`
+    /// constraint would fail the tx for a payee that the runtime demotes, for
+    /// example a program, so `can_hold` checks the flag after the key rules.
     pub payee: UncheckedAccount<'info>,
     /// CHECK: the address fixes the account, and the validator builds its data.
     #[account(address = BMM_ANSWER_ID)]
@@ -574,9 +680,23 @@ pub struct Withdraw<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SealBundle<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = oracle)]
+    pub config: Account<'info, Config>,
+    pub oracle: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct BundlePaid<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = oracle)]
+    pub config: Account<'info, Config>,
+    pub oracle: Signer<'info>,
+}
+
+#[derive(Accounts)]
 #[instruction(index: u64)]
-pub struct MarkPaid<'info> {
-    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = oracle)]
+pub struct CloseRecord<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
     #[account(
         mut,
@@ -589,7 +709,6 @@ pub struct MarkPaid<'info> {
     /// CHECK: the record names this account, and it gets the rent back.
     #[account(mut)]
     pub owner: UncheckedAccount<'info>,
-    pub oracle: Signer<'info>,
 }
 
 /// The bridge settings and counters. The genesis writes this account, so no
@@ -597,7 +716,7 @@ pub struct MarkPaid<'info> {
 #[account]
 #[derive(InitSpace)]
 pub struct Config {
-    /// The key that marks a withdrawal paid.
+    /// The key that seals a bundle and marks it paid.
     pub oracle: Pubkey,
     /// The lowest mainchain sequence number that a deposit may still use.
     pub deposit_high_water: u64,
@@ -627,6 +746,21 @@ pub struct Config {
     pub bump: u8,
     pub vault_bump: u8,
     pub treasury_bump: u8,
+    /// The lamports that the genesis put in the vault.
+    pub vault_supply: u64,
+    /// The spendable lamports outside the vault that no deposit backs.
+    /// Withdrawals stay shut until gifts to the vault cover them.
+    pub float_lamports: u64,
+    /// Every record below this index is paid.
+    pub paid_through: u64,
+    /// The records from `paid_through` up to this index are the live bundle.
+    pub bundled_through: u64,
+    /// `credited_height` when the live bundle was sealed. Its M3 comes later.
+    pub bundle_sealed_height: u64,
+    /// The slot that sealed the live bundle.
+    pub bundle_sealed_slot: u64,
+    /// The fewest slots between a seal and its `bundle_paid`.
+    pub bundle_min_slots: u64,
 }
 
 #[account]
@@ -694,4 +828,24 @@ pub enum BridgeError {
     TooFewCredits,
     #[msg("The active eCash chain dropped a block that the Solana block credited.")]
     CreditsDropped,
+    #[msg("The tx sends a BMM payee read-only.")]
+    PayeeNotWritable,
+    #[msg("The mainchain fee is below the minimum.")]
+    FeeTooLow,
+    #[msg("Gifts to the vault do not yet back the genesis float.")]
+    FloatNotBacked,
+    #[msg("A bundle is live.")]
+    BundleLive,
+    #[msg("No open record waits for a bundle.")]
+    NothingToSeal,
+    #[msg("No bundle is live.")]
+    NoLiveBundle,
+    #[msg("The bundle is not the live bundle.")]
+    NotTheLiveBundle,
+    #[msg("The live bundle is younger than the minimum.")]
+    BundleTooYoung,
+    #[msg("The record is not paid.")]
+    RecordNotPaid,
+    #[msg("The config holds a bump that gives no address.")]
+    BadBump,
 }

@@ -13,7 +13,8 @@ use litesvm::LiteSVM;
 use sol_drivechain_bridge::{
     accounts, commitment_of, instruction, AnsweredDeposit, BmmAnswer, Config, DepositAnswer,
     WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, DEPOSIT_ANSWER_ENTRY_LEN,
-    DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID, LAMPORTS_PER_SAT, MAX_SCRIPT_PUBKEY_LEN,
+    DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID, LAMPORTS_PER_SAT, MAX_BUNDLE_RECORDS,
+    MAX_SCRIPT_PUBKEY_LEN, MIN_FEE_SATS,
 };
 use solana_account::Account;
 use solana_instruction::Instruction;
@@ -54,6 +55,12 @@ struct Chain {
 
 impl Chain {
     fn start() -> Self {
+        Self::start_with(0, 0)
+    }
+
+    /// A chain whose genesis holds `float_lamports` of float and asks for
+    /// `bundle_min_slots` between a seal and its payment.
+    fn start_with(float_lamports: u64, bundle_min_slots: u64) -> Self {
         let program_id = sol_drivechain_bridge::ID;
         let config = Pubkey::find_program_address(&[b"config"], &program_id).0;
         let vault = Pubkey::find_program_address(&[b"vault"], &program_id).0;
@@ -90,7 +97,7 @@ impl Chain {
         )
         .unwrap();
 
-        let config_data = genesis_config(oracle.pubkey());
+        let config_data = genesis_config(oracle.pubkey(), float_lamports, bundle_min_slots);
         let config_lamports = svm.minimum_balance_for_rent_exemption(config_data.len());
         svm.set_account(
             config,
@@ -301,23 +308,79 @@ impl Chain {
             }
             .data(),
         );
+        // A repeat of a failed withdrawal must run again, not read as a replay.
+        self.svm.expire_blockhash();
         self.send(instruction, &user)
     }
 
-    fn mark_paid_as(&mut self, signer: &Keypair, index: u64) -> Result<(), String> {
-        let owner = self.user.pubkey();
+    fn seal_as(&mut self, signer: &Keypair) -> Result<(), String> {
         let instruction = self.build(
-            accounts::MarkPaid {
+            accounts::SealBundle {
                 config: self.config,
-                record: self.record_key(index),
-                owner,
                 oracle: signer.pubkey(),
             }
             .to_account_metas(None),
-            instruction::MarkPaid { index }.data(),
+            instruction::SealBundle {}.data(),
         );
         let signer = signer.insecure_clone();
+        self.svm.expire_blockhash();
         self.send(instruction, &signer)
+    }
+
+    fn seal(&mut self) -> Result<(), String> {
+        let oracle = self.oracle.insecure_clone();
+        self.seal_as(&oracle)
+    }
+
+    fn bundle_paid_as(&mut self, signer: &Keypair, through: u64) -> Result<(), String> {
+        let instruction = self.build(
+            accounts::BundlePaid {
+                config: self.config,
+                oracle: signer.pubkey(),
+            }
+            .to_account_metas(None),
+            instruction::BundlePaid { through }.data(),
+        );
+        let signer = signer.insecure_clone();
+        self.svm.expire_blockhash();
+        self.send(instruction, &signer)
+    }
+
+    fn bundle_paid(&mut self, through: u64) -> Result<(), String> {
+        let oracle = self.oracle.insecure_clone();
+        self.bundle_paid_as(&oracle, through)
+    }
+
+    /// Closes a record, sent by a stranger.
+    fn close_record(&mut self, index: u64) -> Result<(), String> {
+        let instruction = self.build(
+            accounts::CloseRecord {
+                config: self.config,
+                record: self.record_key(index),
+                owner: self.user.pubkey(),
+            }
+            .to_account_metas(None),
+            instruction::CloseRecord { index }.data(),
+        );
+        self.send_all(&[instruction])
+    }
+
+    /// Seals the open records, marks the bundle paid, and closes each record.
+    fn pay_out(&mut self) -> Result<(), String> {
+        self.seal()?;
+        let config = self.config();
+        self.bundle_paid(config.bundled_through)?;
+        for index in config.paid_through..config.bundled_through {
+            self.close_record(index)?;
+        }
+        Ok(())
+    }
+
+    /// Sends lamports to the vault, the way any wallet can.
+    fn gift_vault(&mut self, lamports: u64) {
+        let mut account = self.svm.get_account(&self.vault).expect("vault");
+        account.lamports += lamports;
+        self.svm.set_account(self.vault, account).unwrap();
     }
 
     /// Writes the `BmmAnswer` account, the way the patched validator does
@@ -486,7 +549,7 @@ fn nowhere(sequence_number: u64, value_sats: u64) -> AnsweredDeposit {
 }
 
 /// The config account that the genesis writes, in the Anchor layout.
-fn genesis_config(oracle: Pubkey) -> Vec<u8> {
+fn genesis_config(oracle: Pubkey, float_lamports: u64, bundle_min_slots: u64) -> Vec<u8> {
     let program_id = sol_drivechain_bridge::ID;
     let bump = |seed: &[u8]| Pubkey::find_program_address(&[seed], &program_id).1;
     let config = Config {
@@ -506,6 +569,13 @@ fn genesis_config(oracle: Pubkey) -> Vec<u8> {
         bump: bump(b"config"),
         vault_bump: bump(b"vault"),
         treasury_bump: bump(b"treasury"),
+        vault_supply: VAULT_LAMPORTS,
+        float_lamports,
+        paid_through: 0,
+        bundled_through: 0,
+        bundle_sealed_height: 0,
+        bundle_sealed_slot: 0,
+        bundle_min_slots,
     };
     let mut data = Vec::new();
     config
@@ -548,8 +618,16 @@ fn the_discriminator_is_eight_bytes_of_sha256() {
         &hash(b"global:withdraw").to_bytes()[..8]
     );
     assert_eq!(
-        instruction::MarkPaid::DISCRIMINATOR,
-        &hash(b"global:mark_paid").to_bytes()[..8]
+        instruction::SealBundle::DISCRIMINATOR,
+        &hash(b"global:seal_bundle").to_bytes()[..8]
+    );
+    assert_eq!(
+        instruction::BundlePaid::DISCRIMINATOR,
+        &hash(b"global:bundle_paid").to_bytes()[..8]
+    );
+    assert_eq!(
+        instruction::CloseRecord::DISCRIMINATOR,
+        &hash(b"global:close_record").to_bytes()[..8]
     );
     assert_eq!(
         WithdrawalRecord::DISCRIMINATOR,
@@ -591,9 +669,9 @@ fn the_commitment_is_sha256_of_the_solana_block_then_the_payee() {
 fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
     // The daemon writes the genesis config by hand at these offsets.
     let oracle = Pubkey::new_from_array([5u8; 32]);
-    let data = genesis_config(oracle);
+    let data = genesis_config(oracle, 7, 9);
     let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-    assert_eq!(data.len(), 187);
+    assert_eq!(data.len(), 243);
     assert_eq!(&data[..8], Config::DISCRIMINATOR);
     assert_eq!(&data[8..40], oracle.as_ref());
     assert_eq!(at(64), BMM_START);
@@ -606,6 +684,9 @@ fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
         data[184..187],
         [bump(b"config"), bump(b"vault"), bump(b"treasury")]
     );
+    assert_eq!(at(187), VAULT_LAMPORTS);
+    assert_eq!(at(195), 7);
+    assert_eq!(at(235), 9);
 }
 
 #[test]
@@ -1040,7 +1121,7 @@ fn both_balance_equations_hold_from_deposit_to_paid_withdrawal() {
             chain.balance(&chain.vault) + config.pegged_lamports,
             VAULT_LAMPORTS
         );
-        let pending: u64 = (0..config.withdrawal_count)
+        let pending: u64 = (config.paid_through..config.withdrawal_count)
             .filter_map(|index| chain.record(index))
             .map(|record| record.burned_lamports)
             .sum();
@@ -1070,8 +1151,7 @@ fn both_balance_equations_hold_from_deposit_to_paid_withdrawal() {
         .expect("the withdrawal lands");
     check(&chain, treasury_sats, awaiting_sats);
 
-    let oracle = chain.oracle.insecure_clone();
-    chain.mark_paid_as(&oracle, 0).expect("mark_paid succeeds");
+    chain.pay_out().expect("the bundle pays out");
     treasury_sats -= 5_000_000 / LAMPORTS_PER_SAT;
     check(&chain, treasury_sats, awaiting_sats);
 }
@@ -1176,7 +1256,7 @@ fn two_withdrawals_take_two_record_addresses() {
 }
 
 #[test]
-fn mark_paid_closes_the_record_and_returns_the_rent() {
+fn a_paid_record_closes_and_returns_the_rent() {
     let mut chain = Chain::start();
     chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
     chain
@@ -1187,15 +1267,14 @@ fn mark_paid_closes_the_record_and_returns_the_rent() {
     assert!(rent > 0);
     let before = chain.balance(&chain.user.pubkey());
 
-    let oracle = chain.oracle.insecure_clone();
-    chain.mark_paid_as(&oracle, 0).expect("mark_paid succeeds");
+    chain.pay_out().expect("the bundle pays out");
 
     assert!(chain.record(0).is_none());
     assert_eq!(chain.balance(&chain.user.pubkey()) - before, rent);
 }
 
 #[test]
-fn only_the_oracle_marks_a_record_paid() {
+fn only_the_oracle_seals_and_marks_a_bundle_paid() {
     let mut chain = Chain::start();
     chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
     chain
@@ -1203,8 +1282,125 @@ fn only_the_oracle_marks_a_record_paid() {
         .expect("the withdrawal lands");
 
     let thief = chain.a_stranger();
-    assert!(chain.mark_paid_as(&thief, 0).is_err());
+    assert!(chain.seal_as(&thief).is_err());
+    chain.seal().expect("the oracle seals");
+    assert!(chain.bundle_paid_as(&thief, 1).is_err());
+    assert_eq!(chain.config().paid_through, 0);
+    assert!(chain.close_record(0).is_err());
     assert!(chain.record(0).is_some());
+}
+
+#[test]
+fn a_record_stays_in_its_bundle_until_the_bundle_pays() {
+    let mut chain = Chain::start();
+    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    chain
+        .withdraw(0, 5_000_000, 1_000, &A_P2WPKH)
+        .expect("the first withdrawal lands");
+    chain.seal().expect("the first bundle seals");
+    chain
+        .withdraw(1, 2_000_000, 1_000, &A_P2WPKH)
+        .expect("the second withdrawal lands");
+
+    assert!(chain.seal().is_err(), "a second live bundle");
+    let config = chain.config();
+    assert_eq!((config.paid_through, config.bundled_through), (0, 1));
+
+    chain.bundle_paid(1).expect("the first bundle pays");
+    assert!(chain.bundle_paid(1).is_err(), "a repeat of the payment");
+    chain.seal().expect("the second bundle seals");
+    let config = chain.config();
+    assert_eq!((config.paid_through, config.bundled_through), (1, 2));
+    assert!(chain.bundle_paid(1).is_err(), "a stale payment");
+}
+
+#[test]
+fn a_seal_without_an_open_record_fails() {
+    let mut chain = Chain::start();
+    assert!(chain.seal().is_err());
+    assert!(chain.bundle_paid(0).is_err());
+}
+
+#[test]
+fn a_bundle_holds_at_most_the_record_cap() {
+    let mut chain = Chain::start();
+    chain.deposit(0, 100_000_000).expect("the deposit lands");
+    let each = (MIN_FEE_SATS + 600) * LAMPORTS_PER_SAT;
+    for index in 0..=MAX_BUNDLE_RECORDS {
+        chain.svm.expire_blockhash();
+        chain
+            .withdraw(index, each, MIN_FEE_SATS, &A_P2WPKH)
+            .expect("the withdrawal lands");
+    }
+    chain.seal().expect("the bundle seals");
+    assert_eq!(chain.config().bundled_through, MAX_BUNDLE_RECORDS);
+    chain
+        .bundle_paid(MAX_BUNDLE_RECORDS)
+        .expect("the bundle pays");
+    chain.seal().expect("the rest seals");
+    assert_eq!(chain.config().bundled_through, MAX_BUNDLE_RECORDS + 1);
+}
+
+#[test]
+fn a_bundle_younger_than_the_minimum_cannot_be_marked_paid() {
+    let mut chain = Chain::start_with(0, 1_000);
+    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    chain
+        .withdraw(0, 5_000_000, 1_000, &A_P2WPKH)
+        .expect("the withdrawal lands");
+    chain.seal().expect("the bundle seals");
+    let sealed = chain.config().bundle_sealed_slot;
+    chain.svm.warp_to_slot(sealed + 999);
+    assert!(chain.bundle_paid(1).is_err());
+    chain.svm.warp_to_slot(sealed + 1_000);
+    chain
+        .bundle_paid(1)
+        .expect("the bundle pays at the minimum age");
+}
+
+#[test]
+fn the_seal_keeps_the_ecash_height_of_the_credits() {
+    let mut chain = Chain::start();
+    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    chain
+        .withdraw(0, 5_000_000, 1_000, &A_P2WPKH)
+        .expect("the withdrawal lands");
+    chain.seal().expect("the bundle seals");
+    assert_eq!(chain.config().bundle_sealed_height, DEPOSIT_START + 1);
+}
+
+#[test]
+fn a_fee_below_the_minimum_fails() {
+    let mut chain = Chain::start();
+    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    assert!(chain
+        .withdraw(0, 5_000_000, MIN_FEE_SATS - 1, &A_P2WPKH)
+        .is_err());
+    chain
+        .withdraw(0, 5_000_000, MIN_FEE_SATS, &A_P2WPKH)
+        .expect("the minimum fee lands");
+}
+
+#[test]
+fn the_float_cannot_peg_out_before_gifts_back_it() {
+    let float = 3_000_000;
+    let mut chain = Chain::start_with(float, 0);
+    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    assert!(chain.withdraw(0, 5_000_000, 1_000, &A_P2WPKH).is_err());
+    chain.gift_vault(float - 1);
+    assert!(chain.withdraw(0, 5_000_000, 1_000, &A_P2WPKH).is_err());
+    chain.gift_vault(1);
+    chain
+        .withdraw(0, 5_000_000, 1_000, &A_P2WPKH)
+        .expect("the backed float lets the withdrawal land");
+}
+
+#[test]
+fn a_gift_to_the_vault_backs_nothing_beyond_the_pegged_total() {
+    let mut chain = Chain::start();
+    chain.deposit(0, 100_000).expect("the deposit lands");
+    chain.gift_vault(100_000_000);
+    assert!(chain.withdraw(0, 2_000_000, 1_000, &A_P2WPKH).is_err());
 }
 
 #[test]
@@ -1544,4 +1740,41 @@ fn a_second_settle_in_the_same_tx_fails_the_tx() {
     let repeat = chain.settle_ix(BMM_START, SOLANA_BLOCK, winner);
     assert!(chain.send_all(&[first, repeat]).is_err());
     assert_eq!(chain.config().bmm_next_height, BMM_START);
+}
+
+#[test]
+fn a_read_only_payee_fails_the_tx_and_the_height_stays() {
+    let mut chain = Chain::start();
+    let winner = chain.a_stranger().pubkey();
+    chain.pay_fees(2_000_000);
+    chain.win(BMM_START, winner);
+
+    let mut instruction = chain.settle_ix(BMM_START, SOLANA_BLOCK, winner);
+    for meta in instruction.accounts.iter_mut() {
+        if meta.pubkey == winner {
+            meta.is_writable = false;
+        }
+    }
+    assert!(chain.send_all(&[instruction]).is_err());
+    assert_eq!(chain.config().bmm_next_height, BMM_START);
+    assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 2_000_000);
+
+    let before = chain.balance(&winner);
+    chain
+        .settle(BMM_START, winner)
+        .expect("the writable settle lands");
+    assert_eq!(chain.balance(&winner) - before, 2_000_000);
+}
+
+#[test]
+fn the_vault_as_the_payee_gets_nothing_and_the_height_settles() {
+    let mut chain = Chain::start();
+    let vault = chain.vault;
+    chain.pay_fees(2_000_000);
+    chain.win(BMM_START, vault);
+
+    chain.settle(BMM_START, vault).expect("the height settles");
+    assert_eq!(chain.balance(&vault), VAULT_LAMPORTS);
+    assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 2_000_000);
+    assert_eq!(chain.config().bmm_next_height, BMM_START + 1);
 }
