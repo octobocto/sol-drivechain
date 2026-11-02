@@ -62,16 +62,22 @@ Nothing else is a fork.
 The genesis stores them and the bank ignores them. The base fee stays 5000
 lamports per signature, and the patch sends all of it to the treasury.
 
-The genesis still holds about 2 SOL that no Bitcoin backs: the validator
-identity and the oracle hold 1 SOL each as a buffer for their fees. The rent
-reserves of the genesis accounts add a few lamports more. The stock runtime
+The genesis still holds a float that no Bitcoin backs: the validator
+identity and the oracle hold 0.01 SOL each for their fees, and the stake, vote,
+faucet, and DEX fee accounts hold a few lamports more. The rent reserves of the
+programs and the sysvars add more, but nobody can spend them. The stock runtime
 also creates the rent of its sysvars at slots 0 and 1, about 0.0007 SOL. After
 slot 1 the supply never changes. Upstream gives each vote account a 160 SOL
 Validator Admission Ticket reserve. The patch drops that reserve, because the
 genesis deactivates SIMD-0357 and no ticket is ever burnt.
 
-None of that float can peg out. The bridge counts `pegged_lamports` and
-subtracts with a checked subtraction.
+Lamports are fungible, so a holder of float could peg out the Bitcoin of a
+depositor. The bridge config holds the spendable float (`float_lamports`) and
+the genesis supply of the vault (`vault_supply`). `withdraw` fails until
+`vault + pegged >= vault_supply + float_lamports`, that is, until gifts to the
+vault back the whole float. Run `back-float` once after the first deposit. From
+then on, each spendable lamport has Bitcoin behind it, and no withdrawal can
+exceed `pegged_lamports`.
 
 ## Every network from the start
 
@@ -137,31 +143,41 @@ index 0.
 
 ## The books
 
-Two equations hold at all times:
+Three equations hold at all times:
 
-- `vault + pegged = 21M SOL`. Stranded coins are inside the vault.
+- `vault + pegged = vault_supply + gifts`. Stranded coins are inside the
+  vault. A gift to the vault only adds backing.
+- `gifts >= float_lamports`, after `back-float`.
 - `eCash treasury x 10 = pegged + stranded + awaiting credit + pending
   withdrawals`. A deposit raises the eCash treasury before its credit, and a
   withdrawal lowers `pegged` before eCash pays it.
 
-`bridge-state --books` prints each term of both equations, and it fails when
+`bridge-state --books` prints each term of the equations, and it fails when
 one does not hold. "Awaiting credit" is every deposit on the active eCash
-chain after the cursor. "Pending withdrawals" is every open withdrawal record.
-Between the eCash payment of a bundle and its `mark_paid`, the second equation
-is off by that bundle for a few seconds.
+chain after the cursor. "Pending withdrawals" is every record from
+`paid_through` that eCash did not pay. The live bundle stops to count as soon
+as eCash pays it.
 
 ## How a withdrawal works
 
-1. A user calls `withdraw` with a Bitcoin script pubkey and a fee. It burns
-   the lamports into the vault and writes a record.
-2. The daemon packs every open record into one blinded M6 and calls
-   `ProposeWithdrawalBundle`.
-3. It sets the withdrawal bundle policy to `KNOWN`, so a miner upvotes only a
-   bundle whose transaction that node holds.
-4. Miners vote. On `Succeeded` the daemon reads the paid M6, matches each
-   payout to a record, and closes it.
-5. A bundle that expires leaves its records open, and the next bundle carries
-   them again. No money disappears.
+1. A user calls `withdraw` with a Bitcoin script pubkey and a fee of at least
+   1000 sats. It burns the lamports into the vault and writes a record.
+2. When no bundle is live, the oracle sends `seal_bundle`. The live bundle is
+   the records from `paid_through` to `bundled_through`, at most 1500. One
+   bundle is live at a time, and a record never leaves its bundle, so no two
+   bundles that eCash can pay hold the same record.
+3. After the seal is `finalized`, the daemon builds the blinded M6 from the
+   records in index order and calls `ProposeWithdrawalBundle`. The same
+   records always give the same M6ID, so each daemon proposes the same bundle.
+   The daemon sets the bundle policy to `KNOWN`.
+4. Each pass reads the history of the active eCash chain from the seal. A
+   failed bundle goes back to the enforcer unchanged. When eCash paid the
+   bundle D blocks deep, the oracle sends `bundle_paid`, and the daemon then
+   closes each paid record with `close_record`, which anyone can send.
+
+No pass trusts an event stream or memory, so a restart, a lost event, an RPC
+error, or an eCash reorg leaves no paid record open. An error in a pass goes
+to the log, and the next pass tries again.
 
 ## BMM
 
@@ -285,9 +301,11 @@ answer. A node that replays from the genesis without the file of the node that
 ran the slot still needs the enforcer answer.
 
 A payee that cannot take the payout gets nothing, and the fees go to the next
-winner. The settle still lands. That holds for an account below its rent
-reserve, for an executable account, and for an account that the runtime
-demotes to read only.
+winner. The settle still lands. The key and the account decide this, never the
+tx: a bridge account, a reserved key, an executable account, an account of the
+sysvar or native loader owner, and an account below its rent reserve. Any
+other payee must come writable, or the tx fails, so no sender can cancel a
+payout.
 
 ## Depths
 
@@ -391,9 +409,14 @@ chain has no entrypoint, so it cannot learn its own address. Its operator sets
 
 The mainchain releases the Bitcoin, not a key. A credit needs no key: the
 bridge takes the deposits that each validator reads from its own enforcer.
-The oracle key only marks a withdrawal paid after eCash paid it, and that
-closes a record and returns its rent. The bridge counts `pegged_lamports`, so
-the genesis lamports of the validator can never peg out.
+The oracle key seals a bundle and marks it paid after eCash paid it. The
+program cannot see eCash, so it trusts the oracle for the payment. A stolen
+oracle key, or a false enforcer answer, can mark the live bundle paid before
+eCash pays it. Those records then close without a payout. The key cannot mark
+a record outside the live bundle, cannot move a lamport, and cannot mark a
+bundle paid before `bundle_min_slots` after its seal, about 18 days on eCash.
+So it closes at most one bundle in that time. Keep the enforcer on the same
+host as the daemon, because its gRPC has no TLS.
 
 No key controls BMM. The coinbase commits to the payee, the pair names it, and
 any user can send the settle that pays it.
@@ -624,18 +647,22 @@ needs a new genesis. `scripts/migrate-genesis.sh` carries the money over:
 
 - the balance of each system account without data: every wallet, the vault,
   the treasury, the oracle, the faucet, and the validator identity,
-- each open withdrawal record, byte for byte, so eCash still pays it,
-- the deposit cursor and the counters of the bridge config.
+- the lamports of each stake and vote account, as plain lamports to its
+  withdrawer,
+- each withdrawal record, nonce account, token account, and DEX account, byte
+  for byte, so eCash still pays each open withdrawal,
+- the cursor, the float, the bundle, and the counters of the bridge config.
 
 The new chain credits only the deposits after the cursor. No deposit replay
-occurs, so no coin gets credited two times. A config from the oracle era
-holds no eCash height, so the script finds the eCash block of the last
-credited deposit through the enforcer. BMM on the new chain settles from the
-eCash tip at the migration.
+occurs, so no coin gets credited two times. BMM on the new chain settles from
+the eCash tip at the migration. The export takes only a config of the current
+layout, and it refuses any other.
 
-Token accounts, pools, vote and stake accounts, and nonce accounts stay
-behind. The operator seeds the pools again. The script prints how many
-lamports it copied out of the old supply.
+The export adds up the lamports that it reads, and it stops when they are not
+the whole supply, or when an account of another program holds lamports. The
+new bootstrap stake and vote accounts take their lamports out of the old
+identity, the faucet keeps its old balance, and the oracle gets nothing new,
+so a migration adds no float.
 
 1. Back up the old ledger, the keys, `bmm-pairs`, and `bmm-answers`.
 2. Stop each sender of transactions: the public RPC proxy, the peg, the BMM
@@ -691,15 +718,16 @@ with mode 600.
 | `watch` | Prints every peg event that the mainchain sends. |
 | `address` | Prints the deposit address of a Solana pubkey. |
 | `derive` | Prints the bridge program addresses. |
-| `genesis` | Writes the primordial accounts: the vault, the treasury, the bridge config, the block record, and the oracle. With `--state`, it adds the accounts of a halted chain. |
+| `genesis` | Writes the primordial accounts: the vault, the treasury, the bridge config, the block record, the oracle, and the DEX accounts. With `--state`, it adds the accounts of a halted chain. |
 | `migrate-state` | Reads the balances, the open withdrawals, and the cursor of a halted chain into a file. |
 | `state-lamports` | Prints the lamports of one account in that file. |
 | `seed-pubkey` | Prints the addresses of a BIP39 seed phrase. |
 | `seed-keypair` | Writes a Solana keypair file from that phrase. |
 | `withdraw` | Burns lamports and asks the mainchain to pay an address. |
+| `back-float` | Sends the lamports to the vault that the float still needs, so withdrawals open. |
 | `bridge-state` | Prints the bridge config, the vault, the treasury, and the BMM totals. With `--books`, it checks both balance equations. |
 | `credit` | Credits the deposits of each eCash height in order. Anyone can run it. |
-| `run` | Runs the peg: the credits, the withdrawal bundles, and `mark_paid`. |
+| `run` | Runs the peg: the credits, the seals, the bundles, `bundle_paid`, and the closes. |
 | `bmm` | Bids for eCash blocks, publishes the pairs, and settles the commitments in height order. With `--rpc-listen`, it serves the templates for drivechaind. |
 | `bid-bmm` | Sends one bid for the newest block that passes rule 3, and publishes its pair. |
 | `publish-pair` | Publishes one pair to a validator. |
