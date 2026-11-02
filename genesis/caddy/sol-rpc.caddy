@@ -1,6 +1,6 @@
-	# The SOL drivechain JSON-RPC. The validator binds 127.0.0.1 only, so
-	# this proxy is the one way to the RPC. The gossip ports stay open, so
-	# any user can join the chain with a validator of its own.
+	# The SOL drivechain JSON-RPC for wallets, POST only. The validator RPC
+	# also answers the peers on its own port, for the genesis, the snapshots,
+	# and the BMM pairs. The gossip ports stay open, so any user can join.
 	handle_path /sol/* {
 		@sol_rpc method POST OPTIONS
 		handle @sol_rpc {

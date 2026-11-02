@@ -6,7 +6,12 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LEDGER="${LEDGER:-$REPO/genesis/ledger}"
+# shellcheck source=genesis/depths.sh
+. "$REPO/genesis/depths.sh"
+# No default: the default ledger of run-validator.sh holds a live chain.
+LEDGER="${LEDGER:-}"
+# REPLACE_LEDGER=1 deletes a ledger that exists. Without it, the script stops.
+REPLACE_LEDGER="${REPLACE_LEDGER:-0}"
 KEYS="${KEYS:-$REPO/keys}"
 PROGRAM_SO="${PROGRAM_SO:-$REPO/target/deploy/sol_drivechain_bridge.so}"
 DAEMON="${DAEMON:-}"
@@ -50,10 +55,9 @@ ORACLE_LAMPORTS="${ORACLE_LAMPORTS:-10000000}"
 # counts the deposits up to it as credited, so it is the eCash tip at the
 # start. D is the eCash confirmations before a credit. A checkpoint at eCash
 # height H counts only when its bank credited every deposit through H minus
-# DEPOSIT_LAG. K and L are validator flags in run-validator.sh.
+# DEPOSIT_LAG. NETWORK selects both. K and L are validator flags in
+# run-validator.sh.
 ECASH_START_HEIGHT="${ECASH_START_HEIGHT:-}"
-DEPOSIT_CONFIRMATIONS="${DEPOSIT_CONFIRMATIONS:-6}"
-DEPOSIT_LAG="${DEPOSIT_LAG:-100}"
 # A validator leads only up to one epoch after its root, and a BMM root comes
 # 30 to 120 minutes after its block. The development default of 8192 slots is
 # about 55 minutes, so the chain stopped. 432000 slots is about 2 days.
@@ -83,6 +87,19 @@ VOTE_LAMPORTS=$(((128 + 3762) * LAMPORTS_PER_BYTE_YEAR))
 
 # One satoshi per signature. The stock 5000 lamports is 500 satoshis.
 LAMPORTS_PER_SIGNATURE="${LAMPORTS_PER_SIGNATURE:-10}"
+
+network_depths
+require_depths DEPOSIT_CONFIRMATIONS DEPOSIT_LAG
+
+if [ -z "$LEDGER" ]; then
+  echo "error: set LEDGER to the directory of the new ledger." >&2
+  exit 1
+fi
+if [ -e "$LEDGER" ] && [ "$REPLACE_LEDGER" != 1 ]; then
+  echo "error: $LEDGER exists. It can hold a live chain, so the script keeps it." >&2
+  echo "Pick a new directory, or set REPLACE_LEDGER=1 to delete it." >&2
+  exit 1
+fi
 
 if [ -z "$SOLANA_GENESIS" ] || [ ! -x "$SOLANA_GENESIS" ]; then
   echo "error: solana-genesis is missing. No Agave CLI release carries it." >&2

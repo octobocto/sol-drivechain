@@ -71,7 +71,7 @@ supply() {
 }
 books() {
   "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
-    --books --enforcer-url "$ENFORCER_URL" --slot "$SLOT"
+    --books --network regtest --enforcer-url "$ENFORCER_URL" --slot "$SLOT"
 }
 # The peg marks a paid withdrawal a few seconds after eCash pays it, and the
 # books close after that.
@@ -130,7 +130,7 @@ step "the Solana chain"
 # The genesis writes the bridge config: BMM settles from this eCash height,
 # and the credits start after it.
 BMM_START="$(btc getblockcount)"
-LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$BMM_START" \
+NETWORK=regtest LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$BMM_START" \
   DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 \
   ORACLE_LAMPORTS=2000000 BOOTSTRAP_LAMPORTS=2000000 \
   bash "$REPO/genesis/build-genesis.sh" > "$ROOT/genesis.log"
@@ -139,7 +139,7 @@ LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$BMM_START" \
 cp -R "$ROOT/ledger" "$ROOT/ledger2"
 LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
   GOSSIP_PORT="$SOLANA_GOSSIP_PORT" XDP=0 \
-  ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
+  NETWORK=regtest ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
   BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" ALLOW_PRIVATE_ADDR=1 \
   nohup bash "$REPO/genesis/run-validator.sh" > "$ROOT/validator.log" 2>&1 &
 VALIDATOR_PID=$!
@@ -362,7 +362,7 @@ rm -f "$ROOT/keys2/validator-identity.json"
 "$SOLANA_KEYGEN" new --no-bip39-passphrase --silent -o "$ROOT/keys2/validator-identity.json"
 LEDGER="$ROOT/ledger2" KEYS="$ROOT/keys2" RPC_PORT="$((SOLANA_RPC_PORT + 10))" \
   GOSSIP_PORT="$((SOLANA_GOSSIP_PORT + 10))" XDP=0 NO_VOTE=1 \
-  ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
+  NETWORK=regtest ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
   BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" ALLOW_PRIVATE_ADDR=1 \
   BIND_ADDRESS=127.0.0.1 NO_SNAPSHOT_FETCH=1 \
   ENTRYPOINT="127.0.0.1:$SOLANA_GOSSIP_PORT" \
@@ -386,10 +386,10 @@ SECOND_SLOT_BEFORE="$("$SOLANA" -u "$SECOND_URL" slot)"
 echo "the second validator replays at slot $SECOND_SLOT_BEFORE"
 
 start_bid_loop() {
-  nohup "$D" bmm --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
+  nohup "$D" bmm --network regtest --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
     --slot "$SLOT" --program-id "$PROGRAM_ID" \
     --identity "$ROOT/keys/validator-identity.json" \
-    --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --interval-secs 1 \
+    --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --max-bid-sats 100000000 --interval-secs 1 \
     >> "$ROOT/bmm.log" 2>&1 &
   BMM_PID=$!
   PIDS+=("$BMM_PID")
@@ -432,10 +432,11 @@ wait "$BMM_PID" 2>/dev/null || true
 # A new block drops the last bid of the old loop, so only the M8 below can win.
 "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
 BMM_RPC_URL="http://127.0.0.1:$BMM_RPC_PORT"
-NO_COLOR=1 nohup "$D" bmm --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
+NO_COLOR=1 nohup "$D" bmm --network regtest --enforcer-url "$ENFORCER_URL" \
+  --solana-rpc-url "$SOLANA_URL" \
   --slot "$SLOT" --program-id "$PROGRAM_ID" \
   --identity "$ROOT/keys/validator-identity.json" \
-  --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --interval-secs 1 \
+  --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --max-bid-sats 100000000 --interval-secs 1 \
   --rpc-listen "127.0.0.1:$BMM_RPC_PORT" --no-bid \
   > "$ROOT/bmm-rpc.log" 2>&1 &
 BMM_PID=$!
@@ -661,7 +662,7 @@ wait "$VALIDATOR_PID" 2>/dev/null || true
 step "migration: the halted chain goes into a new genesis"
 LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
   GOSSIP_PORT="$SOLANA_GOSSIP_PORT" XDP=0 HALT=1 \
-  ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
+  NETWORK=regtest ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
   BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" ALLOW_PRIVATE_ADDR=1 \
   nohup bash "$REPO/genesis/run-validator.sh" > "$ROOT/validator-halted.log" 2>&1 &
 HALTED_PID=$!
@@ -694,7 +695,7 @@ wait "$HALTED_PID" 2>/dev/null || true
 step "migration: the new chain starts"
 LEDGER="$ROOT/ledger-new" KEYS="$ROOT/keys" RPC_PORT="$SOLANA_RPC_PORT" \
   GOSSIP_PORT="$SOLANA_GOSSIP_PORT" XDP=0 \
-  ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
+  NETWORK=regtest ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" \
   BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" ALLOW_PRIVATE_ADDR=1 \
   nohup bash "$REPO/genesis/run-validator.sh" > "$ROOT/validator-new.log" 2>&1 &
 VALIDATOR_PID=$!
