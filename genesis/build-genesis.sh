@@ -34,11 +34,13 @@ LOADER="${LOADER:-BPFLoader2111111111111111111111111111111111}"
 
 VAULT_SOL="${VAULT_SOL:-21000000}"
 
-# The token programs and the DEX program come from Solana mainnet. Set DEX=0 to
-# build a chain with the bridge alone.
+# The token programs come from Solana mainnet, and CP-Swap comes from a pinned
+# source build without an admin key. Set DEX=0 to build a chain with the
+# bridge alone.
 DEX="${DEX:-1}"
 DEX_PROGRAMS="${PROGRAMS:-$REPO/genesis/programs}"
 TOKEN_ID=TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+TOKEN_2022_ID=TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
 ATA_ID=ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
 MEMO_ID=MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr
 CPMM_ID=CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C
@@ -145,14 +147,12 @@ FAUCET="$("$SOLANA_KEYGEN" pubkey "$KEYS/faucet.json")"
 DEX_FLAGS=()
 DEX_ARGS=()
 if [ "$DEX" = "1" ]; then
-  # A token account takes 165 bytes, and this rent schedule makes it exempt.
-  PROGRAMS="$DEX_PROGRAMS" \
-    FEE_OWNER="$("$SOLANA_KEYGEN" pubkey "$KEYS/faucet.json")" \
-    FEE_LAMPORTS=$(((128 + 165) * LAMPORTS_PER_BYTE_YEAR * 2)) \
+  PROGRAMS="$DEX_PROGRAMS" LAMPORTS_PER_BYTE_YEAR="$LAMPORTS_PER_BYTE_YEAR" \
     bash "$REPO/genesis/fetch-dex-programs.sh"
   DEX_ARGS=(--dex-accounts "$REPO/genesis/dex-accounts.yaml")
   DEX_FLAGS=(
     --bpf-program "$TOKEN_ID" "$LOADER" "$DEX_PROGRAMS/token.so"
+    --bpf-program "$TOKEN_2022_ID" "$LOADER" "$DEX_PROGRAMS/token-2022.so"
     --bpf-program "$ATA_ID" "$LOADER" "$DEX_PROGRAMS/ata.so"
     --bpf-program "$MEMO_ID" "$LOADER" "$DEX_PROGRAMS/memo.so"
     --bpf-program "$CPMM_ID" "$LOADER" "$DEX_PROGRAMS/cpmm.so"
