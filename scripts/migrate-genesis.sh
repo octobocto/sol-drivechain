@@ -38,7 +38,7 @@ PROGRAM_ID="$(cat "$KEYS/bridge-program.pubkey")"
 
 echo "== the state of the halted chain"
 "$DAEMON" migrate-state --solana-rpc-url "$OLD_RPC" --program-id "$PROGRAM_ID" \
-  --enforcer-url "$ENFORCER_URL" --slot "$SIDECHAIN_SLOT" --out "$STATE"
+  --out "$STATE"
 
 echo "== the new genesis"
 TIP="$("$DAEMON" ecash-tip --network "$NETWORK" --enforcer-url "$ENFORCER_URL" \
