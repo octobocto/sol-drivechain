@@ -82,13 +82,15 @@ exceed `pegged_lamports`.
 ## Every network from the start
 
 `--network` takes `ecash`, `alphanet`, `betanet`, `mainnet`, `testnet`,
-`signet`, or `regtest`. The daemon asks the enforcer which network it runs, and it stops on
-a mismatch.
+`signet`, or `regtest`. Each command that talks to an enforcer asks it which
+network it runs, and it stops on a mismatch.
 
-eCash runs `chain=main`, so its networks report as mainnet. The enforcer tells
-them apart with `--fork` (`ecash`, `ecash-betanet`, `ecash-alphanet`), not
-with the chain name.
-The BIP300 thresholds do differ, and `status` prints them.
+eCash runs `chain=main`, so its networks report as mainnet. The daemon tells
+them apart by the withdrawal bundle threshold and the BIP300 activation height
+of the enforcer: 6048 and 973728 on eCash, 13150 and 967680 on betanet, 72
+and 963648 on alphanet. Bitcoin mainnet has 13150 and no activation. A chain
+with other values matches no network, and the daemon stops. `status` prints
+the thresholds.
 
 Numbers read from the live eCash betanet on 2026-09-20, and for eCash from
 `Thresholds::ECX_MAINNET` in the enforcer. On eCash, a withdrawal bundle waits at
@@ -209,8 +211,12 @@ commitments than the honest bidders since the split.
 2. **Bid.** For each new eCash tip T, the `bmm` loop reads the block record
    of the branch that its validator follows, at `processed`. It takes the
    newest block whose bank passes rule 3 for height T + 1, and it sends one
-   BMM request with h* for that block. The bid is at most the fee income of
-   one block interval, from the growth of `treasury + bmm_paid_total`.
+   BMM request with h* for that block. The bid is a part of the median fee
+   income of one eCash block over the last N + 1 blocks, and at most
+   `--max-bid-sats`. The loop counts only the fees that the blocks paid into
+   the treasury, from `getBlock`. A transfer to the treasury is no fee, and
+   one block with a high fee does not move the median. `getBlock` needs
+   `--enable-rpc-transaction-history`, and `run-validator.sh` sets it.
 3. **Pair.** The bidder sends the pair (T + 1, bank hash, payee) to the RPC
    method `bmmPublishPairs` of a validator. Each validator keeps the pairs in
    `bmm-pairs` in its ledger directory, and sends them to the RPC of every
@@ -233,15 +239,15 @@ commitments than the honest bidders since the split.
 BitWindow and drivechaind pay the bids, as for the other sidechains. Start the
 bids with `drivechain-cli bmm start --max-bid <sats> solana`. drivechaind takes
 a template from the daemon, sends the M8 from a BitWindow wallet, and the
-daemon settles the wins. Run the daemon with `bmm --rpc-listen
-127.0.0.1:6008 --no-bid`. `--no-bid` stops its own bids. The publish of the
-pairs and the settles continue.
+daemon settles the wins. Run the daemon with `bmm --network ecash
+--max-bid-sats <sats> --rpc-listen 127.0.0.1:6008 --no-bid`. `--no-bid` stops
+its own bids. The publish of the pairs and the settles continue.
 
 The rpc is JSON-RPC 2.0 over HTTP POST:
 
 | Method | Params | Result |
 |---|---|---|
-| `get_block_template` | none | `critical_hash` (h* in hex, the bytes of the M8), `block` (`prev_main_hash` as the explorers show it, `height` = tip + 1, `bank_hash`, `payee`, `slot`), and `fees_sats`, the bid that the fees allow. The daemon publishes the pair before it answers. |
+| `get_block_template` | none | `critical_hash` (h* in hex, the bytes of the M8), `block` (`prev_main_hash` as the explorers show it, `height` = tip + 1, `bank_hash`, `payee`, `slot`), and `fees_sats`, the bid that the fees allow, at most `--max-bid-sats`. The daemon publishes the pair before it answers. |
 | `connect_block` | `[block, main_block_hash]` | `true` when the active eCash block at `block.height` is `main_block_hash` and commits to the pair. |
 | `get_bmm_inclusions` | `[critical_hash]` | The active eCash blocks that carry `critical_hash`. |
 | `template_valid` | `[block]` | `true` while the block record holds the bank, and the bank passes rule 3. |
@@ -309,7 +315,7 @@ payout.
 
 ## Depths
 
-| Value | Where | Betanet | eCash | What it does |
+| Value | Where | Betanet and regtest | eCash | What it does |
 |---|---|---|---|---|
 | D | `deposit_confirmations` in the bridge config, from the genesis | 6 | 12 | A credit waits for D eCash confirmations. |
 | lag | `deposit_lag` in the bridge config, from the genesis | 100 | 100 | A checkpoint at eCash height H counts only when its bank credited every deposit through H - lag. |
@@ -318,10 +324,13 @@ payout.
 | L | `--bmm-fallback-blocks` on each validator | 6 | 12 | After L eCash blocks without a checkpoint, the stake votes move the root. |
 | epoch | `slots_per_epoch` in the genesis | 8192 | 432000 | A validator leads only up to one epoch after its root. |
 
-`build-genesis.sh` writes D and the lag into the bridge config
-(`DEPOSIT_CONFIRMATIONS`, `DEPOSIT_LAG`). Every validator reads the same config,
-so every validator uses the same values. `run-validator.sh` passes N, K, and L
-(`BMM_CONFIRMATIONS`, `BMM_ROOT_DEPTH`, `BMM_FALLBACK_BLOCKS`).
+`genesis/depths.sh` holds this table. `build-genesis.sh` and
+`run-validator.sh` read `NETWORK` and take its values. A value in the
+environment wins: `DEPOSIT_CONFIRMATIONS`, `DEPOSIT_LAG`, `BMM_CONFIRMATIONS`,
+`BMM_ROOT_DEPTH`, `BMM_FALLBACK_BLOCKS`. Alphanet, mainnet, testnet, and
+signet have no values here, so the scripts ask for each one.
+`build-genesis.sh` writes D and the lag into the bridge config. Every
+validator reads the same config, so every validator uses the same values.
 
 `build-genesis.sh` sets 432000 slots per epoch (`SLOTS_PER_EPOCH`), about 2
 days. A BMM root comes 30 to 120 minutes after its block. When the root falls a
@@ -381,7 +390,7 @@ account holds an admission ticket, and a validator can stake any amount.
 
 ```sh
 mkdir -p ~/sol-drivechain/ledger
-LEDGER=~/sol-drivechain/ledger KEYS=~/sol-drivechain/keys \
+LEDGER=~/sol-drivechain/ledger KEYS=~/sol-drivechain/keys NETWORK=ecash \
 ENFORCER_URL=http://127.0.0.1:50051 SIDECHAIN_SLOT=8 \
 RPC_BIND_ADDRESS=0.0.0.0 \
 ENTRYPOINT=204.168.254.113:8001 \
@@ -393,8 +402,8 @@ bash genesis/run-validator.sh
 5. To vote, create a vote account, peg in Bitcoin, and delegate stake to it.
    The stake activates at the next epoch. Stake makes blocks and gives
    `confirmed`, but BMM checkpoints select the branch.
-6. To earn fees, run `daemon bmm --rpc-listen 127.0.0.1:6008 --no-bid`
-   beside the node, and start the bids in BitWindow or with
+6. To earn fees, run `daemon bmm --network ecash --max-bid-sats <sats>
+   --rpc-listen 127.0.0.1:6008 --no-bid` beside the node, and start the bids in BitWindow or with
    `drivechain-cli bmm start --max-bid <sats> solana`. The daemon publishes
    the pairs and settles. Without `--no-bid`, it bids from the enforcer
    wallet.
@@ -477,7 +486,8 @@ $D watch $E                        # the deposit event names the account
 A wallet reaches the chain through a reverse proxy.
 `genesis/caddy/sol-rpc.caddy` holds the block, and it takes POST only. The
 gossip ports stay open, because any user may join the chain. The RPC port also
-stays open to the peers, because each validator sends the BMM pairs there.
+stays open to the peers: a joiner reads the genesis and a snapshot there, and
+each validator sends the BMM pairs there.
 
 ```sh
 solana config set --url https://seed.alpha.ecash.eu.com/sol/
@@ -577,15 +587,44 @@ refuses that spend. The faucet covers every builder until betanet opens.
 
 ## The DEX
 
-The regtest chain carries four Solana mainnet programs at their mainnet
-addresses: SPL Token, the associated token account program, Memo, and the
-Raydium CP-Swap AMM. `genesis/fetch-dex-programs.sh` copies each program from
-a mainnet RPC, and it pins the bytes in `genesis/dex-programs.sha256`.
+The genesis carries five programs at their Solana mainnet addresses: SPL
+Token, Token-2022, the associated token account program, Memo, and the Raydium
+CP-Swap AMM. `genesis/dex-programs.sha256` pins the bytes of each one, and
+`genesis/fetch-dex-programs.sh` stops when a program does not match.
 
-CP-Swap keeps its fees in an `AmmConfig` account that only its admin makes.
-That account is a PDA of the program, so the genesis carries a copy of the
-mainnet account at the same address. The genesis also carries the wrapped SOL
-mint and the token account that takes the pool creation fee.
+- The four token programs come from a mainnet RPC. A mainnet upgrade changes
+  their bytes, so the script stops until a person checks the new bytes and
+  changes the manifest.
+- CP-Swap comes from `genesis/build-cpmm.sh`. It builds a pinned Raydium
+  commit in the pinned Solana verifiable build image, so each host gets the
+  same bytes. Docker is necessary.
+
+Upstream CP-Swap hard-codes the keys of the Raydium admin. That admin can
+change the fees, stop the deposits, the withdrawals, and the swaps of a pool,
+and take the protocol and fund fees. The build replaces each authority key
+with `8JFDDCpHbgKntaU6t66EGqCT5RCMuvdDRsxWPuhPd8eC`, the SHA-256 of
+`sol-drivechain: nobody holds this key` and a zero byte. That value is not on
+the ed25519 curve, so no signature can match it. So nobody can do one of
+these:
+
+| Instruction | What it stays |
+|---|---|
+| `create_amm_config`, `update_amm_config` | The one config of the genesis, fixed. |
+| `update_pool_status` | Each pool stays open. |
+| `collect_protocol_fee`, `collect_fund_fee` | The rates are 0, so no fee collects. |
+| `collect_excess_lamports` | Off. |
+| `create_permission_pda`, `close_permission_pda` | Off, so `initialize_with_permission` is off too. |
+| `create_creator_fee_share`, `close_creator_fee_share` | Off. The creator fee rate is 0. |
+| `create_support_mint_associated`, `close_support_mint_associated` | Off. |
+
+`genesis/dex_accounts.py` builds the genesis accounts from constants, and no
+data from an RPC enters the genesis:
+
+- the `AmmConfig` at index 0: 25 basis points per trade, all to the liquidity
+  providers; protocol, fund, creator, and pool creation fees 0; both owners
+  the key above,
+- the wrapped SOL mint,
+- the token account that takes the pool creation fee, owned by the key above.
 
 A trade page runs on those pools at `https://seed.alpha.ecash.eu.com/dex/`.
 The page lives in the `sol-dex` repository. This repository serves the built
@@ -609,14 +648,14 @@ Point the daemon at the enforcer that already runs beside your eCash node:
 
 ```sh
 D=daemon/target/debug/sol-drivechain-daemon
-$D status --network betanet --enforcer-url http://127.0.0.1:50051 --slot 8
+$D status --network ecash --enforcer-url http://127.0.0.1:50051 --slot 8
 ```
 
 Pick a slot that no sidechain holds. `status` lists every active slot and every
 open proposal. Then claim it and mine until it activates:
 
 ```sh
-$D propose-slot --network betanet --enforcer-url http://127.0.0.1:50051 --slot 8
+$D propose-slot --network ecash --enforcer-url http://127.0.0.1:50051 --slot 8
 ```
 
 ## Start the Solana chain
@@ -628,16 +667,20 @@ The genesis writes the bridge config, so no transaction creates it. Set
 `ECASH_START_HEIGHT` to the eCash tip: BMM settles from that height, and the
 credits start after it.
 
+`build-genesis.sh` asks for `LEDGER`, and it stops when that directory
+exists. `REPLACE_LEDGER=1` deletes it.
+
 ```sh
 D=daemon/target/release/sol-drivechain-daemon
-ECASH_START_HEIGHT=$($D ecash-tip --network betanet --enforcer-url http://127.0.0.1:50051 --slot 8 | awk '{print $1}') \
-DEPOSIT_CONFIRMATIONS=6 DEPOSIT_LAG=100 bash genesis/build-genesis.sh
-ENFORCER_URL=http://127.0.0.1:50051 SIDECHAIN_SLOT=8 bash genesis/run-validator.sh
-$D run --network betanet --slot 8 \
+ECASH_START_HEIGHT=$($D ecash-tip --network ecash --enforcer-url http://127.0.0.1:50051 --slot 8 | awk '{print $1}') \
+NETWORK=ecash LEDGER=genesis/ledger bash genesis/build-genesis.sh
+NETWORK=ecash ENFORCER_URL=http://127.0.0.1:50051 SIDECHAIN_SLOT=8 bash genesis/run-validator.sh
+$D run --network ecash --slot 8 \
   --program-id "$(cat keys/bridge-program.pubkey)" --oracle keys/oracle.json
-$D bmm --slot 8 --program-id "$(cat keys/bridge-program.pubkey)" \
-  --identity keys/validator-identity.json
-$D bridge-state --program-id "$(cat keys/bridge-program.pubkey)" --books --slot 8
+$D bmm --network ecash --slot 8 --program-id "$(cat keys/bridge-program.pubkey)" \
+  --identity keys/validator-identity.json --max-bid-sats <sats>
+$D bridge-state --program-id "$(cat keys/bridge-program.pubkey)" --books \
+  --network ecash --slot 8
 ```
 
 ## Migrate an existing chain
@@ -652,6 +695,8 @@ needs a new genesis. `scripts/migrate-genesis.sh` carries the money over:
 - each withdrawal record, nonce account, token account, and DEX account, byte
   for byte, so eCash still pays each open withdrawal,
 - the cursor, the float, the bundle, and the counters of the bridge config.
+- D and the lag of the bridge config. A value set by hand that differs from
+  the old chain stops the script.
 
 The new chain credits only the deposits after the cursor. No deposit replay
 occurs, so no coin gets credited two times. BMM on the new chain settles from
@@ -675,9 +720,8 @@ so a migration adds no float.
 
 ```sh
 OLD_RPC=http://127.0.0.1:8899 LEDGER=~/sol-drivechain/ledger-new \
-KEYS=~/sol-drivechain/keys NETWORK=betanet SIDECHAIN_SLOT=8 \
-ENFORCER_URL=http://127.0.0.1:50051 DEPOSIT_CONFIRMATIONS=6 DEPOSIT_LAG=100 \
-bash scripts/migrate-genesis.sh
+KEYS=~/sol-drivechain/keys NETWORK=ecash SIDECHAIN_SLOT=8 \
+ENFORCER_URL=http://127.0.0.1:50051 bash scripts/migrate-genesis.sh
 ```
 
 5. Stop the halted node, start the validator on the new ledger, and check the
@@ -728,7 +772,7 @@ with mode 600.
 | `bridge-state` | Prints the bridge config, the vault, the treasury, and the BMM totals. With `--books`, it checks both balance equations. |
 | `credit` | Credits the deposits of each eCash height in order. Anyone can run it. |
 | `run` | Runs the peg: the credits, the seals, the bundles, `bundle_paid`, and the closes. |
-| `bmm` | Bids for eCash blocks, publishes the pairs, and settles the commitments in height order. With `--rpc-listen`, it serves the templates for drivechaind. |
+| `bmm` | Bids for eCash blocks, publishes the pairs, and settles the commitments in height order. With `--rpc-listen`, it serves the templates for drivechaind. It reads at most 2016 eCash blocks below the tip, and at most 16 new blocks for the settles of one round. |
 | `bid-bmm` | Sends one bid for the newest block that passes rule 3, and publishes its pair. |
 | `publish-pair` | Publishes one pair to a validator. |
 | `bmm-block` | Prints the newest block in the block record. |
