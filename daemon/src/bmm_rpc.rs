@@ -199,8 +199,8 @@ impl<C: Chain> Server<C> {
     pub async fn get_block_template(&self) -> Result<Value, RpcError> {
         let tip = self.chain.tip().await?;
         let template = bmm::template(&*self.chain, &self.memory, &self.rules, tip).await?;
+        bmm::publish_one(&*self.chain, template.pair).await?;
         self.memory.lock().await.remember(template.pair);
-        self.chain.publish(&[template.pair]).await?;
         Ok(json!({
             "critical_hash": crate::hex::encode(&template.pair.commitment()),
             "block": BlockJson::new(tip.0, &template.pair, self.sidechain_id)?,
@@ -226,8 +226,8 @@ impl<C: Chain> Server<C> {
                 hash == main_block_hash && commitment == Some(pair.commitment())
             });
         if connected {
+            bmm::publish_one(&*self.chain, pair).await?;
             self.memory.lock().await.remember(pair);
-            self.chain.publish(&[pair]).await?;
         }
         Ok(connected)
     }
@@ -324,6 +324,7 @@ mod tests {
         recorded: Vec<RecordedBlock>,
         blocks: BTreeMap<u64, (BlockHash, Option<[u8; 32]>)>,
         published: Vec<Pair>,
+        answer: String,
     }
 
     struct FakeChain(std::sync::Mutex<Fake>);
@@ -381,9 +382,11 @@ mod tests {
             }))
         }
 
-        async fn publish(&self, pairs: &[Pair]) -> Result<(), BmmError> {
-            self.with(|fake| fake.published.extend_from_slice(pairs));
-            Ok(())
+        async fn publish(&self, pairs: &[Pair]) -> Result<Vec<String>, BmmError> {
+            Ok(self.with(|fake| {
+                fake.published.extend_from_slice(pairs);
+                vec![fake.answer.clone(); pairs.len()]
+            }))
         }
     }
 
@@ -453,6 +456,7 @@ mod tests {
                 recorded: vec![recorded(BANK, 98)],
                 blocks,
                 published: Vec::new(),
+                answer: "new".to_owned(),
             }))),
             memory: Arc::new(Mutex::new(Memory::default())),
             rules: BidRules {
@@ -560,6 +564,19 @@ mod tests {
             "one high block keeps the median"
         );
         assert_eq!(server.chain.with(|fake| fake.earned_reads), 2);
+    }
+
+    #[tokio::test]
+    async fn a_refused_pair_gives_no_template_and_stays_unknown() {
+        let server = server();
+        server.chain.with(|fake| {
+            fake.answer = "refused: too many pairs wait at this height".to_owned();
+        });
+        assert_eq!(
+            server.get_block_template().await.unwrap_err().code,
+            NOT_READY
+        );
+        assert_eq!(server.memory.lock().await.pair(&pair().commitment()), None);
     }
 
     #[tokio::test]
