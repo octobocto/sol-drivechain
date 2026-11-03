@@ -256,10 +256,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..94f6be8
+index 0000000..bf98907
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,588 @@
+@@ -0,0 +1,603 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -270,8 +270,7 @@ index 0000000..94f6be8
 +    sol_drivechain_bmm::{
 +        BMM_BLOCKS_ID, BlockHash, Credits, RecordedBlock, checkpoints,
 +        fork_choice::{
-+            self, BankHash, Base, Checkpoint, Choice, Deposits, ForkBank, PROOF_BLOCKS, Proof,
-+            Rejection, Restart, Saved,
++            self, BankHash, Base, Checkpoint, Choice, Deposits, ForkBank, Rejection, Restart, Saved,
 +        },
 +        pairs::{PAIR_WINDOW, pairs},
 +        peers::peers,
@@ -315,7 +314,12 @@ index 0000000..94f6be8
 +impl BmmForkChoice {
 +    /// `None` when BMM does not control the forks. `start_root` is the root
 +    /// bank that this process loaded. The first start keeps it as the base.
-+    pub(crate) fn new(ledger: &Path, archives: Option<PathBuf>, start_root: &Bank) -> Option<Self> {
++    pub(crate) fn new(
++        ledger: &Path,
++        archives: Option<PathBuf>,
++        start_root: &Bank,
++        blockstore: &solana_ledger::blockstore::Blockstore,
++    ) -> Option<Self> {
 +        if !fork_choice::enabled() {
 +            return None;
 +        }
@@ -343,6 +347,12 @@ index 0000000..94f6be8
 +            &saved.anchors,
 +            (start_root.slot(), start_root.hash().to_bytes()),
 +            &record,
++            |slot, bank_hash| {
++                blockstore.is_root(slot)
++                    && blockstore
++                        .get_bank_hash(slot)
++                        .is_some_and(|hash| &hash.to_bytes() == bank_hash)
++            },
 +        )
 +        .unwrap_or_default();
 +        fork_choice::set_final_root(final_root);
@@ -523,12 +533,26 @@ index 0000000..94f6be8
 +            .collect();
 +        choice.fallback = choice.fallback
 +            && !fork_choice::pending_stops_fallback(&waiting, tip_height, fork_choice::params());
-+        fork_choice::hold_root(
++        let holding = fork_choice::hold_root(
 +            &mut choice,
 +            &self.vouched,
 +            tip_height,
 +            fork_choice::params(),
 +        );
++        if !holding.is_empty() {
++            let mut saved = self.saved.clone();
++            if fork_choice::open_hold_proof(
++                &mut saved,
++                &holding,
++                |bank_hash| peers().attesters(bank_hash),
++                tip_height,
++            ) {
++                match saved.store(&self.ledger) {
++                    Ok(()) => self.saved = saved,
++                    Err(error) => error!("cannot write the BMM fork choice state: {error}"),
++                }
++            }
++        }
 +        if choice.head != self.choice.head
 +            || choice.fallback != self.choice.fallback
 +            || choice.tied != self.choice.tied
@@ -733,30 +757,21 @@ index 0000000..94f6be8
 +        let mut saved = self.saved.clone();
 +        saved.handled_height = restart.trigger_height;
 +        saved.restart_to = Some(restart.anchor.slot);
-+        let named: Vec<&Checkpoint> = self
++        let named: Vec<Checkpoint> = self
 +            .vouched
 +            .iter()
 +            .filter(|checkpoint| {
 +                checkpoint.height > restart.anchor.height
 +                    && checkpoint.height <= restart.trigger_height
 +            })
++            .copied()
 +            .collect();
-+        if !named.is_empty() {
-+            let mut nodes: Vec<_> = named
-+                .iter()
-+                .flat_map(|checkpoint| peers().attesters(&checkpoint.bank_hash))
-+                .collect();
-+            nodes.sort_unstable();
-+            nodes.dedup();
-+            saved.proof = Some(Proof {
-+                bank_hashes: named
-+                    .iter()
-+                    .map(|checkpoint| checkpoint.bank_hash)
-+                    .collect(),
-+                nodes,
-+                deadline_height: self.tip_height.saturating_add(PROOF_BLOCKS),
-+            });
-+        }
++        fork_choice::open_hold_proof(
++            &mut saved,
++            &named,
++            |bank_hash| peers().attesters(bank_hash),
++            self.tip_height,
++        );
 +        saved.store(&self.ledger)?;
 +        self.saved = saved;
 +        Ok(Some(restart))
@@ -946,7 +961,7 @@ index 5180157..7eafc97 100644
  pub mod cluster_slots_service;
  pub mod commitment_service;
 diff --git a/core/src/replay_stage.rs b/core/src/replay_stage.rs
-index c5a5f4d..2feca3c 100644
+index c5a5f4d..65a3936 100644
 --- a/core/src/replay_stage.rs
 +++ b/core/src/replay_stage.rs
 @@ -4,6 +4,7 @@ use {
@@ -957,7 +972,7 @@ index c5a5f4d..2feca3c 100644
          cluster_info_vote_listener::{
              DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver, VoteTracker,
          },
-@@ -874,6 +875,17 @@ impl ReplayStage {
+@@ -874,6 +875,18 @@ impl ReplayStage {
                  r_bank_forks.working_bank()
              };
              let mut last_threshold_failure_slot = 0;
@@ -971,11 +986,12 @@ index c5a5f4d..2feca3c 100644
 +                        .clone()
 +                }),
 +                &bank_forks.read().unwrap().root_bank(),
++                &blockstore,
 +            );
              // Thread pool to (maybe) replay multiple threads in parallel
              let replay_mode = if replay_forks_threads.get() == 1 {
                  ForkReplayMode::Serial
-@@ -1255,9 +1267,40 @@ impl ReplayStage {
+@@ -1255,9 +1268,40 @@ impl ReplayStage {
                      compute_slot_stats_time.stop();
  
                      let mut select_forks_time = Measure::start("select_forks_time");
@@ -1017,7 +1033,7 @@ index c5a5f4d..2feca3c 100644
                      select_forks_time.stop();
  
                      let mut select_vote_and_reset_forks_time =
-@@ -1276,6 +1319,9 @@ impl ReplayStage {
+@@ -1276,6 +1320,9 @@ impl ReplayStage {
                          &latest_validator_votes_for_frozen_banks,
                          &tbft_structs.heaviest_subtree_fork_choice,
                      );
@@ -1027,7 +1043,7 @@ index c5a5f4d..2feca3c 100644
                      select_vote_and_reset_forks_time.stop();
  
                      if vote_bank.is_none() {
-@@ -1347,8 +1393,31 @@ impl ReplayStage {
+@@ -1347,8 +1394,31 @@ impl ReplayStage {
                              wait_to_vote_slot,
                              migration_status.as_ref(),
                              &mut tbft_structs,
@@ -1059,7 +1075,7 @@ index c5a5f4d..2feca3c 100644
                      voting_time.stop();
  
                      let mut reset_bank_time = Measure::start("reset_bank");
-@@ -1433,6 +1502,21 @@ impl ReplayStage {
+@@ -1433,6 +1503,21 @@ impl ReplayStage {
                                  last_reset_bank_descendants = vec![];
                              }
  
@@ -1081,7 +1097,7 @@ index c5a5f4d..2feca3c 100644
                              if let Some(last_voted_slot) = tower.last_voted_slot() {
                                  // If the current heaviest bank is not a descendant of the last voted slot,
                                  // there must be a partition
-@@ -2038,6 +2122,13 @@ impl ReplayStage {
+@@ -2038,6 +2123,13 @@ impl ReplayStage {
          // confirmed, what happens then? Should probably keep track of dumped list and skip things
          // in `duplicate_slots_to_repair` that have already been dumped. Add test.
          duplicate_slots_to_repair.retain(|duplicate_slot, correct_hash| {
@@ -1095,7 +1111,7 @@ index c5a5f4d..2feca3c 100644
              // Should not dump duplicate slots if there is currently a poh bank building
              // on top of that slot, as BankingStage might still be referencing/touching that state
              // concurrently.
-@@ -2911,7 +3002,11 @@ impl ReplayStage {
+@@ -2911,7 +3003,11 @@ impl ReplayStage {
                  ("leader", next_leader_id.to_string(), String),
              );
  
@@ -1108,7 +1124,7 @@ index c5a5f4d..2feca3c 100644
                  let latest_unconfirmed_leader_slot = progress_map
                      .get_latest_leader_slot_must_exist(parent_slot)
                      .expect(
-@@ -3047,16 +3142,21 @@ impl ReplayStage {
+@@ -3047,16 +3143,21 @@ impl ReplayStage {
          wait_to_vote_slot: Option<Slot>,
          migration_status: &MigrationStatus,
          tbft_structs: &mut TowerBFTStructures,
@@ -1134,7 +1150,7 @@ index c5a5f4d..2feca3c 100644
  
          if let Some(new_root) = new_root {
              let highest_super_majority_root = Some(
-@@ -4955,6 +5055,91 @@ impl ReplayStage {
+@@ -4955,6 +5056,91 @@ impl ReplayStage {
          duplicate_confirmed_forks
      }
  
@@ -4386,10 +4402,10 @@ index 0000000..805c22e
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..fb185be
+index 0000000..f74a25c
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2195 @@
+@@ -0,0 +1,2306 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -4681,15 +4697,56 @@ index 0000000..fb185be
 +/// Holds the root while a checkpoint less than `fallback_blocks` old waits
 +/// for a bank that a trusted staked peer holds. When that bank arrives, it
 +/// can tie or beat the head.
-+pub fn hold_root(choice: &mut Choice, vouched: &[Checkpoint], tip_height: u64, params: Params) {
-+    if vouched
++/// Returns the checkpoints that held a root move, so their peers must prove
++/// them with `open_hold_proof`.
++pub fn hold_root(
++    choice: &mut Choice,
++    vouched: &[Checkpoint],
++    tip_height: u64,
++    params: Params,
++) -> Vec<Checkpoint> {
++    let holding: Vec<Checkpoint> = vouched
 +        .iter()
-+        .any(|checkpoint| tip_height.saturating_sub(checkpoint.height) < params.fallback_blocks)
-+    {
-+        choice.new_root = None;
-+        choice.new_anchors.clear();
-+        choice.new_pruned.clear();
++        .filter(|checkpoint| tip_height.saturating_sub(checkpoint.height) < params.fallback_blocks)
++        .copied()
++        .collect();
++    if holding.is_empty() || choice.new_root.is_none() {
++        return Vec::new();
 +    }
++    choice.new_root = None;
++    choice.new_anchors.clear();
++    choice.new_pruned.clear();
++    holding
++}
++
++/// Puts the banks that held a root move and their peers into the open proof.
++/// A peer of the proof vouches for nothing else, and when none of the banks
++/// arrives by the deadline, `settle_proof` distrusts it. True when `saved`
++/// changed.
++pub fn open_hold_proof(
++    saved: &mut Saved,
++    holding: &[Checkpoint],
++    attesters: impl Fn(&BankHash) -> Vec<NodeId>,
++    tip_height: u64,
++) -> bool {
++    let mut proof = saved.proof.clone().unwrap_or(Proof {
++        bank_hashes: Vec::new(),
++        nodes: Vec::new(),
++        deadline_height: tip_height.saturating_add(PROOF_BLOCKS),
++    });
++    for checkpoint in holding {
++        if !proof.bank_hashes.contains(&checkpoint.bank_hash) {
++            proof.bank_hashes.push(checkpoint.bank_hash);
++        }
++        for node in attesters(&checkpoint.bank_hash) {
++            if !proof.nodes.contains(&node) {
++                proof.nodes.push(node);
++            }
++        }
++    }
++    let changed = saved.proof.as_ref() != Some(&proof);
++    saved.proof = Some(proof);
++    changed
 +}
 +
 +/// The deposit credits of a bank, checked against the active eCash chain.
@@ -4994,13 +5051,15 @@ index 0000000..fb185be
 +        .collect()
 +}
 +
-+/// The newest saved anchor on the chain of the root: the root itself or a
-+/// block of its block record, by slot and bank hash. A slot number alone can
-+/// name a block of an abandoned branch.
++/// The newest saved anchor on the chain of the root: the root itself, a
++/// block of its block record, or a slot that the ledger roots with the same
++/// bank hash, all by slot and bank hash. A slot number alone can name a block
++/// of an abandoned branch.
 +pub fn final_from_anchors(
 +    anchors: &[Anchor],
 +    root: (Slot, BankHash),
 +    record: &[RecordedBlock],
++    rooted: impl Fn(Slot, &BankHash) -> bool,
 +) -> Option<Slot> {
 +    let on_chain: HashSet<(Slot, BankHash)> = record
 +        .iter()
@@ -5010,7 +5069,9 @@ index 0000000..fb185be
 +    anchors
 +        .iter()
 +        .filter(|anchor| {
-+            anchor.slot <= root.0 && on_chain.contains(&(anchor.slot, anchor.bank_hash))
++            anchor.slot <= root.0
++                && (on_chain.contains(&(anchor.slot, anchor.bank_hash))
++                    || rooted(anchor.slot, &anchor.bank_hash))
 +        })
 +        .map(|anchor| anchor.slot)
 +        .max()
@@ -5958,15 +6019,36 @@ index 0000000..fb185be
 +        };
 +        let anchors = [anchor(50, 100), same_slot_other_bank];
 +        assert_eq!(
-+            final_from_anchors(&anchors, (250, hash(250)), &record),
++            final_from_anchors(&anchors, (250, hash(250)), &record, |_, _| false),
 +            Some(100)
 +        );
 +        let at_root = [anchor(60, 250)];
 +        assert_eq!(
-+            final_from_anchors(&at_root, (250, hash(250)), &record),
++            final_from_anchors(&at_root, (250, hash(250)), &record, |_, _| false),
 +            Some(250)
 +        );
-+        assert_eq!(final_from_anchors(&[], (250, hash(250)), &record), None);
++        assert_eq!(
++            final_from_anchors(&[], (250, hash(250)), &record, |_, _| false),
++            None
++        );
++    }
++
++    #[test]
++    fn an_anchor_past_the_record_stays_final_when_the_ledger_roots_it() {
++        let old = anchor(50, 100);
++        let rooted = |slot: Slot, bank_hash: &BankHash| slot == 100 && bank_hash == &hash(100);
++        assert_eq!(
++            final_from_anchors(&[old], (90_000, hash(90_000)), &[], rooted),
++            Some(100)
++        );
++        let other_bank = Anchor {
++            bank_hash: [0xab; 32],
++            ..old
++        };
++        assert_eq!(
++            final_from_anchors(&[other_bank], (90_000, hash(90_000)), &[], rooted),
++            None
++        );
 +    }
 +
 +    #[test]
@@ -5985,12 +6067,57 @@ index 0000000..fb185be
 +        let mut choice = choose(10, &shared(), &checkpoints, 103, PARAMS);
 +        assert_eq!(choice.new_root, Some(12));
 +        assert_eq!(choice.tied, 1);
-+        hold_root(&mut choice, &[unknown(101)], 103, PARAMS);
++        assert_eq!(
++            hold_root(&mut choice, &[unknown(101)], 103, PARAMS),
++            vec![unknown(101)]
++        );
 +        assert_eq!(choice.new_root, None);
 +        assert!(choice.new_anchors.is_empty());
 +        let mut later = choose(10, &shared(), &checkpoints, 107, PARAMS);
-+        hold_root(&mut later, &[unknown(101)], 107, PARAMS);
++        assert!(hold_root(&mut later, &[unknown(101)], 107, PARAMS).is_empty());
 +        assert_eq!(later.new_root, Some(12));
++    }
++
++    fn fake(height: u64) -> Checkpoint {
++        Checkpoint {
++            height,
++            block_hash: block(height),
++            bank_hash: [height as u8; 32],
++        }
++    }
++
++    #[test]
++    fn a_peer_that_never_shows_its_banks_holds_the_root_only_until_the_proof_ends() {
++        let liar = |_: &BankHash| vec![node(7)];
++        let checkpoints = [checkpoint(100, 12)];
++        let mut saved = Saved::default();
++        let mut tip = 103;
++        let first = vouched(&[fake(101)], liar, &saved, tip);
++        let mut choice = choose(10, &shared(), &checkpoints, tip, PARAMS);
++        let holding = hold_root(&mut choice, &first, tip, PARAMS);
++        assert_eq!(choice.new_root, None);
++        assert!(open_hold_proof(&mut saved, &holding, liar, tip));
++        let deadline = tip + PROOF_BLOCKS;
++        while tip < deadline {
++            tip += 1;
++            let again = vouched(&[fake(tip - 1)], liar, &saved, tip);
++            assert!(again.is_empty(), "the liar holds a second bank");
++            let still = vouched(&[fake(101)], liar, &saved, tip);
++            let mut choice = choose(10, &shared(), &checkpoints, tip, PARAMS);
++            hold_root(&mut choice, &still, tip, PARAMS);
++            if tip >= 101 + PARAMS.fallback_blocks {
++                assert_eq!(choice.new_root, Some(12));
++            }
++            settle_proof(&mut saved, |_| false, tip);
++        }
++        assert_eq!(saved.proof, None);
++        assert!(
++            saved
++                .distrusted
++                .iter()
++                .any(|distrust| distrust.node == node(7))
++        );
++        assert!(vouched(&[fake(200)], liar, &saved, tip + 1).is_empty());
 +    }
 +
 +    #[test]
