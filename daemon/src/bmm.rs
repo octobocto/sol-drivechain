@@ -69,6 +69,8 @@ pub enum BmmError {
         #[source]
         source: solana_rpc_client_api::client_error::Error,
     },
+    #[error("the validator did not take the pair at eCash height {height}: {answers:?}")]
+    PairRefused { height: u64, answers: Vec<String> },
     #[error("the bid percent is {0}, and it must be from 1 to 100")]
     BadBidPercent(u64),
     #[error("the max bid is {max} sats, and it must be at least 1 and at least the min bid of {min} sats")]
@@ -219,6 +221,10 @@ impl BidRules {
 /// height.
 const REMEMBERED_HEIGHTS: u64 = 1_000;
 
+/// The validator holds at most this many unchecked pairs per eCash height
+/// (`MAX_UNCHECKED_PER_HEIGHT` in the validator patch).
+const MAX_PAIRS_PER_HEIGHT: usize = 16;
+
 /// The state that the loop and the BMM rpc share: the fee history, the bid of
 /// the current tip, and the own pairs by commitment.
 #[derive(Debug, Default)]
@@ -226,7 +232,9 @@ pub struct Memory {
     generation: u64,
     history: FeeHistory,
     fees: Option<(BlockHash, u64)>,
-    pairs: HashMap<[u8; 32], Pair>,
+    /// The own pairs by commitment, each with its `remember` order.
+    pairs: HashMap<[u8; 32], (u64, Pair)>,
+    remembered: u64,
 }
 
 impl Memory {
@@ -285,12 +293,27 @@ impl Memory {
         fees
     }
 
+    /// Keeps `pair`, and drops the oldest pairs at its height above
+    /// `MAX_PAIRS_PER_HEIGHT`.
     pub fn remember(&mut self, pair: Pair) {
-        self.pairs.insert(pair.commitment(), pair);
+        self.remembered += 1;
+        self.pairs
+            .insert(pair.commitment(), (self.remembered, pair));
+        let mut at_height: Vec<(u64, [u8; 32])> = self
+            .pairs
+            .iter()
+            .filter(|(_, (_, other))| other.height == pair.height)
+            .map(|(commitment, (order, _))| (*order, *commitment))
+            .collect();
+        at_height.sort_unstable();
+        let excess = at_height.len().saturating_sub(MAX_PAIRS_PER_HEIGHT);
+        for (_, commitment) in &at_height[..excess] {
+            self.pairs.remove(commitment);
+        }
     }
 
     pub fn pair(&self, commitment: &[u8; 32]) -> Option<Pair> {
-        self.pairs.get(commitment).copied()
+        self.pairs.get(commitment).map(|(_, pair)| *pair)
     }
 
     /// The own pairs that no settle passed yet, for a new publish at eCash tip
@@ -302,14 +325,14 @@ impl Memory {
         confirmations: u64,
     ) -> Vec<Pair> {
         self.pairs
-            .retain(|_, pair| pair.height.saturating_add(REMEMBERED_HEIGHTS) >= tip_height);
+            .retain(|_, (_, pair)| pair.height.saturating_add(REMEMBERED_HEIGHTS) >= tip_height);
         let mut pairs: Vec<Pair> = self
             .pairs
             .values()
+            .map(|(_, pair)| *pair)
             .filter(|pair| {
                 pair.height >= next_height && pair.height + confirmations + 2 >= tip_height
             })
-            .copied()
             .collect();
         pairs.sort_by_key(|pair| pair.height);
         pairs
@@ -342,7 +365,10 @@ pub trait Chain: Send + Sync {
         tip: (BlockHash, u32),
         height: u64,
     ) -> impl Future<Output = Result<Option<ActiveBlock>, BmmError>> + Send;
-    fn publish(&self, pairs: &[Pair]) -> impl Future<Output = Result<(), BmmError>> + Send;
+    /// Sends pairs to the validator. It gives one answer per pair: "new",
+    /// "known", or "refused: <reason>".
+    fn publish(&self, pairs: &[Pair])
+        -> impl Future<Output = Result<Vec<String>, BmmError>> + Send;
 }
 
 /// The chain behind the local enforcer and the local validator.
@@ -775,8 +801,8 @@ impl Chain for Live {
         }
     }
 
-    async fn publish(&self, pairs: &[Pair]) -> Result<(), BmmError> {
-        publish_pairs(&self.rpc, pairs).await.map(|_| ())
+    async fn publish(&self, pairs: &[Pair]) -> Result<Vec<String>, BmmError> {
+        publish_pairs(&self.rpc, pairs).await
     }
 }
 
@@ -1274,6 +1300,18 @@ pub async fn recorded_blocks(rpc: &RpcClient) -> Result<Vec<RecordedBlock>, BmmE
         .unwrap_or_default())
 }
 
+/// Publishes `pair`, and fails unless the validator holds it.
+pub async fn publish_one(chain: &impl Chain, pair: Pair) -> Result<(), BmmError> {
+    let answers = chain.publish(&[pair]).await?;
+    match answers.as_slice() {
+        [answer] if answer == "new" || answer == "known" => Ok(()),
+        _ => Err(BmmError::PairRefused {
+            height: pair.height,
+            answers,
+        }),
+    }
+}
+
 /// Sends pairs to the validator. It gives one result per pair: "new",
 /// "known", or the reason of a refusal.
 pub async fn publish_pairs(rpc: &RpcClient, pairs: &[Pair]) -> Result<Vec<String>, BmmError> {
@@ -1615,6 +1653,25 @@ mod tests {
         assert_eq!(memory.pair(&pair.commitment()), Some(pair));
         assert!(memory.pairs_to_publish(101, 1_101, 6).is_empty());
         assert_eq!(memory.pair(&pair.commitment()), None);
+    }
+
+    #[test]
+    fn a_height_keeps_only_the_newest_pairs_that_the_validator_holds() {
+        let mut memory = Memory::default();
+        let pairs: Vec<Pair> = (0..=MAX_PAIRS_PER_HEIGHT as u8)
+            .map(|byte| Pair {
+                height: 100,
+                block: [byte; 32],
+                payee: Pubkey::new_from_array([7u8; 32]),
+            })
+            .collect();
+        for pair in &pairs {
+            memory.remember(*pair);
+        }
+        assert_eq!(memory.pair(&pairs[0].commitment()), None);
+        for pair in &pairs[1..] {
+            assert_eq!(memory.pair(&pair.commitment()), Some(*pair));
+        }
     }
 
     #[test]
@@ -2056,7 +2113,7 @@ mod tests {
                 self.commitments.get(&height).copied(),
             )))
         }
-        async fn publish(&self, _pairs: &[Pair]) -> Result<(), BmmError> {
+        async fn publish(&self, _pairs: &[Pair]) -> Result<Vec<String>, BmmError> {
             unreachable!()
         }
     }
