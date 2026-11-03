@@ -463,8 +463,6 @@ async fn pass(
     let program_id = &settings.program_id;
     let processed = read_config(rpc, program_id, CommitmentConfig::processed()).await?;
     let finalized = read_config(rpc, program_id, CommitmentConfig::finalized()).await?;
-    close_paid(rpc, program_id, oracle, &processed, &finalized, memory).await?;
-
     let finalized_slot = rpc
         .get_slot_with_commitment(CommitmentConfig::finalized())
         .await
@@ -538,7 +536,8 @@ async fn pass(
             }
         }
     }
-    Ok(())
+    // Anyone can close a paid record, so a close can fail after the read.
+    close_paid(rpc, program_id, oracle, &processed, &finalized, memory).await
 }
 
 /// Closes the paid records, so each owner gets the rent back. The cursor
@@ -629,6 +628,19 @@ mod tests {
     use bitcoin::{
         absolute::LockTime, hashes::Hash as _, transaction::Version, Amount, BlockHash, TxOut,
     };
+    use std::{future::Future, pin::Pin, sync::Arc};
+
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use solana_rpc_client::{
+        mock_sender::MockSender,
+        rpc_client::RpcClientConfig,
+        rpc_sender::{RpcSender, RpcTransportStats},
+    };
+    use solana_rpc_client_api::{
+        client_error::Result as ClientResult,
+        request::{RpcError as ClientRpcError, RpcRequest},
+    };
+    use solana_sdk::signature::Signature;
 
     fn a_record(index: u64, payout_sats: u64, script: u8) -> WithdrawalRecord {
         WithdrawalRecord {
@@ -724,6 +736,138 @@ mod tests {
 
     fn an_m6id(byte: u8) -> Txid {
         Txid::from_byte_array([byte; 32])
+    }
+
+    /// A Solana RPC that holds one config and one paid record, and refuses
+    /// each close tx.
+    struct Bank {
+        mock: MockSender,
+        config: Config,
+        record: Account,
+        sent: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    fn ui_account(account: &Account) -> serde_json::Value {
+        serde_json::json!({
+            "lamports": account.lamports,
+            "data": [BASE64.encode(&account.data), "base64"],
+            "owner": account.owner.to_string(),
+            "executable": false,
+            "rentEpoch": 0,
+            "space": account.data.len(),
+        })
+    }
+
+    impl Bank {
+        async fn answer(
+            &self,
+            request: RpcRequest,
+            params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            let context = serde_json::json!({"slot": 1});
+            match request {
+                RpcRequest::GetAccountInfo => Ok(serde_json::json!({
+                    "context": context,
+                    "value": ui_account(&Account {
+                        lamports: 1_000,
+                        data: self.config.encode(),
+                        owner: self.record.owner,
+                        executable: false,
+                        rent_epoch: 0,
+                    }),
+                })),
+                RpcRequest::GetMultipleAccounts => Ok(serde_json::json!({
+                    "context": context,
+                    "value": [ui_account(&self.record)],
+                })),
+                RpcRequest::SendTransaction => {
+                    let tx = BASE64.decode(params[0].as_str().unwrap()).unwrap();
+                    let holds = |name: &str| {
+                        let discriminator = bridge::discriminator("global", name);
+                        tx.windows(8).any(|window| window == discriminator)
+                    };
+                    let name = ["seal_bundle", "close_record"]
+                        .into_iter()
+                        .find(|name| holds(name))
+                        .unwrap();
+                    self.sent.lock().unwrap().push(name);
+                    if name == "close_record" {
+                        return Err(ClientRpcError::ForUser(
+                            "a user closed the record first".to_owned(),
+                        )
+                        .into());
+                    }
+                    let signature = Signature::try_from(&tx[1..65]).unwrap();
+                    Ok(serde_json::Value::String(signature.to_string()))
+                }
+                request => self.mock.send(request, params).await,
+            }
+        }
+    }
+
+    impl RpcSender for Bank {
+        fn send<'life0, 'async_trait>(
+            &'life0 self,
+            request: RpcRequest,
+            params: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = ClientResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(self.answer(request, params))
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "bank".to_owned()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_close_does_not_stop_the_seal() {
+        let program_id = Pubkey::new_from_array([3u8; 32]);
+        let sent = Arc::default();
+        let rpc = RpcClient::new_sender(
+            Bank {
+                mock: MockSender::new("succeeds"),
+                config: a_config(3, 1, 1),
+                record: a_record_account(program_id, &a_record(0, 5_000, 1)),
+                sent: Arc::clone(&sent),
+            },
+            RpcClientConfig::with_commitment(CommitmentConfig::processed()),
+        );
+        let settings = Settings {
+            network: crate::network::PegNetwork::Alphanet,
+            enforcer_url: "http://127.0.0.1:1".to_owned(),
+            solana_rpc_url: String::new(),
+            sidechain_id: 8,
+            program_id,
+            bundle_interval: Duration::from_secs(1),
+        };
+        let mut enforcer = Enforcer::connect(settings.enforcer_url.clone(), 8)
+            .await
+            .unwrap();
+        let error = pass(
+            &mut enforcer,
+            &rpc,
+            &settings,
+            &Keypair::new(),
+            &mut Memory::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PegError::Rpc {
+                call: "sendTransaction",
+                ..
+            }
+        ));
+        assert_eq!(*sent.lock().unwrap(), ["seal_bundle", "close_record"]);
     }
 
     #[test]
