@@ -1225,6 +1225,74 @@ fn an_op_return_script_fails() {
         .is_err());
 }
 
+fn check_treasury_script(opcode: u8) {
+    let mut chain = Chain::start();
+    chain
+        .deposit(0, A_DEPOSIT_SATS)
+        .expect("the deposit passes");
+    let lamports = (MIN_FEE_SATS + 600) * LAMPORTS_PER_SAT;
+    for slot in 0..=u8::MAX {
+        let index = u64::from(slot);
+        let config = chain.svm.get_account(&chain.config).unwrap();
+        let vault = chain.svm.get_account(&chain.vault).unwrap();
+        let user_balance = chain.balance(&chain.user.pubkey());
+        let fee = 5_000;
+
+        assert!(
+            chain
+                .withdraw(index, lamports, MIN_FEE_SATS, &[opcode, 0x01, slot, 0x51])
+                .is_err(),
+            "the bridge accepts treasury opcode {opcode:#x} for slot {slot}"
+        );
+
+        assert_eq!(chain.svm.get_account(&chain.config), Some(config));
+        assert_eq!(chain.svm.get_account(&chain.vault), Some(vault));
+        assert_eq!(chain.balance(&chain.user.pubkey()), user_balance - fee);
+        assert!(chain.svm.get_account(&chain.record_key(index)).is_none());
+
+        chain
+            .withdraw(index, lamports, MIN_FEE_SATS, &A_P2WPKH)
+            .expect("the valid withdrawal passes after the rejection");
+        assert_eq!(chain.config().withdrawal_count, index + 1);
+        assert_eq!(chain.record(index).unwrap().script_pubkey, A_P2WPKH);
+    }
+    chain.seal().expect("the valid bundle seals");
+    assert_eq!(chain.config().bundled_through, 256);
+}
+
+#[test]
+fn a_nop5_treasury_script_fails_for_each_slot() {
+    check_treasury_script(0xb4);
+}
+
+#[test]
+fn a_nop8_treasury_script_fails_for_each_slot() {
+    check_treasury_script(0xb7);
+}
+
+#[test]
+fn a_script_outside_the_treasury_form_passes() {
+    let mut chain = Chain::start();
+    chain
+        .deposit(0, A_DEPOSIT_SATS)
+        .expect("the deposit passes");
+    let lamports = (MIN_FEE_SATS + 600) * LAMPORTS_PER_SAT;
+    for opcode in [0xb4, 0xb7] {
+        for script in [
+            vec![opcode, 0x01, 9, 0x51, 0x51],
+            vec![0x51, opcode, 0x01, 9, 0x51],
+            vec![opcode, 0x01, 9, 0x52],
+            vec![opcode, 0x4c, 0x01, 9, 0x51],
+        ] {
+            let index = chain.config().withdrawal_count;
+            chain
+                .withdraw(index, lamports, MIN_FEE_SATS, &script)
+                .expect("the non-treasury withdrawal passes");
+            assert_eq!(chain.record(index).unwrap().script_pubkey, script);
+        }
+    }
+}
+
 #[test]
 fn an_empty_script_fails() {
     let mut chain = Chain::start();

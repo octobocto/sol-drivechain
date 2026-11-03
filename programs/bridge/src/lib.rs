@@ -345,6 +345,10 @@ pub mod bridge {
             script_pubkey[0] != OP_RETURN,
             BridgeError::ScriptPubkeyUnspendable
         );
+        require!(
+            !matches!(script_pubkey.as_slice(), [0xb4 | 0xb7, 0x01, _, 0x51]),
+            BridgeError::ScriptPubkeyTreasury
+        );
 
         let total_sats = lamports / LAMPORTS_PER_SAT;
         let payout_sats = total_sats
@@ -848,4 +852,6 @@ pub enum BridgeError {
     RecordNotPaid,
     #[msg("The config holds a bump that gives no address.")]
     BadBump,
+    #[msg("The script pubkey names a mainchain treasury.")]
+    ScriptPubkeyTreasury,
 }
