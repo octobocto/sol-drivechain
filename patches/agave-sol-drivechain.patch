@@ -256,10 +256,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..bf98907
+index 0000000..7d361ba
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,603 @@
+@@ -0,0 +1,601 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -270,7 +270,8 @@ index 0000000..bf98907
 +    sol_drivechain_bmm::{
 +        BMM_BLOCKS_ID, BlockHash, Credits, RecordedBlock, checkpoints,
 +        fork_choice::{
-+            self, BankHash, Base, Checkpoint, Choice, Deposits, ForkBank, Rejection, Restart, Saved,
++            self, BankHash, Base, BelowRoot, Checkpoint, Choice, Deposits, ForkBank, Rejection,
++            Restart, Saved,
 +        },
 +        pairs::{PAIR_WINDOW, pairs},
 +        peers::peers,
@@ -442,12 +443,14 @@ index 0000000..bf98907
 +            })
 +            .max()
 +            .unwrap_or_default();
-+        let below_root: HashSet<BankHash> = self
-+            .ancestors
++        let root_lag = frozen_banks
 +            .iter()
-+            .map(|block| block.bank_hash)
-+            .chain(self.saved.anchors.iter().map(|anchor| anchor.bank_hash))
-+            .collect();
++            .find(|bank| bank.slot() == root)
++            .and_then(|bank| self.credits.get(&(root, bank.hash().to_bytes())))
++            .and_then(|credits| credits.map(|credits| credits.lag));
++        let below_root = BelowRoot::new(&self.saved.anchors, &self.ancestors, root_lag, |height| {
++            view().block_at(height).map(|block| block.hash)
++        });
 +        let screened = fork_choice::screen(&checkpoints, &deposits, &below_root);
 +        self.share_banks(&screened.absent, &below_root, tip_height);
 +        for (checkpoint, rejection) in &screened.rejected {
@@ -568,12 +571,7 @@ index 0000000..bf98907
 +
 +    /// Tells the peer sync which banks this node holds and which it wants,
 +    /// and settles the proof of the last restart.
-+    fn share_banks(
-+        &mut self,
-+        absent: &[Checkpoint],
-+        below_root: &HashSet<BankHash>,
-+        tip_height: u64,
-+    ) {
++    fn share_banks(&mut self, absent: &[Checkpoint], below_root: &BelowRoot, tip_height: u64) {
 +        let known: HashMap<BankHash, Slot> = self
 +            .banks
 +            .iter()
@@ -600,7 +598,7 @@ index 0000000..bf98907
 +        );
 +        let mut saved = self.saved.clone();
 +        let holds =
-+            |bank_hash: &BankHash| known.contains_key(bank_hash) || below_root.contains(bank_hash);
++            |bank_hash: &BankHash| known.contains_key(bank_hash) || below_root.holds(bank_hash);
 +        if fork_choice::settle_proof(&mut saved, holds, tip_height) {
 +            if saved.proof.is_none() && saved.distrusted.len() > self.saved.distrusted.len() {
 +                warn!(
@@ -4432,10 +4430,10 @@ index 0000000..805c22e
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..f74a25c
+index 0000000..99d2688
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2306 @@
+@@ -0,0 +1,2538 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -4588,11 +4586,16 @@ index 0000000..f74a25c
 +impl Anchor {
 +    /// True when the active eCash chain still holds this checkpoint.
 +    pub fn is_active(&self, checkpoints: &[Checkpoint]) -> bool {
-+        checkpoints.iter().any(|checkpoint| {
-+            checkpoint.height == self.height
-+                && checkpoint.block_hash == self.block_hash
-+                && checkpoint.bank_hash == self.bank_hash
-+        })
++        checkpoints
++            .iter()
++            .any(|checkpoint| self.matches(checkpoint))
++    }
++
++    /// True when `checkpoint` is the checkpoint of this anchor.
++    pub fn matches(&self, checkpoint: &Checkpoint) -> bool {
++        checkpoint.height == self.height
++            && checkpoint.block_hash == self.block_hash
++            && checkpoint.bank_hash == self.bank_hash
 +    }
 +}
 +
@@ -4875,21 +4878,98 @@ index 0000000..f74a25c
 +    pub rejected: Vec<(Checkpoint, Rejection)>,
 +}
 +
++/// The deposit credits of a block in the block record of the root.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Ancestor {
++    pub credited_height: u64,
++    pub lag: u64,
++    pub deposits: Deposits,
++}
++
++/// The banks below the root that this node holds.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct BelowRoot {
++    /// The saved anchors. Each one counts only its own checkpoint.
++    pub anchors: Vec<Anchor>,
++    /// The blocks of the block record of the root.
++    pub ancestors: HashMap<BankHash, Ancestor>,
++}
++
++impl BelowRoot {
++    /// Checks the credits of each block of the block record against the
++    /// active eCash chain. `lag` is the deposit lag of the root bank.
++    pub fn new(
++        anchors: &[Anchor],
++        record: &[RecordedBlock],
++        lag: Option<u64>,
++        mut active_block: impl FnMut(u64) -> Option<BlockHash>,
++    ) -> Self {
++        let ancestors = lag
++            .map(|lag| {
++                record
++                    .iter()
++                    .map(|block| {
++                        let ancestor = Ancestor {
++                            credited_height: block.credited_height,
++                            lag,
++                            deposits: check_deposits(Some(block.credits(lag)), &mut active_block),
++                        };
++                        (block.bank_hash, ancestor)
++                    })
++                    .collect()
++            })
++            .unwrap_or_default();
++        Self {
++            anchors: anchors.to_vec(),
++            ancestors,
++        }
++    }
++
++    pub fn holds(&self, bank_hash: &BankHash) -> bool {
++        self.ancestors.contains_key(bank_hash)
++            || self
++                .anchors
++                .iter()
++                .any(|anchor| anchor.bank_hash == *bank_hash)
++    }
++}
++
 +/// Applies rules 3 and 4 to the checkpoints. `deposits` holds the credits of
-+/// each frozen bank. `below_root` holds the banks below the root that this
-+/// node holds, and their checkpoints count as before the root move.
++/// each frozen bank. A checkpoint for a bank below the root counts when it is
++/// the checkpoint of a saved anchor, or when it passes rule 3 for its block of
++/// the block record.
 +pub fn screen(
 +    checkpoints: &[Checkpoint],
 +    deposits: &HashMap<BankHash, Deposits>,
-+    below_root: &HashSet<BankHash>,
++    below_root: &BelowRoot,
 +) -> Screened {
 +    let mut screened = Screened::default();
 +    for checkpoint in checkpoints {
 +        match deposits.get(&checkpoint.bank_hash) {
-+            None if below_root.contains(&checkpoint.bank_hash) => {
++            None if below_root
++                .anchors
++                .iter()
++                .any(|anchor| anchor.matches(checkpoint)) =>
++            {
 +                screened.counted.push(*checkpoint)
 +            }
-+            None => screened.absent.push(*checkpoint),
++            None => match below_root.ancestors.get(&checkpoint.bank_hash) {
++                None => screened.absent.push(*checkpoint),
++                Some(ancestor)
++                    if ancestor.credited_height.saturating_add(ancestor.lag)
++                        < checkpoint.height =>
++                {
++                    screened.rejected.push((
++                        *checkpoint,
++                        Rejection::TooFewCredits(ancestor.credited_height),
++                    ))
++                }
++                Some(ancestor) => match ancestor.deposits {
++                    Deposits::Credited { .. } => screened.counted.push(*checkpoint),
++                    Deposits::Dropped => screened.rejected.push((*checkpoint, Rejection::Dropped)),
++                    Deposits::Unknown => screened.pending.push(checkpoint.height),
++                },
++            },
 +            Some(Deposits::Unknown) => screened.pending.push(checkpoint.height),
 +            Some(Deposits::Dropped) => screened.rejected.push((*checkpoint, Rejection::Dropped)),
 +            Some(Deposits::Credited {
@@ -5730,7 +5810,7 @@ index 0000000..f74a25c
 +        let screened = screen(
 +            &[checkpoint(100, 12), checkpoint(100, 11)],
 +            &deposits,
-+            &HashSet::new(),
++            &BelowRoot::default(),
 +        );
 +        assert_eq!(screened.counted, vec![checkpoint(100, 12)]);
 +    }
@@ -5765,7 +5845,7 @@ index 0000000..f74a25c
 +    fn rule_3_holds_at_exactly_h_minus_lag() {
 +        let deposits = HashMap::from([(hash(11), credited(97)), (hash(12), credited(96))]);
 +        let at_100 = [checkpoint(100, 11), checkpoint(100, 12)];
-+        let screened = screen(&at_100, &deposits, &HashSet::new());
++        let screened = screen(&at_100, &deposits, &BelowRoot::default());
 +        assert_eq!(screened.counted, vec![checkpoint(100, 11)]);
 +        assert_eq!(
 +            screened.rejected,
@@ -5776,7 +5856,7 @@ index 0000000..f74a25c
 +    #[test]
 +    fn a_dropped_credit_rejects_the_checkpoint() {
 +        let deposits = HashMap::from([(hash(11), Deposits::Dropped)]);
-+        let screened = screen(&[checkpoint(100, 11)], &deposits, &HashSet::new());
++        let screened = screen(&[checkpoint(100, 11)], &deposits, &BelowRoot::default());
 +        assert!(screened.counted.is_empty());
 +        assert_eq!(
 +            screened.rejected,
@@ -5787,13 +5867,13 @@ index 0000000..f74a25c
 +    #[test]
 +    fn an_unknown_credit_leaves_the_checkpoint_pending_until_the_view_holds_it() {
 +        let before = HashMap::from([(hash(13), Deposits::Unknown)]);
-+        let screened = screen(&[checkpoint(100, 13)], &before, &HashSet::new());
++        let screened = screen(&[checkpoint(100, 13)], &before, &BelowRoot::default());
 +        assert!(screened.counted.is_empty());
 +        assert_eq!(screened.pending, vec![100]);
 +        assert!(pending_stops_fallback(&screened.pending, 105, PARAMS));
 +        assert!(!pending_stops_fallback(&screened.pending, 106, PARAMS));
 +        let after = HashMap::from([(hash(13), credited(98))]);
-+        let screened = screen(&[checkpoint(100, 13)], &after, &HashSet::new());
++        let screened = screen(&[checkpoint(100, 13)], &after, &BelowRoot::default());
 +        assert_eq!(screened.counted, vec![checkpoint(100, 13)]);
 +        assert_eq!(
 +            choose(10, &split(), &screened.counted, 100, PARAMS).head,
@@ -5803,17 +5883,167 @@ index 0000000..f74a25c
 +
 +    #[test]
 +    fn a_checkpoint_for_an_absent_bank_does_not_count() {
-+        let screened = screen(&[unknown(100)], &HashMap::new(), &HashSet::new());
++        let screened = screen(&[unknown(100)], &HashMap::new(), &BelowRoot::default());
 +        assert!(screened.counted.is_empty());
 +        assert_eq!(screened.absent, vec![unknown(100)]);
 +    }
 +
 +    #[test]
 +    fn a_checkpoint_for_a_bank_below_the_root_counts() {
-+        let below = HashSet::from([hash(5)]);
++        let below = BelowRoot {
++            anchors: vec![anchor(100, 5)],
++            ..BelowRoot::default()
++        };
 +        let screened = screen(&[checkpoint(100, 5)], &HashMap::new(), &below);
 +        assert_eq!(screened.counted, vec![checkpoint(100, 5)]);
 +        assert!(screened.absent.is_empty());
++    }
++
++    fn screen_root(
++        checkpoints: &[Checkpoint],
++        ancestors: &[RecordedBlock],
++        saved: &Saved,
++    ) -> Screened {
++        let deposits = HashMap::from([(
++            hash(96),
++            Deposits::Credited {
++                credited_height: 200,
++                lag: 100,
++            },
++        )]);
++        let below_root = BelowRoot::new(&saved.anchors, ancestors, Some(100), |height| {
++            Some(block(height))
++        });
++        screen(checkpoints, &deposits, &below_root)
++    }
++
++    fn check_ancestor_checkpoint(
++        credited_height: u64,
++        credited_block: BlockHash,
++        rejection: Rejection,
++    ) {
++        let banks = tree(&[(96, 0)]);
++        let saved = saved(&[anchor(100, 32)], &[], 0);
++        let ancestors = [
++            RecordedBlock {
++                slot: 32,
++                bank_hash: hash(32),
++                credited_height: 90,
++                credited_block: block(90),
++                part_block: [0; 32],
++            },
++            RecordedBlock {
++                slot: 64,
++                bank_hash: hash(64),
++                credited_height,
++                credited_block,
++                part_block: [0; 32],
++            },
++        ];
++        let mut checkpoints = vec![
++            checkpoint(100, 32),
++            checkpoint(198, 128),
++            checkpoint(199, 160),
++        ];
++        let expected = Some(Restart {
++            anchor: anchor(100, 32),
++            trigger_height: 199,
++        });
++        for attack in [false, true] {
++            if attack {
++                checkpoints.push(checkpoint(201, 64));
++            }
++            let screened = screen_root(&checkpoints, &ancestors, &saved);
++            let vouched = vouched(&screened.absent, |_| vec![node(1)], &saved, 206);
++            let mut choice = choose(96, &banks, &screened.counted, 206, PARAMS);
++            let pending: Vec<_> = screened
++                .pending
++                .iter()
++                .copied()
++                .chain(vouched.iter().map(|checkpoint| checkpoint.height))
++                .collect();
++            choice.fallback &= !pending_stops_fallback(&pending, 206, PARAMS);
++            assert!(choice.fallback);
++            let candidates: Vec<_> = screened
++                .counted
++                .iter()
++                .chain(vouched.iter())
++                .copied()
++                .collect();
++            assert_eq!(
++                restart(
++                    96,
++                    &banks,
++                    &candidates,
++                    206,
++                    &saved,
++                    &ancestors,
++                    200,
++                    PARAMS
++                ),
++                expected
++            );
++            if attack {
++                assert_eq!(screened.rejected, vec![(checkpoint(201, 64), rejection)]);
++            }
++        }
++        assert_eq!(
++            record_answer(&ancestors[1], 100, 201, |height| Some(block(height))),
++            Some(RecordAnswer {
++                credited_height,
++                credits_active: false,
++            })
++        );
++    }
++
++    #[test]
++    fn an_ancestor_with_old_credits_keeps_the_fallback_and_restart() {
++        check_ancestor_checkpoint(100, block(100), Rejection::TooFewCredits(100));
++    }
++
++    #[test]
++    fn an_ancestor_with_dropped_credits_keeps_the_fallback_and_restart() {
++        check_ancestor_checkpoint(101, [0xda; 32], Rejection::Dropped);
++    }
++
++    #[test]
++    fn an_ancestor_that_the_view_cannot_check_still_obeys_rule_3() {
++        let ancestors = [RecordedBlock {
++            slot: 64,
++            bank_hash: hash(64),
++            credited_height: 101,
++            credited_block: block(101),
++            part_block: [0; 32],
++        }];
++        let below_root = BelowRoot::new(&[], &ancestors, Some(100), |_| None);
++        let screened = screen(
++            &[checkpoint(150, 64), checkpoint(202, 64)],
++            &HashMap::new(),
++            &below_root,
++        );
++        assert!(screened.counted.is_empty());
++        assert_eq!(screened.pending, vec![150]);
++        assert_eq!(
++            screened.rejected,
++            vec![(checkpoint(202, 64), Rejection::TooFewCredits(101))]
++        );
++    }
++
++    #[test]
++    fn a_saved_anchor_counts_only_its_exact_checkpoint() {
++        let saved = saved(&[anchor(100, 32)], &[], 0);
++        let checkpoints = [
++            checkpoint(100, 32),
++            checkpoint(201, 32),
++            Checkpoint {
++                block_hash: [0xda; 32],
++                ..checkpoint(100, 32)
++            },
++            checkpoint(100, 64),
++        ];
++        let screened = screen_root(&checkpoints, &[], &saved);
++        assert_eq!(screened.counted, vec![checkpoint(100, 32)]);
++        assert_eq!(screened.absent, checkpoints[1..]);
 +    }
 +
 +    #[test]
@@ -5822,7 +6052,7 @@ index 0000000..f74a25c
 +        let screened = screen(
 +            &checkpoints,
 +            &HashMap::from([(hash(11), credited(90))]),
-+            &HashSet::new(),
++            &BelowRoot::default(),
 +        );
 +        assert!(choose(10, &split(), &screened.counted, 105, PARAMS).fallback);
 +    }
@@ -5940,7 +6170,7 @@ index 0000000..f74a25c
 +            checkpoint(101, 13),
 +            checkpoint(102, 15),
 +        ];
-+        let screened = screen(&checkpoints, &deposits, &HashSet::new());
++        let screened = screen(&checkpoints, &deposits, &BelowRoot::default());
 +        let choice = choose(10, &split(), &screened.counted, 102, PARAMS);
 +        assert_eq!(choice.head, Some(15));
 +        assert_eq!(choice.count, 1);
