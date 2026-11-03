@@ -594,8 +594,9 @@ else
 fi
 echo "slot $A4 ($A4_HASH) on A and slot $B4 ($B4_HASH) on B each have one checkpoint; the nodes build on slot $LEAD, the lower bank hash"
 heal
-wait_log M "head Some\($LEAD\)" "$MARK_M" 240
-wait_log H "head Some\($LEAD\)" "$MARK_H" 240
+# Each node must hold both branches and see the tie before K blocks come.
+wait_log M "head Some\($LEAD\) with 1 checkpoints above root [0-9]+, 2 tied heads" "$MARK_M" 240
+wait_log H "head Some\($LEAD\) with 1 checkpoints above root [0-9]+, 2 tied heads" "$MARK_H" 240
 mine "$K"
 sleep 10
 for node in "M $MARK_M" "H $MARK_H"; do

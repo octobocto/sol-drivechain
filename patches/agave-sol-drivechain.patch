@@ -256,10 +256,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..535da60
+index 0000000..94f6be8
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,578 @@
+@@ -0,0 +1,588 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -376,6 +376,7 @@ index 0000000..535da60
 +    /// frozen banks changed. `frozen_banks` holds the root and the frozen
 +    /// banks above it.
 +    pub(crate) fn update(&mut self, root: Slot, frozen_banks: &[Arc<Bank>]) {
++        sol_drivechain_bmm::answers::answers().prune_noted_below(root);
 +        let highest = frozen_banks
 +            .iter()
 +            .map(|bank| bank.slot())
@@ -522,11 +523,20 @@ index 0000000..535da60
 +            .collect();
 +        choice.fallback = choice.fallback
 +            && !fork_choice::pending_stops_fallback(&waiting, tip_height, fork_choice::params());
-+        if choice.head != self.choice.head || choice.fallback != self.choice.fallback {
++        fork_choice::hold_root(
++            &mut choice,
++            &self.vouched,
++            tip_height,
++            fork_choice::params(),
++        );
++        if choice.head != self.choice.head
++            || choice.fallback != self.choice.fallback
++            || choice.tied != self.choice.tied
++        {
 +            info!(
-+                "BMM fork choice: head {:?} with {} checkpoints above root {root}, eCash tip \
-+                 {tip_height}, fallback {}",
-+                choice.head, choice.count, choice.fallback
++                "BMM fork choice: head {:?} with {} checkpoints above root {root}, {} tied \
++                 heads, eCash tip {tip_height}, fallback {}",
++                choice.head, choice.count, choice.tied, choice.fallback
 +            );
 +        }
 +        self.choice = choice;
@@ -2191,7 +2201,7 @@ index 2c2292f..52634d7 100644
  solana-account-info = { workspace = true }
  solana-accounts-db = { workspace = true }
 diff --git a/runtime/src/bank.rs b/runtime/src/bank.rs
-index c8399cb..5c884e1 100644
+index c8399cb..e65b4e8 100644
 --- a/runtime/src/bank.rs
 +++ b/runtime/src/bank.rs
 @@ -233,6 +233,7 @@ use {
@@ -2239,7 +2249,18 @@ index c8399cb..5c884e1 100644
          }
      }
  
-@@ -3999,6 +4016,15 @@ impl Bank {
+@@ -3325,6 +3342,10 @@ impl Bank {
+         let transaction_configuration =
+             TransactionConfiguration::try_from_sanitized_message(message, &self.feature_set)
+                 .ok()?;
++        // sol-drivechain: the same waiver as the execution gives a staked vote.
++        if self.is_staked_simple_vote_message(message) {
++            return Some(transaction_configuration.priority_fee_lamports);
++        }
+         Some(solana_fee::calculate_fee(
+             message,
+             self.fee_structure().lamports_per_signature,
+@@ -3999,6 +4020,15 @@ impl Bank {
          ));
          timings.saturating_add_in_place(ExecuteTimingType::CheckUs, check_us);
  
@@ -2255,7 +2276,7 @@ index c8399cb..5c884e1 100644
          let (blockhash, blockhash_lamports_per_signature) =
              self.last_blockhash_and_lamports_per_signature();
          let effective_epoch_of_deployments =
-@@ -4473,14 +4499,9 @@ impl Bank {
+@@ -4473,14 +4503,9 @@ impl Bank {
              .collect()
      }
  
@@ -2273,7 +2294,7 @@ index c8399cb..5c884e1 100644
  
      /// Returns the accounts, sorted by pubkey, that were part of accounts lt hash calculation
      /// This is used when writing a bank hash details file.
-@@ -5143,6 +5164,7 @@ impl Bank {
+@@ -5143,6 +5168,7 @@ impl Bank {
      }
  
      // if you want get_account_modified_since_parent without fixed_root, please define so...
@@ -2281,7 +2302,7 @@ index c8399cb..5c884e1 100644
      fn get_account_modified_since_parent_with_fixed_root(
          &self,
          pubkey: &Pubkey,
-@@ -6296,7 +6318,16 @@ impl Bank {
+@@ -6296,7 +6322,16 @@ impl Bank {
          let mut pending = AHashSet::new();
          let slot = self.slot();
  
@@ -2300,10 +2321,10 @@ index c8399cb..5c884e1 100644
                  && let Some(feature) = feature::state::from_account(&account)
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..72e457d
+index 0000000..51c3bef
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,835 @@
+@@ -0,0 +1,885 @@
 +//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
@@ -2530,9 +2551,34 @@ index 0000000..72e457d
 +    /// True for a simple vote that pays no signature fee: its vote account
 +    /// holds stake in the epoch stakes and its authorized voter signs it.
 +    pub fn is_staked_vote(&self, tx: &impl TransactionWithMeta) -> bool {
-+        if !tx.is_simple_vote_transaction() {
-+            return false;
-+        }
++        tx.is_simple_vote_transaction() && self.is_staked_vote_message(tx)
++    }
++
++    /// The same rule for a message alone, as a fee estimate sees it.
++    pub(super) fn is_staked_simple_vote_message(
++        &self,
++        message: &impl solana_svm_transaction::svm_message::SVMMessage,
++    ) -> bool {
++        let signatures = vec![
++            solana_signature::Signature::default();
++            usize::try_from(message.num_transaction_signatures())
++                .unwrap_or(usize::MAX)
++        ];
++        let simple =
++            solana_transaction::simple_vote_transaction_checker::is_simple_vote_transaction_impl(
++                &signatures,
++                message.version() == solana_transaction::versioned::TransactionVersion::LEGACY,
++                message
++                    .program_instructions_iter()
++                    .map(|(program_id, _)| program_id),
++            );
++        simple && self.is_staked_vote_message(message)
++    }
++
++    fn is_staked_vote_message(
++        &self,
++        tx: &impl solana_svm_transaction::svm_message::SVMMessage,
++    ) -> bool {
 +        let Some((_, instruction)) = tx.program_instructions_iter().next() else {
 +            return false;
 +        };
@@ -3062,11 +3108,13 @@ index 0000000..72e457d
 +        };
 +        let staked = ValidatorVoteKeypairs::new_rand();
 +        let unstaked = ValidatorVoteKeypairs::new_rand();
-+        let genesis = create_genesis_config_with_vote_accounts(
++        let mut genesis = create_genesis_config_with_vote_accounts(
 +            1_000_000_000_000,
 +            &[&staked, &unstaked],
 +            vec![1_000_000_000, 0],
 +        );
++        genesis.genesis_config.fee_rate_governor =
++            solana_fee_calculator::FeeRateGovernor::new(5_000, 0);
 +        let bank = Bank::new_for_tests(&genesis.genesis_config);
 +        let voter_of = |keys: &ValidatorVoteKeypairs| {
 +            let vote_key = keys.vote_keypair.pubkey();
@@ -3126,6 +3174,29 @@ index 0000000..72e457d
 +            Hash::default(),
 +        );
 +        assert_eq!(vote_fee(&bank, transfer), 5_000);
++        let estimate = |vote_key: Pubkey, signer: &Keypair| {
++            let instruction = vote_instruction::tower_sync(
++                &vote_key,
++                &signer.pubkey(),
++                TowerSync::new_from_slot(0, Hash::default()),
++            );
++            let message = solana_message::Message::new_with_blockhash(
++                &[instruction],
++                Some(&signer.pubkey()),
++                &bank.last_blockhash(),
++            );
++            let message = solana_message::SanitizedMessage::try_from_legacy_message(
++                message,
++                &std::collections::HashSet::new(),
++            )
++            .unwrap();
++            bank.get_fee_for_message(&message)
++        };
++        assert_eq!(estimate(staked.vote_keypair.pubkey(), &authority), Some(0));
++        assert_eq!(
++            estimate(staked.vote_keypair.pubkey(), &stranger),
++            Some(5_000)
++        );
 +    }
 +
 +    #[test]
@@ -3307,10 +3378,10 @@ index 0000000..0538a00
 +workspace = true
 diff --git a/sol-drivechain-bmm/src/answers.rs b/sol-drivechain-bmm/src/answers.rs
 new file mode 100644
-index 0000000..d41d402
+index 0000000..58f1553
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/answers.rs
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,432 @@
 +//! The answers of the pre-check, per tx. A replay of a rooted slot uses the
 +//! answer of its first run, because a later eCash reorg can drop the block
 +//! that the tx names, and the view then has no answer for it.
@@ -3331,10 +3402,6 @@ index 0000000..d41d402
 +
 +/// The file in the ledger directory that keeps the answers.
 +pub const ANSWERS_FILE: &str = "bmm-answers";
-+
-+/// Noted answers of a slot that never froze leave this many slots below the
-+/// newest frozen slot.
-+const PENDING_SLOTS: u64 = 4096;
 +
 +/// The slot and the first signature of a tx.
 +type TxKey = (u64, [u8; 64]);
@@ -3446,8 +3513,6 @@ index 0000000..d41d402
 +    ) -> io::Result<()> {
 +        let mut state = self.state.lock().unwrap();
 +        let noted = state.noted.remove(&slot).unwrap_or_default();
-+        let floor = slot.saturating_sub(PENDING_SLOTS);
-+        state.noted = state.noted.split_off(&floor);
 +        let mut text = String::new();
 +        let mut kept = Vec::new();
 +        for (signature, noted) in noted {
@@ -3469,6 +3534,13 @@ index 0000000..d41d402
 +        })?;
 +        state.by_tx.extend(kept);
 +        Ok(())
++    }
++
++    /// Drops the noted answers of the slots below `root`. A bank below the
++    /// root that did not freeze is gone, and a frozen one wrote its answers.
++    pub fn prune_noted_below(&self, root: u64) {
++        let mut state = self.state.lock().unwrap();
++        state.noted = state.noted.split_off(&root);
 +    }
 +
 +    /// Drops the answers below `slot`, which no replay can reach again, and
@@ -3674,10 +3746,16 @@ index 0000000..d41d402
 +    }
 +
 +    #[test]
-+    fn a_noted_answer_of_a_slot_that_never_froze_leaves_later() {
++    fn a_noted_answer_waits_for_its_bank_until_the_root_passes_it() {
 +        let store = AnswerStore::default();
 +        store.note(10, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
-+        store.freeze(10 + PENDING_SLOTS + 1, |_, _| true).unwrap();
++        store.freeze(10_000, |_, _| true).unwrap();
++        store.prune_noted_below(10);
++        store.freeze(10, |_, _| true).unwrap();
++        store.set_replay_root(10);
++        assert_eq!(store.recorded(10, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
++        store.note(20, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
++        store.prune_noted_below(21);
 +        assert!(store.state.lock().unwrap().noted.is_empty());
 +    }
 +
@@ -4308,10 +4386,10 @@ index 0000000..805c22e
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..5ff65c6
+index 0000000..fb185be
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2164 @@
+@@ -0,0 +1,2195 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -4490,6 +4568,8 @@ index 0000000..5ff65c6
 +    pub new_pruned: Vec<Pruned>,
 +    /// No checkpoint came for `fallback_blocks` eCash blocks.
 +    pub fallback: bool,
++    /// The heads with the most checkpoints. More than one is a tie.
++    pub tied: usize,
 +}
 +
 +/// Selects the branch and the next root from the fork tree and the active
@@ -4594,6 +4674,21 @@ index 0000000..5ff65c6
 +        new_anchors,
 +        new_pruned,
 +        fallback,
++        tied: tied.len(),
++    }
++}
++
++/// Holds the root while a checkpoint less than `fallback_blocks` old waits
++/// for a bank that a trusted staked peer holds. When that bank arrives, it
++/// can tie or beat the head.
++pub fn hold_root(choice: &mut Choice, vouched: &[Checkpoint], tip_height: u64, params: Params) {
++    if vouched
++        .iter()
++        .any(|checkpoint| tip_height.saturating_sub(checkpoint.height) < params.fallback_blocks)
++    {
++        choice.new_root = None;
++        choice.new_anchors.clear();
++        choice.new_pruned.clear();
 +    }
 +}
 +
@@ -5882,6 +5977,20 @@ index 0000000..5ff65c6
 +        };
 +        saved.drop_anchors_above(200);
 +        assert_eq!(saved.anchors, vec![anchor(50, 100), anchor(60, 200)]);
++    }
++
++    #[test]
++    fn a_recent_vouched_checkpoint_holds_the_root() {
++        let checkpoints = [checkpoint(100, 12)];
++        let mut choice = choose(10, &shared(), &checkpoints, 103, PARAMS);
++        assert_eq!(choice.new_root, Some(12));
++        assert_eq!(choice.tied, 1);
++        hold_root(&mut choice, &[unknown(101)], 103, PARAMS);
++        assert_eq!(choice.new_root, None);
++        assert!(choice.new_anchors.is_empty());
++        let mut later = choose(10, &shared(), &checkpoints, 107, PARAMS);
++        hold_root(&mut later, &[unknown(101)], 107, PARAMS);
++        assert_eq!(later.new_root, Some(12));
 +    }
 +
 +    #[test]
