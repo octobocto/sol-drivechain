@@ -109,9 +109,9 @@ Only regtest is tested end to end.
 1. A user asks for the deposit address of a Solana pubkey. The form is
    `s<slot>_<base58 pubkey>_<checksum>`, where the checksum is the first three
    bytes of the SHA-256 of the part before it, in hex.
-2. The wallet removes the slot and the checksum, and pays through
-   `CreateDepositTransaction`. The OP_RETURN carries only the bare base58
-   pubkey, the same as Thunder.
+2. The wallet pays through `CreateDepositTransaction`. The OP_RETURN carries
+   the bare base58 pubkey, the same as Thunder, or the full address. A full
+   address counts only with the slot of this chain and a correct checksum.
 3. The mainchain sends a deposit event with a gapless sequence number.
 4. After D eCash confirmations, anybody sends
    `credit_deposits(H, block, first, count)`. No key signs for the bridge.
@@ -190,7 +190,8 @@ rules decide:
 1. **Commit.** Each eCash commitment names a Solana block and its payee:
    h* = SHA-256(Solana bank hash ‖ payee pubkey).
 2. **Choose.** Each validator follows the branch with the most valid
-   checkpoints since the split. A tie goes to the lower bank hash.
+   checkpoints since the split. In a tie a node builds on the lower bank
+   hash, but a tie roots nothing. The next checkpoint decides it.
 3. **Include deposits.** A checkpoint at eCash height H counts only when its
    bank credited every deposit through H - lag, and the active eCash chain
    still holds each credited block.
@@ -281,21 +282,26 @@ only makes blocks.
 | Part | What it does |
 |---|---|
 | Treasury | Every fee goes to the treasury, not to the leader. |
-| Vote fee | A simple vote pays no signature fee. The genesis keeps Alpenglow off, so votes are txs. |
+| Vote fee | A simple vote pays no signature fee only when its vote account holds stake in the epoch stakes and its authorized voter signs it. Every other tx pays. Alpenglow stays off, so votes are txs. |
 | `sol-drivechain-bmm` | A view of the active eCash chain, filled from the local enforcer. |
 | Settle check | For each tx with a top-level `settle_bmm(H, M, S)`, the bank asks the view. It passes only when M is the active block at H. A leader needs N + 1 blocks on top, and replay needs N. |
 | Credit check | For each tx with a top-level `credit_deposits(H, M, ...)`, the bank asks the view for the deposits of M, after D confirmations. |
 | Answers | The runtime builds `BmmAnswer` and `DepositAnswer` for the tx, the same way as the instructions sysvar. No tx can write them. |
 | Block record | The runtime writes the last block of each 32 slots and its credits into `BmmB1ocks…`. |
-| Pairs | `bmmPublishPairs` and `bmmGetPairs` on the RPC, the `bmm-pairs` file, and the push to the peers. |
+| Pairs | `bmmPublishPairs`, `bmmGetPairs`, and `bmmKnownBanks` on the RPC, the `bmm-pairs` file, and the push to and the pull from the staked peers. A peer signs each `bmmKnownBanks` reply with its node key over the asked banks, the slots, a nonce of the asker, and the time. |
 | Kept answers | The `bmm-answers` file keeps the answer of each settle and credit that the node ran. |
-| Fork choice | Checkpoints select the branch and move the root. The RPC `finalized` commitment is that root. |
-| Flags | `--bmm-enforcer-url`, `--bmm-sidechain-slot`, `--bmm-confirmations`, `--bmm-root-depth`, and `--bmm-fallback-blocks`. |
+| Fork choice | Checkpoints select the branch and move the root. A checkpoint for a bank that this node does not hold counts only when a staked peer holds that bank. The RPC `finalized` commitment is the newest root that BMM moved. |
+| Values | The genesis account `BmmParams…` holds the sidechain slot, N, K, and L. No tx can write it. |
+| Flags | `--bmm-enforcer-url` on the validator. `--bmm-sidechain-slot`, `--bmm-confirmations`, `--bmm-root-depth`, and `--bmm-fallback-blocks` on `solana-genesis`. |
 
-A "not ready" settle or credit waits in the leader queue and goes into a later
-block. On replay, the check waits up to 30 seconds for the local enforcer, and
-then the block is dead. A leader needs one more block than replay, so a
-healthy node never waits.
+A settle or a credit that the bridge refuses from its config alone runs at
+once, fails, and pays its fee. A "not ready" settle or credit waits in the
+leader queue for at most 30 seconds, with at most 4 txs per fee payer. A
+question that no new eCash block can answer leaves the queue at once. On
+replay, the questions of one slot wait 10 seconds in all for a late eCash
+block, and then the block is dead. While the enforcer does not answer, the
+replay waits and marks no block dead. A leader needs one more block than
+replay, so a healthy node never waits.
 
 A replay of a slot at or below the root of the start takes the answer from
 `bmm-answers`, not from the enforcer. The node ran that slot before, and the
@@ -319,18 +325,19 @@ payout.
 |---|---|---|---|---|
 | D | `deposit_confirmations` in the bridge config, from the genesis | 6 | 12 | A credit waits for D eCash confirmations. |
 | lag | `deposit_lag` in the bridge config, from the genesis | 100 | 100 | A checkpoint at eCash height H counts only when its bank credited every deposit through H - lag. |
-| N | `--bmm-confirmations` on each validator and `bmm --confirmations` | 6 | 6 | A settle waits for N + 1 eCash blocks on top. |
-| K | `--bmm-root-depth` on each validator | 2 | 3 | A checkpoint becomes the root after K eCash confirmations. |
-| L | `--bmm-fallback-blocks` on each validator | 6 | 12 | After L eCash blocks without a checkpoint, the stake votes move the root. |
+| N | `BmmParams` in the genesis, and `bmm --confirmations` | 6 | 6 | A settle waits for N + 1 eCash blocks on top. |
+| K | `BmmParams` in the genesis | 2 | 3 | A checkpoint becomes the root after K eCash confirmations. |
+| L | `BmmParams` in the genesis | 6 | 12 | After L eCash blocks without a checkpoint, the stake votes move the root. |
 | epoch | `slots_per_epoch` in the genesis | 8192 | 432000 | A validator leads only up to one epoch after its root. |
 
-`genesis/depths.sh` holds this table. `build-genesis.sh` and
-`run-validator.sh` read `NETWORK` and take its values. A value in the
+`genesis/depths.sh` holds this table. `build-genesis.sh` reads `NETWORK`
+and takes its values. A value in the
 environment wins: `DEPOSIT_CONFIRMATIONS`, `DEPOSIT_LAG`, `BMM_CONFIRMATIONS`,
 `BMM_ROOT_DEPTH`, `BMM_FALLBACK_BLOCKS`. Alphanet, mainnet, testnet, and
 signet have no values here, so the scripts ask for each one.
-`build-genesis.sh` writes D and the lag into the bridge config. Every
-validator reads the same config, so every validator uses the same values.
+`build-genesis.sh` writes D and the lag into the bridge config, and the
+sidechain slot (`SIDECHAIN_SLOT`), N, K, and L into `BmmParams`. Every
+validator reads the same genesis, so every validator uses the same values.
 
 `build-genesis.sh` sets 432000 slots per epoch (`SLOTS_PER_EPOCH`), about 2
 days. A BMM root comes 30 to 120 minutes after its block. When the root falls a
@@ -342,14 +349,19 @@ root. An existing chain cannot change the value.
 ## Finality
 
 - **Confirmed** comes in seconds. The stake votes give it, as on any Solana
-  chain.
+  chain. A branch with more checkpoints can still replace it, so a payment
+  waits for `finalized`.
 - **Finalized** is the BMM root: the newest block on the chosen branch with a
   checkpoint at K or more eCash confirmations. The RPC `finalized` commitment
   never passes it.
 - **Fallback.** After L eCash blocks without a checkpoint, the stake votes
-  move the root, and `finalized` follows that root. When checkpoints come
-  back and name another branch, BMM still overrules those roots with a
-  restart.
+  move the root, but `finalized` stays at the last BMM root. A read at
+  `finalized` then fails, because the node no longer holds the exact state
+  of that slot. When checkpoints come back and name another branch, BMM still
+  overrules the stake roots with a restart.
+- **Join.** A node that starts from a snapshot shows no `finalized` block
+  until it moves its root to a BMM checkpoint itself. A tie never moves the
+  root.
 
 A conflict above the root is a normal fork switch. A branch that splits behind
 the root wins only after an eCash reorg deeper than K, or after a fallback
