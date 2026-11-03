@@ -3394,10 +3394,10 @@ index 0000000..0538a00
 +workspace = true
 diff --git a/sol-drivechain-bmm/src/answers.rs b/sol-drivechain-bmm/src/answers.rs
 new file mode 100644
-index 0000000..58f1553
+index 0000000..55a3f08
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/answers.rs
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,462 @@
 +//! The answers of the pre-check, per tx. A replay of a rooted slot uses the
 +//! answer of its first run, because a later eCash reorg can drop the block
 +//! that the tx names, and the view then has no answer for it.
@@ -3409,7 +3409,7 @@ index 0000000..58f1553
 +    solana_pubkey::Pubkey,
 +    std::{
 +        collections::{BTreeMap, HashMap},
-+        fs::{self, File, OpenOptions},
++        fs::{self, OpenOptions},
 +        io::{self, Write},
 +        path::{Path, PathBuf},
 +        sync::{Mutex, OnceLock},
@@ -3435,7 +3435,7 @@ index 0000000..58f1553
 +    by_tx: HashMap<TxKey, (Pubkey, Vec<u8>)>,
 +    noted: BTreeMap<u64, HashMap<[u8; 64], Noted>>,
 +    path: Option<PathBuf>,
-+    file: Option<File>,
++    file: crate::Sink,
 +    /// The blockstore root at the start. Only a slot at or below it takes a
 +    /// recorded answer.
 +    replay_root: Option<u64>,
@@ -3459,7 +3459,7 @@ index 0000000..58f1553
 +    /// and the open drops that part.
 +    pub fn open(&self, ledger: &Path) -> io::Result<()> {
 +        let path = ledger.join(ANSWERS_FILE);
-+        let by_tx = match fs::read_to_string(&path) {
++        let (by_tx, file) = match fs::read_to_string(&path) {
 +            Ok(text) => {
 +                let complete = text.rfind('\n').map_or("", |end| &text[..=end]);
 +                let by_tx = parse(complete).ok_or_else(|| {
@@ -3468,18 +3468,22 @@ index 0000000..58f1553
 +                        format!("{} holds a bad line", path.display()),
 +                    )
 +                })?;
-+                if complete.len() != text.len() {
-+                    rewrite(&path, &by_tx)?;
-+                }
-+                by_tx
++                let file = if complete.len() != text.len() {
++                    crate::replace_file(&path, &render(&by_tx))?
++                } else {
++                    OpenOptions::new().append(true).open(&path)?
++                };
++                (by_tx, file)
 +            }
-+            Err(error) if error.kind() == io::ErrorKind::NotFound => HashMap::new(),
++            Err(error) if error.kind() == io::ErrorKind::NotFound => (
++                HashMap::new(),
++                OpenOptions::new().create(true).append(true).open(&path)?,
++            ),
 +            Err(error) => return Err(error),
 +        };
-+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 +        let mut state = self.state.lock().unwrap();
 +        state.by_tx = by_tx;
-+        state.file = Some(file);
++        state.file = crate::Sink::File(file);
 +        state.path = Some(path);
 +        Ok(())
 +    }
@@ -3571,8 +3575,7 @@ index 0000000..58f1553
 +        let Some(path) = state.path.clone() else {
 +            return Ok(());
 +        };
-+        rewrite(&path, &state.by_tx)?;
-+        state.file = Some(OpenOptions::new().append(true).open(&path)?);
++        state.file = crate::Sink::File(crate::replace_file(&path, &render(&state.by_tx))?);
 +        Ok(())
 +    }
 +
@@ -3597,18 +3600,14 @@ index 0000000..58f1553
 +    )
 +}
 +
-+fn rewrite(path: &Path, by_tx: &HashMap<TxKey, (Pubkey, Vec<u8>)>) -> io::Result<()> {
++fn render(by_tx: &HashMap<TxKey, (Pubkey, Vec<u8>)>) -> Vec<u8> {
 +    let mut entries: Vec<_> = by_tx.iter().collect();
 +    entries.sort_by_key(|((slot, signature), _)| (*slot, *signature));
 +    let mut text = String::new();
 +    for ((slot, signature), (key, data)) in entries {
 +        text.push_str(&line(*slot, signature, key, data));
 +    }
-+    let temp = path.with_extension("tmp");
-+    let mut out = File::create(&temp)?;
-+    out.write_all(text.as_bytes())?;
-+    out.sync_all()?;
-+    fs::rename(temp, path)
++    text.into_bytes()
 +}
 +
 +fn to_hex(bytes: &[u8]) -> String {
@@ -3819,6 +3818,37 @@ index 0000000..58f1553
 +        again.set_replay_root(42);
 +        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
 +        assert_eq!(again.recorded(42, &[9; 64]), Some((BMM_ANSWER_ID, vec![3])));
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_broken_log_fails_each_later_freeze() {
++        let dir = temp_dir("broken");
++        let store = AnswerStore::default();
++        store.open(&dir).unwrap();
++        store.state.lock().unwrap().file = crate::Sink::Broken;
++        store.note(40, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
++        assert!(store.freeze(40, |_, _| true).is_err());
++        store.note(41, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
++        assert!(store.freeze(41, |_, _| true).is_err());
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_prune_that_cannot_rename_keeps_the_old_file_and_handle() {
++        let dir = temp_dir("prune-rename");
++        let store = AnswerStore::default();
++        store.open(&dir).unwrap();
++        keep(&store, 40, [7; 64], &[1]);
++        keep(&store, 50, [8; 64], &[2]);
++        fs::create_dir_all(dir.join(ANSWERS_FILE).with_extension("tmp")).unwrap();
++        assert!(store.prune_below(45).is_err());
++        keep(&store, 60, [9; 64], &[3]);
++        fs::remove_dir_all(dir.join(ANSWERS_FILE).with_extension("tmp")).unwrap();
++        let again = AnswerStore::default();
++        again.open(&dir).unwrap();
++        again.set_replay_root(60);
++        assert_eq!(again.recorded(60, &[9; 64]), Some((BMM_ANSWER_ID, vec![3])));
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
@@ -6836,10 +6866,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..fb30678
+index 0000000..48adcf1
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,1815 @@
+@@ -0,0 +1,1842 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -7040,16 +7070,29 @@ index 0000000..fb30678
 +/// An eCash height, its block hash, and the commitment in its coinbase.
 +pub type HeightCommitment = (u64, BlockHash, Commitment);
 +
-+/// Appends `text` to a file that the store opened to append, with one sync.
-+/// A failed write cuts the file back to its old length, so no part of a line
-+/// stays. A failed cut drops the handle, and the store writes no more lines.
++/// Where a store writes its lines.
++#[derive(Debug, Default)]
++pub(crate) enum Sink {
++    /// No file, by design: the store lives in memory.
++    #[default]
++    Memory,
++    File(std::fs::File),
++    /// A write failed and its cut failed too. Every later write fails.
++    Broken,
++}
++
++/// Appends `text` to the file of `sink`, with one sync. A failed write cuts
++/// the file back to its old length, so no part of a line stays. A failed cut
++/// breaks the sink.
 +pub(crate) fn append_or_roll_back(
-+    file: &mut Option<std::fs::File>,
++    sink: &mut Sink,
 +    text: &[u8],
 +    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 +) -> std::io::Result<()> {
-+    let Some(handle) = file.as_mut() else {
-+        return Ok(());
++    let handle = match sink {
++        Sink::Memory => return Ok(()),
++        Sink::Broken => return Err(std::io::Error::other("an earlier write to the log failed")),
++        Sink::File(handle) => handle,
 +    };
 +    let len = handle.metadata()?.len();
 +    let Err(error) = write(handle, text).and_then(|()| handle.sync_data()) else {
@@ -7060,9 +7103,23 @@ index 0000000..fb30678
 +        .and_then(|()| handle.sync_data())
 +        .is_err()
 +    {
-+        *file = None;
++        *sink = Sink::Broken;
 +    }
 +    Err(error)
++}
++
++/// Writes `text` as the new file at `path` in one rename, and gives a handle
++/// that appends to it. The handle opens before the rename, so a failure leaves
++/// the old file and its handle as they were.
++pub(crate) fn replace_file(path: &std::path::Path, text: &[u8]) -> std::io::Result<std::fs::File> {
++    use std::io::Write;
++    let temp = path.with_extension("tmp");
++    let mut out = std::fs::File::create(&temp)?;
++    out.write_all(text)?;
++    out.sync_all()?;
++    let handle = std::fs::OpenOptions::new().append(true).open(&temp)?;
++    std::fs::rename(&temp, path)?;
++    Ok(handle)
 +}
 +
 +/// `N` bytes from base58 text. Text longer than the base58 of `N` bytes fails
@@ -8657,10 +8714,10 @@ index 0000000..fb30678
 +}
 diff --git a/sol-drivechain-bmm/src/pairs.rs b/sol-drivechain-bmm/src/pairs.rs
 new file mode 100644
-index 0000000..2607ace
+index 0000000..6bfac3a
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/pairs.rs
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,716 @@
 +//! The published pairs. A bidder sends the Solana block hash and the payee of
 +//! its bid to the validators, outside any transaction. A commitment h* counts
 +//! only when a pair with SHA-256(block hash ‖ payee) = h* is known.
@@ -8669,7 +8726,7 @@ index 0000000..2607ace
 +    crate::{BmmView, Commitment},
 +    std::{
 +        collections::{BTreeMap, HashMap, HashSet},
-+        fs::{self, File, OpenOptions},
++        fs,
 +        io::{self, Write},
 +        path::{Path, PathBuf},
 +        sync::{Mutex, OnceLock},
@@ -8722,7 +8779,7 @@ index 0000000..2607ace
 +#[derive(Default)]
 +struct Log {
 +    path: Option<PathBuf>,
-+    file: Option<File>,
++    file: crate::Sink,
 +    /// The lines in the file.
 +    lines: usize,
 +}
@@ -8756,8 +8813,9 @@ index 0000000..2607ace
 +            Err(error) => return Err(error),
 +        };
 +        let mut log = self.log.lock().unwrap();
-+        log.lines = rewrite(&path, &by_height, &checked)?;
-+        log.file = Some(OpenOptions::new().append(true).open(&path)?);
++        let (text, lines) = render(&by_height, &checked);
++        log.file = crate::Sink::File(crate::replace_file(&path, &text)?);
++        log.lines = lines;
 +        log.path = Some(path);
 +        let mut state = self.state.lock().unwrap();
 +        state.by_height = by_height;
@@ -8910,8 +8968,9 @@ index 0000000..2607ace
 +        let Some(path) = log.path.clone() else {
 +            return Ok(());
 +        };
-+        log.lines = rewrite(&path, &snapshot, &checked)?;
-+        log.file = Some(OpenOptions::new().append(true).open(&path)?);
++        let (text, lines) = render(&snapshot, &checked);
++        log.file = crate::Sink::File(crate::replace_file(&path, &text)?);
++        log.lines = lines;
 +        Ok(())
 +    }
 +
@@ -8962,12 +9021,11 @@ index 0000000..2607ace
 +    text.rfind('\n').map_or("", |end| &text[..=end])
 +}
 +
-+/// Writes the file in one rename, and gives its line count.
-+fn rewrite(
-+    file: &Path,
++/// The text of the file, and its line count.
++fn render(
 +    by_height: &BTreeMap<u64, Vec<Pair>>,
 +    checked: &HashSet<(u64, Pair)>,
-+) -> io::Result<usize> {
++) -> (Vec<u8>, usize) {
 +    let mut text = String::new();
 +    let mut lines = 0usize;
 +    for (height, pairs) in by_height {
@@ -8976,12 +9034,7 @@ index 0000000..2607ace
 +            lines = lines.saturating_add(1);
 +        }
 +    }
-+    let temp = file.with_extension("tmp");
-+    let mut out = File::create(&temp)?;
-+    out.write_all(text.as_bytes())?;
-+    out.sync_all()?;
-+    fs::rename(temp, file)?;
-+    Ok(lines)
++    (text.into_bytes(), lines)
 +}
 +
 +type Parsed = (BTreeMap<u64, Vec<Pair>>, HashSet<(u64, Pair)>);
@@ -9022,7 +9075,7 @@ index 0000000..2607ace
 +
 +#[cfg(test)]
 +mod tests {
-+    use {super::*, crate::Block};
++    use {super::*, crate::Block, std::fs::OpenOptions};
 +
 +    fn pair(byte: u8) -> Pair {
 +        Pair {
@@ -9297,7 +9350,7 @@ index 0000000..2607ace
 +                Err(io::Error::other("no space left"))
 +            });
 +        assert!(failed.is_err());
-+        assert!(log.file.is_some());
++        assert!(matches!(log.file, crate::Sink::File(_)));
 +        drop(log);
 +        store.publish(106, pair(6), &view(104)).ok();
 +        store.publish(111, pair(9), &view(110)).unwrap();
@@ -9307,6 +9360,44 @@ index 0000000..2607ace
 +            "{text}"
 +        );
 +        let again = PairStore::default();
++        again.open(&dir).unwrap();
++        assert_eq!(again.from_height(0), store.from_height(0));
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_failed_cut_breaks_the_log_and_later_writes_fail() {
++        let dir = temp_dir("broken");
++        let store = PairStore::default();
++        store.open(&dir).unwrap();
++        store.log.lock().unwrap().file = crate::Sink::Broken;
++        assert!(store.publish(105, pair(5), &view(110)).is_err());
++        assert!(store.publish(106, pair(6), &view(105)).is_err());
++        let memory = PairStore::default();
++        assert_eq!(
++            memory.publish(105, pair(5), &view(110)).unwrap(),
++            Publish::New
++        );
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_rewrite_that_cannot_rename_keeps_the_old_file_and_handle() {
++        let dir = temp_dir("rename");
++        let store = PairStore::default();
++        store.open(&dir).unwrap();
++        store.publish(105, pair(5), &view(110)).unwrap();
++        fs::create_dir_all(dir.join(PAIRS_FILE).with_extension("tmp")).unwrap();
++        store.log.lock().unwrap().lines = usize::MAX / 2;
++        store.state.lock().unwrap().maintained = None;
++        assert!(store.maintain(&view(110)).is_err());
++        assert!(matches!(
++            store.log.lock().unwrap().file,
++            crate::Sink::File(_)
++        ));
++        store.publish(111, pair(9), &view(110)).unwrap();
++        let again = PairStore::default();
++        fs::remove_dir_all(dir.join(PAIRS_FILE).with_extension("tmp")).unwrap();
 +        again.open(&dir).unwrap();
 +        assert_eq!(again.from_height(0), store.from_height(0));
 +        fs::remove_dir_all(&dir).unwrap();
