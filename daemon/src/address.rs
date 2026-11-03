@@ -33,6 +33,25 @@ pub fn parse_deposit_recipient(text: &str) -> Result<Pubkey, AddressError> {
     Ok(Pubkey::new_from_array(bytes))
 }
 
+/// The pubkey that a deposit OP_RETURN names, by the rule of the validator: a
+/// bare base58 pubkey, or `s<slot>_<pubkey>_<checksum>` with this chain's
+/// `slot` in decimal and a correct lower-case checksum.
+pub fn deposit_target(text: &str, slot: u8) -> Option<Pubkey> {
+    let pubkey = match text.split('_').collect::<Vec<_>>().as_slice() {
+        [pubkey] => *pubkey,
+        [prefix, pubkey, checksum] => {
+            if *prefix != format!("s{slot}")
+                || *checksum != checksum_of(&format!("{prefix}_{pubkey}_"))
+            {
+                return None;
+            }
+            *pubkey
+        }
+        _ => return None,
+    };
+    parse_deposit_recipient(pubkey).ok()
+}
+
 fn checksum_of(prefix: &str) -> String {
     let digest = sha256::Hash::hash(prefix.as_bytes());
     crate::hex::encode(&digest.to_byte_array()[..CHECKSUM_BYTES])
@@ -83,6 +102,32 @@ mod tests {
         let address = format_deposit_address(SLOT, &a_pubkey());
         let error = parse_deposit_recipient(&address).unwrap_err();
         assert!(matches!(error, AddressError::Base58(_)));
+    }
+
+    /// The vectors that the validator test `a_deposit_names_a_full_address_of_this_slot`
+    /// in the Agave patch checks too.
+    #[test]
+    fn the_deposit_target_follows_the_validator_rule() {
+        let pubkey = a_pubkey();
+        let full = format_deposit_address(SLOT, &pubkey);
+        assert_eq!(deposit_target(&pubkey.to_string(), SLOT), Some(pubkey));
+        assert_eq!(deposit_target(&full, SLOT), Some(pubkey));
+        assert_eq!(deposit_target(&full, 9), None);
+        let zero_slot = format!("s08_{pubkey}_{}", checksum_of(&format!("s08_{pubkey}_")));
+        assert_eq!(deposit_target(&zero_slot, SLOT), None);
+        assert_eq!(deposit_target(&full.to_uppercase(), SLOT), None);
+        let mut bad = full.clone();
+        let last = if full.ends_with('0') { "1" } else { "0" };
+        bad.replace_range(bad.len() - 1.., last);
+        assert_eq!(deposit_target(&bad, SLOT), None);
+        assert_eq!(deposit_target(&format!("s8_{pubkey}"), SLOT), None);
+        assert_eq!(deposit_target("s8_abc_000000", SLOT), None);
+        let solana = "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4T";
+        let bitwindow = format!("s8_{solana}_{}", checksum_of(&format!("s8_{solana}_")));
+        assert_eq!(
+            deposit_target(&bitwindow, SLOT).map(|key| key.to_string()),
+            Some(solana.to_owned())
+        );
     }
 
     #[test]

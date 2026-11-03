@@ -735,14 +735,14 @@ fn main() -> Result<(), CliError> {
                         } => {
                             for deposit in deposits {
                                 let text = String::from_utf8_lossy(&deposit.address);
-                                let parsed = address::parse_deposit_recipient(&text);
+                                let parsed = address::deposit_target(&text, slot);
                                 println!(
                                     "block {height} deposit seq {} value {} sats address {text}",
                                     deposit.sequence_number, deposit.value_sats
                                 );
                                 match parsed {
-                                    Ok(pubkey) => println!("  the target is {pubkey}"),
-                                    Err(error) => println!("  the address fails: {error}"),
+                                    Some(pubkey) => println!("  the target is {pubkey}"),
+                                    None => println!("  the address names no target"),
                                 }
                             }
                             for bundle in bundles {
@@ -1013,7 +1013,7 @@ fn main() -> Result<(), CliError> {
                 )
                 .await?;
                 enforcer.check_network(network).await?;
-                credit::run(&mut enforcer, solana_rpc_url, program_id, &payer_key).await?;
+                credit::run(&mut enforcer, solana_rpc_url, program_id, &payer_key, slot).await?;
                 Ok(())
             })
         }
@@ -1213,7 +1213,10 @@ fn main() -> Result<(), CliError> {
             wait_secs,
         } => runtime.block_on(async {
             let rpc = std::sync::Arc::new(
-                solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url),
+                solana_rpc_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
+                    solana_rpc_url,
+                    solana_commitment_config::CommitmentConfig::confirmed(),
+                ),
             );
             let mut enforcer = enforcer.open().await?;
             let mut tip = enforcer.tip().await?;
@@ -1276,7 +1279,10 @@ fn main() -> Result<(), CliError> {
             block,
             payee,
         } => runtime.block_on(async {
-            let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
+            let rpc = solana_rpc_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
+                solana_rpc_url,
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            );
             let pair = bmm::Pair {
                 height,
                 block: parse_pubkey(&block)?.to_bytes(),

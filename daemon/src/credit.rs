@@ -54,7 +54,7 @@ pub struct Part {
 
 /// The next part of the deposits of a block, from the credit index of the
 /// config. A deposit whose OP_RETURN names no pubkey adds no target.
-pub fn next_part(height: u64, credit_index: u64, deposits: &[DepositEvent]) -> Part {
+pub fn next_part(height: u64, credit_index: u64, deposits: &[DepositEvent], slot: u8) -> Part {
     let first = usize::try_from(credit_index)
         .unwrap_or(usize::MAX)
         .min(deposits.len());
@@ -64,15 +64,18 @@ pub fn next_part(height: u64, credit_index: u64, deposits: &[DepositEvent]) -> P
         first: u32::try_from(first).unwrap_or(u32::MAX),
         count: u8::try_from(part.len()).unwrap_or(u8::MAX),
         total: deposits.len(),
-        targets: part.iter().filter_map(target).collect(),
+        targets: part
+            .iter()
+            .filter_map(|deposit| target(deposit, slot))
+            .collect(),
     }
 }
 
 /// The pubkey that a deposit OP_RETURN names. The validator reads it the same
 /// way.
-pub fn target(deposit: &DepositEvent) -> Option<Pubkey> {
+pub fn target(deposit: &DepositEvent, slot: u8) -> Option<Pubkey> {
     let text = std::str::from_utf8(&deposit.address).ok()?;
-    address::parse_deposit_recipient(text).ok()
+    address::deposit_target(text, slot)
 }
 
 /// True when the bridge config can take a part of the active eCash block
@@ -96,12 +99,13 @@ pub async fn run(
     solana_rpc_url: String,
     program_id: Pubkey,
     payer: &Keypair,
+    slot: u8,
 ) -> Result<(), CreditError> {
     // The followed branch can be one that the stake does not confirm yet.
     let rpc = RpcClient::new_with_commitment(solana_rpc_url, CommitmentConfig::processed());
     tracing::info!(payer = %payer.pubkey(), "the credit loop starts");
     loop {
-        if !credit_next(enforcer, &rpc, &program_id, payer).await? {
+        if !credit_next(enforcer, &rpc, &program_id, payer, slot).await? {
             tokio::time::sleep(IDLE).await;
         }
     }
@@ -113,6 +117,7 @@ async fn credit_next(
     rpc: &RpcClient,
     program_id: &Pubkey,
     payer: &Keypair,
+    slot: u8,
 ) -> Result<bool, CreditError> {
     let config = read_config(rpc, program_id).await?;
     let height = config.credited_height.saturating_add(1);
@@ -135,7 +140,7 @@ async fn credit_next(
         return Ok(false);
     }
     let deposits = enforcer.block_deposits(block_hash, prev_hash).await?;
-    let part = next_part(height, config.credit_index, &deposits);
+    let part = next_part(height, config.credit_index, &deposits, slot);
     let instruction = bridge::credit_deposits_ix(
         program_id,
         height,
@@ -251,10 +256,10 @@ mod tests {
         let deposits: Vec<DepositEvent> = (0..20)
             .map(|index| a_deposit(index, key.to_string().as_bytes()))
             .collect();
-        let first = next_part(50, 0, &deposits);
+        let first = next_part(50, 0, &deposits, 8);
         assert_eq!((first.first, first.count, first.total), (0, 16, 20));
         assert_eq!(first.targets.len(), 16);
-        let last = next_part(50, 16, &deposits);
+        let last = next_part(50, 16, &deposits, 8);
         assert_eq!((last.first, last.count), (16, 4));
     }
 
@@ -266,14 +271,23 @@ mod tests {
             a_deposit(1, key.to_string().as_bytes()),
             a_deposit(2, &[0xff]),
         ];
-        let part = next_part(50, 0, &deposits);
+        let part = next_part(50, 0, &deposits, 8);
         assert_eq!(part.count, 3);
         assert_eq!(part.targets, vec![key]);
     }
 
     #[test]
+    fn a_full_address_of_this_slot_adds_its_target() {
+        let key = Pubkey::new_from_array([7u8; 32]);
+        let full = address::format_deposit_address(8, &key);
+        let deposits = [a_deposit(0, full.as_bytes())];
+        assert_eq!(next_part(50, 0, &deposits, 8).targets, vec![key]);
+        assert!(next_part(50, 0, &deposits, 9).targets.is_empty());
+    }
+
+    #[test]
     fn an_empty_block_gives_an_empty_part() {
-        let part = next_part(50, 0, &[]);
+        let part = next_part(50, 0, &[], 8);
         assert_eq!((part.first, part.count, part.total), (0, 0, 0));
         assert!(part.targets.is_empty());
     }
