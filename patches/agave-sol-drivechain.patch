@@ -256,10 +256,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..7d361ba
+index 0000000..e8f1ade
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,611 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -503,9 +503,26 @@ index 0000000..7d361ba
 +            }
 +            self.dropped = dropped;
 +        }
++        let (staked, total_stake) = frozen_banks
++            .iter()
++            .find(|bank| bank.slot() == root)
++            .map(|bank| {
++                (
++                    bank.current_epoch_staked_nodes(),
++                    bank.get_current_epoch_total_stake(),
++                )
++            })
++            .unwrap_or_default();
 +        let vouched = fork_choice::vouched(
 +            &screened.absent,
 +            |bank_hash| peers().attesters(bank_hash),
++            |node| {
++                staked
++                    .get(&Pubkey::new_from_array(*node))
++                    .copied()
++                    .unwrap_or_default()
++            },
++            total_stake,
 +            &self.saved,
 +            tip_height,
 +        );
@@ -526,27 +543,20 @@ index 0000000..7d361ba
 +            tip_height,
 +            fork_choice::params(),
 +        );
-+        // A checkpoint whose bank a trusted staked peer holds can still
-+        // arrive here, so it stops the fallback as a pending one does.
-+        let waiting: Vec<u64> = screened
-+            .pending
-+            .iter()
-+            .copied()
-+            .chain(self.vouched.iter().map(|checkpoint| checkpoint.height))
-+            .collect();
-+        choice.fallback = choice.fallback
-+            && !fork_choice::pending_stops_fallback(&waiting, tip_height, fork_choice::params());
-+        let holding = fork_choice::hold_root(
++        // A checkpoint whose bank trusted staked peers hold can still arrive
++        // here, so it stops the fallback as a pending one does.
++        let stopping = fork_choice::stop_fallback(
 +            &mut choice,
++            &screened.pending,
 +            &self.vouched,
 +            tip_height,
 +            fork_choice::params(),
 +        );
-+        if !holding.is_empty() {
++        if !stopping.is_empty() {
 +            let mut saved = self.saved.clone();
-+            if fork_choice::open_hold_proof(
++            if fork_choice::open_proof(
 +                &mut saved,
-+                &holding,
++                &stopping,
 +                |bank_hash| peers().attesters(bank_hash),
 +                tip_height,
 +            ) {
@@ -570,7 +580,7 @@ index 0000000..7d361ba
 +    }
 +
 +    /// Tells the peer sync which banks this node holds and which it wants,
-+    /// and settles the proof of the last restart.
++    /// and settles the open proof.
 +    fn share_banks(&mut self, absent: &[Checkpoint], below_root: &BelowRoot, tip_height: u64) {
 +        let known: HashMap<BankHash, Slot> = self
 +            .banks
@@ -602,7 +612,7 @@ index 0000000..7d361ba
 +        if fork_choice::settle_proof(&mut saved, holds, tip_height) {
 +            if saved.proof.is_none() && saved.distrusted.len() > self.saved.distrusted.len() {
 +                warn!(
-+                    "BMM: the last restart brought no bank that its peers named, so this node \
++                    "BMM: no bank that the peers of the proof named arrived, so this node \
 +                     distrusts {} peers",
 +                    saved.distrusted.len() - self.saved.distrusted.len()
 +                );
@@ -764,7 +774,7 @@ index 0000000..7d361ba
 +            })
 +            .copied()
 +            .collect();
-+        fork_choice::open_hold_proof(
++        fork_choice::open_proof(
 +            &mut saved,
 +            &named,
 +            |bank_hash| peers().attesters(bank_hash),
@@ -3860,10 +3870,10 @@ index 0000000..55a3f08
 +}
 diff --git a/sol-drivechain-bmm/src/enforcer.rs b/sol-drivechain-bmm/src/enforcer.rs
 new file mode 100644
-index 0000000..805c22e
+index 0000000..2af21ea
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/enforcer.rs
-@@ -0,0 +1,564 @@
+@@ -0,0 +1,761 @@
 +//! A small gRPC client for the enforcer `ValidatorService`. It holds only the
 +//! messages that the BMM view reads, so Agave needs no proto build step.
 +
@@ -3872,6 +3882,14 @@ index 0000000..805c22e
 +    tonic::{codegen::http::uri::PathAndQuery, transport::Channel},
 +    tonic_prost::ProstCodec,
 +};
++
++/// The consensus limit of a serialized eCash block, as in
++/// `MAX_BLOCK_SERIALIZED_SIZE` of the enforcer.
++const MAX_ECASH_BLOCK_BYTES: usize = 4_000_000;
++
++/// The largest reply that the client decodes. The peg data of one block
++/// carries each byte of the block at most twice, as hex.
++pub(crate) const MAX_REPLY_BYTES: usize = 2 * MAX_ECASH_BLOCK_BYTES + (1 << 20);
 +
 +#[derive(Debug, thiserror::Error)]
 +pub enum EnforcerError {
@@ -3900,6 +3918,13 @@ index 0000000..805c22e
 +    BadBlockHash(String),
 +    #[error("the enforcer gave a deposit address that is not hex: {0}")]
 +    BadDepositAddress(String),
++}
++
++impl EnforcerError {
++    /// True when the reply was larger than `MAX_REPLY_BYTES`.
++    pub fn is_reply_too_large(&self) -> bool {
++        matches!(self, Self::Call { source, .. } if source.code() == tonic::Code::OutOfRange)
++    }
 +}
 +
 +/// google.protobuf.StringValue
@@ -4095,7 +4120,7 @@ index 0000000..805c22e
 +                source,
 +            })?;
 +        Ok(Self {
-+            grpc: tonic::client::Grpc::new(channel),
++            grpc: tonic::client::Grpc::new(channel).max_decoding_message_size(MAX_REPLY_BYTES),
 +        })
 +    }
 +
@@ -4314,6 +4339,128 @@ index 0000000..805c22e
 +}
 +
 +#[cfg(test)]
++pub(crate) mod fake {
++    use {
++        super::*,
++        crate::Block,
++        std::{
++            convert::Infallible,
++            sync::Arc,
++            task::{Context, Poll},
++        },
++        tonic::{
++            body::Body,
++            codegen::{BoxFuture, Service, http},
++            transport::server::TcpIncoming,
++        },
++    };
++
++    /// An enforcer that answers only `GetTwoWayPegData`, for the blocks of
++    /// its chain from low to high.
++    #[derive(Clone)]
++    struct PegData(Arc<Vec<(u64, Block)>>);
++
++    impl PegData {
++        fn reply(
++            &self,
++            request: GetTwoWayPegDataRequest,
++        ) -> Result<tonic::Response<GetTwoWayPegDataResponse>, tonic::Status> {
++            let index_of = |value: Option<HexValue>, child: bool| {
++                let text = hex_text(value).ok_or(tonic::Status::invalid_argument("no hash"))?;
++                let hash = decode_block_hash(&text)
++                    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
++                self.0
++                    .iter()
++                    .position(|(_, block)| hash == if child { block.prev_hash } else { block.hash })
++                    .ok_or(tonic::Status::not_found(text))
++            };
++            let first = match request.start_block_hash {
++                Some(start) => index_of(Some(start), true)?,
++                None => 0,
++            };
++            let last = index_of(request.end_block_hash, false)?;
++            let blocks = self.0[first..=last]
++                .iter()
++                .filter(|(_, block)| !block.deposits.is_empty())
++                .map(|(height, block)| PegDataItem {
++                    block_header_info: Some(BlockHeaderInfo {
++                        block_hash: Some(hex_value(&reverse_hex(&block.hash))),
++                        prev_block_hash: Some(hex_value(&reverse_hex(&block.prev_hash))),
++                        height: u32::try_from(*height).unwrap(),
++                    }),
++                    block_info: Some(BlockInfo {
++                        events: block
++                            .deposits
++                            .iter()
++                            .map(|deposit| BlockEvent {
++                                deposit: Some(DepositMessage {
++                                    sequence_number: Some(UInt64Value {
++                                        value: deposit.sequence_number,
++                                    }),
++                                    output: Some(DepositOutput {
++                                        address: Some(hex_value(&hex::encode(&deposit.address))),
++                                        value_sats: Some(UInt64Value {
++                                            value: deposit.value_sats,
++                                        }),
++                                    }),
++                                }),
++                            })
++                            .collect(),
++                    }),
++                })
++                .collect();
++            Ok(tonic::Response::new(GetTwoWayPegDataResponse { blocks }))
++        }
++    }
++
++    impl tonic::server::UnaryService<GetTwoWayPegDataRequest> for PegData {
++        type Response = GetTwoWayPegDataResponse;
++        type Future = std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
++
++        fn call(&mut self, request: tonic::Request<GetTwoWayPegDataRequest>) -> Self::Future {
++            std::future::ready(self.reply(request.into_inner()))
++        }
++    }
++
++    impl Service<http::Request<Body>> for PegData {
++        type Response = http::Response<Body>;
++        type Error = Infallible;
++        type Future = BoxFuture<Self::Response, Self::Error>;
++
++        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++            Poll::Ready(Ok(()))
++        }
++
++        fn call(&mut self, request: http::Request<Body>) -> Self::Future {
++            let service = self.clone();
++            Box::pin(async move {
++                let mut grpc = tonic::server::Grpc::new(ProstCodec::<
++                    GetTwoWayPegDataResponse,
++                    GetTwoWayPegDataRequest,
++                >::default());
++                Ok(grpc.unary(service, request).await)
++            })
++        }
++    }
++
++    /// A block hash in the reversed hex of the enforcer.
++    pub(crate) fn reverse_hex(hash: &BlockHash) -> String {
++        hex::encode(hash.iter().rev().copied().collect::<Vec<_>>())
++    }
++
++    /// Starts an enforcer for `chain` on a free local port, and gives its URL.
++    pub(crate) fn serve(chain: Vec<(u64, Block)>) -> String {
++        let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
++        let url = format!("http://{}", incoming.local_addr().unwrap());
++        tokio::spawn(
++            tonic::transport::Server::builder()
++                .serve_with_incoming(PegData(Arc::new(chain)), incoming),
++        );
++        url
++    }
++}
++
++#[cfg(test)]
 +mod tests {
 +    use {super::*, prost::Message as _};
 +
@@ -4427,13 +4574,73 @@ index 0000000..805c22e
 +        let decoded = GetBmmHStarCommitmentResponse::decode(bytes.as_slice()).unwrap();
 +        assert_eq!(decoded, reply);
 +    }
++
++    fn deposit_of(len: usize) -> Deposit {
++        Deposit {
++            sequence_number: 1,
++            value_sats: 5000,
++            address: vec![b'a'; len],
++        }
++    }
++
++    fn block_with(byte: u8, deposits: Vec<Deposit>) -> crate::Block {
++        crate::Block {
++            hash: [byte; 32],
++            prev_hash: [byte.wrapping_sub(1); 32],
++            commitment: None,
++            deposits: deposits.into(),
++        }
++    }
++
++    #[tokio::test]
++    async fn a_deposit_reply_above_four_mib_reads() {
++        let big = deposit_of(2_200_000);
++        let url = fake::serve(vec![(1, block_with(1, vec![big.clone()]))]);
++        let mut enforcer = Enforcer::connect(&url).await.unwrap();
++        let read = enforcer
++            .deposits(
++                8,
++                Some(&fake::reverse_hex(&[0; 32])),
++                &fake::reverse_hex(&[1; 32]),
++            )
++            .await
++            .unwrap();
++        assert_eq!(read, vec![([1; 32], vec![big])]);
++    }
++
++    #[tokio::test]
++    async fn the_reply_for_a_block_of_the_largest_size_reads() {
++        let big = deposit_of(MAX_ECASH_BLOCK_BYTES);
++        let url = fake::serve(vec![(1, block_with(1, vec![big.clone()]))]);
++        let mut enforcer = Enforcer::connect(&url).await.unwrap();
++        let read = enforcer
++            .deposits(8, None, &fake::reverse_hex(&[1; 32]))
++            .await
++            .unwrap();
++        assert_eq!(read, vec![([1; 32], vec![big])]);
++    }
++
++    #[tokio::test]
++    async fn a_reply_above_the_limit_fails_as_too_large() {
++        let url = fake::serve(vec![
++            (1, block_with(1, vec![deposit_of(MAX_ECASH_BLOCK_BYTES)])),
++            (2, block_with(2, vec![deposit_of(MAX_ECASH_BLOCK_BYTES)])),
++        ]);
++        let mut enforcer = Enforcer::connect(&url).await.unwrap();
++        let error = enforcer
++            .deposits(8, None, &fake::reverse_hex(&[2; 32]))
++            .await
++            .unwrap_err();
++        assert!(error.is_reply_too_large(), "{error}");
++        assert!(!EnforcerError::BlockNotFound(String::new()).is_reply_too_large());
++    }
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..99d2688
+index 0000000..3fde07d
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2538 @@
+@@ -0,0 +1,2705 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -4446,8 +4653,9 @@ index 0000000..99d2688
 +//! top.
 +//! When no checkpoint comes for `fallback_blocks` eCash blocks, the root
 +//! follows the stake votes again. A checkpoint for an absent bank stops the
-+//! fallback and asks for a restart only when a trusted staked peer holds its
-+//! bank. A commitment without a pair is not a checkpoint.
++//! fallback and asks for a restart only when trusted staked peers with more
++//! than 1/3 of the stake hold its bank. A commitment without a pair is not a
++//! checkpoint.
 +//!
 +//! A checkpoint at eCash height H counts only when the bridge config of its
 +//! bank credited every deposit through H - lag, and the active eCash chain
@@ -4727,38 +4935,39 @@ index 0000000..99d2688
 +    }
 +}
 +
-+/// Holds the root while a checkpoint less than `fallback_blocks` old waits
-+/// for a bank that a trusted staked peer holds. When that bank arrives, it
-+/// can tie or beat the head.
-+/// Returns the checkpoints that held a root move, so their peers must prove
-+/// them with `open_hold_proof`.
-+pub fn hold_root(
++/// Stops the fallback while a pending or a vouched checkpoint came less than
++/// `fallback_blocks` eCash blocks ago. It never changes the root move.
++/// Returns the vouched checkpoints that stopped the fallback, so their peers
++/// must prove them with `open_proof`.
++pub fn stop_fallback(
 +    choice: &mut Choice,
++    pending: &[u64],
 +    vouched: &[Checkpoint],
 +    tip_height: u64,
 +    params: Params,
 +) -> Vec<Checkpoint> {
-+    let holding: Vec<Checkpoint> = vouched
++    if !choice.fallback {
++        return Vec::new();
++    }
++    if pending_stops_fallback(pending, tip_height, params) {
++        choice.fallback = false;
++        return Vec::new();
++    }
++    let stopping: Vec<Checkpoint> = vouched
 +        .iter()
 +        .filter(|checkpoint| tip_height.saturating_sub(checkpoint.height) < params.fallback_blocks)
 +        .copied()
 +        .collect();
-+    if holding.is_empty() || choice.new_root.is_none() {
-+        return Vec::new();
-+    }
-+    choice.new_root = None;
-+    choice.new_anchors.clear();
-+    choice.new_pruned.clear();
-+    holding
++    choice.fallback = stopping.is_empty();
++    stopping
 +}
 +
-+/// Puts the banks that held a root move and their peers into the open proof.
-+/// A peer of the proof vouches for nothing else, and when none of the banks
-+/// arrives by the deadline, `settle_proof` distrusts it. True when `saved`
-+/// changed.
-+pub fn open_hold_proof(
++/// Puts the banks of `named` and their peers into the open proof. A peer of
++/// the proof vouches for nothing else, and when none of the banks arrives by
++/// the deadline, `settle_proof` distrusts it. True when `saved` changed.
++pub fn open_proof(
 +    saved: &mut Saved,
-+    holding: &[Checkpoint],
++    named: &[Checkpoint],
 +    attesters: impl Fn(&BankHash) -> Vec<NodeId>,
 +    tip_height: u64,
 +) -> bool {
@@ -4767,7 +4976,7 @@ index 0000000..99d2688
 +        nodes: Vec::new(),
 +        deadline_height: tip_height.saturating_add(PROOF_BLOCKS),
 +    });
-+    for checkpoint in holding {
++    for checkpoint in named {
 +        if !proof.bank_hashes.contains(&checkpoint.bank_hash) {
 +            proof.bank_hashes.push(checkpoint.bank_hash);
 +        }
@@ -4925,6 +5134,7 @@ index 0000000..99d2688
 +        }
 +    }
 +
++    /// True when a saved anchor or a block of the block record has this bank hash.
 +    pub fn holds(&self, bank_hash: &BankHash) -> bool {
 +        self.ancestors.contains_key(bank_hash)
 +            || self
@@ -5005,9 +5215,9 @@ index 0000000..99d2688
 +    pub until_height: u64,
 +}
 +
-+/// The banks that a restart named, and the nodes that said they hold them.
-+/// A restart that brings none of the banks by `deadline_height` makes this
-+/// node distrust those nodes.
++/// The banks that a restart or a stopped fallback named, and the nodes that
++/// said they hold them. When none of the banks arrives by `deadline_height`,
++/// this node distrusts those nodes.
 +#[derive(Clone, Debug, PartialEq, Eq)]
 +pub struct Proof {
 +    pub bank_hashes: Vec<BankHash>,
@@ -5015,19 +5225,22 @@ index 0000000..99d2688
 +    pub deadline_height: u64,
 +}
 +
-+/// The eCash blocks after a restart in which one of its banks must arrive.
++/// The eCash blocks after a proof opens in which one of its banks must arrive.
 +pub const PROOF_BLOCKS: u64 = 12;
 +
-+/// A node whose restart brought no bank does not count for this many eCash
++/// A node whose proof brought no bank does not count for this many eCash
 +/// blocks.
 +pub const DISTRUST_BLOCKS: u64 = 1008;
 +
-+/// The absent checkpoints that a staked peer holds the bank of. A peer in
++/// The absent checkpoints whose bank staked peers with more than 1/3 of
++/// `total_stake` hold. `stake` gives the epoch stake of a node. A peer in
 +/// `distrusted` does not count, and a peer in the open proof counts only for
 +/// the banks of that proof.
 +pub fn vouched(
 +    absent: &[Checkpoint],
 +    attesters: impl Fn(&BankHash) -> Vec<NodeId>,
++    stake: impl Fn(&NodeId) -> u64,
++    total_stake: u64,
 +    saved: &Saved,
 +    tip_height: u64,
 +) -> Vec<Checkpoint> {
@@ -5043,9 +5256,12 @@ index 0000000..99d2688
 +    absent
 +        .iter()
 +        .filter(|checkpoint| {
-+            attesters(&checkpoint.bank_hash)
++            let held: u128 = attesters(&checkpoint.bank_hash)
 +                .iter()
-+                .any(|node| !doubted(node, &checkpoint.bank_hash))
++                .filter(|node| !doubted(node, &checkpoint.bank_hash))
++                .map(|node| u128::from(stake(node)))
++                .sum();
++            held.saturating_mul(3) > u128::from(total_stake)
 +        })
 +        .copied()
 +        .collect()
@@ -5192,11 +5408,16 @@ index 0000000..99d2688
 +///
 +/// The root can pass the newest active anchor in two ways: the stake votes
 +/// moved it in a fallback, or an eCash reorg removed a newer anchor. If more
-+/// checkpoints above that anchor name banks that this node does not know, the
-+/// node must replay from a snapshot at or below the anchor. Unknown
-+/// checkpoints at or below `saved.handled_height` caused an earlier restart,
-+/// and they cannot cause another. `ancestors` is the block record of the
-+/// root. Without an active anchor, the node replays from `saved.base`, the
++/// checkpoints above the split name banks that this node does not know, the
++/// node must replay from a snapshot at or below an anchor below the split.
++/// Unknown checkpoints at or below `saved.handled_height` caused an earlier
++/// restart, and they cannot cause another. `ancestors` is the block record of
++/// the root.
++///
++/// No shared data gives the slot of the split, so the eCash height of the
++/// first unknown checkpoint stands for it. The anchor is the newest active
++/// anchor below that height. Without one, it is the newest saved anchor below
++/// that height. A node without a saved anchor replays from `saved.base`, the
 +/// root of its first start.
 +///
 +/// `credited_tip` is the highest eCash height that a frozen bank credited. An
@@ -5214,22 +5435,22 @@ index 0000000..99d2688
 +    params: Params,
 +) -> Option<Restart> {
 +    let anchors = known_anchors(saved, ancestors, checkpoints);
-+    let anchor = anchors
++    let base = saved
++        .anchors
++        .is_empty()
++        .then_some(saved.base)
++        .flatten()
++        .map(|base| Anchor {
++            slot: base.slot,
++            bank_hash: [0u8; 32],
++            height: base.credited_height,
++            block_hash: [0u8; 32],
++        });
++    let floor = anchors
 +        .iter()
-+        .filter(|anchor| anchor.is_active(checkpoints))
-+        .max_by_key(|anchor| anchor.slot)
-+        .copied()
-+        .or_else(|| {
-+            saved.base.map(|base| Anchor {
-+                slot: base.slot,
-+                bank_hash: [0u8; 32],
-+                height: base.credited_height,
-+                block_hash: [0u8; 32],
-+            })
-+        })?;
-+    if anchor.slot >= root {
-+        return None;
-+    }
++        .chain(base.iter())
++        .map(|anchor| anchor.height)
++        .min()?;
 +    let lost: HashSet<BankHash> = saved
 +        .pruned
 +        .iter()
@@ -5243,23 +5464,43 @@ index 0000000..99d2688
 +        .chain(ancestors.iter().map(|block| block.bank_hash))
 +        .chain(lost.iter().copied())
 +        .collect();
-+    let above = checkpoints
++    let theirs: Vec<u64> = checkpoints
 +        .iter()
-+        .filter(|checkpoint| checkpoint.height > anchor.height);
-+    let ours = above
-+        .clone()
 +        .filter(|checkpoint| {
-+            known.contains(&checkpoint.bank_hash) && !lost.contains(&checkpoint.bank_hash)
-+        })
-+        .count();
-+    let theirs: Vec<u64> = above
-+        .filter(|checkpoint| {
-+            !known.contains(&checkpoint.bank_hash)
++            checkpoint.height > floor
++                && !known.contains(&checkpoint.bank_hash)
 +                && checkpoint.height <= credited_tip
 +                && tip_height.saturating_sub(checkpoint.height) >= params.root_depth
 +        })
 +        .map(|checkpoint| checkpoint.height)
 +        .collect();
++    let split_height = *theirs.iter().min()?;
++    let below_split = |anchor: &&Anchor| anchor.height < split_height;
++    let anchor = anchors
++        .iter()
++        .filter(below_split)
++        .filter(|anchor| anchor.is_active(checkpoints))
++        .max_by_key(|anchor| anchor.slot)
++        .or_else(|| {
++            saved
++                .anchors
++                .iter()
++                .filter(below_split)
++                .max_by_key(|anchor| anchor.slot)
++        })
++        .or(base.as_ref().filter(below_split))
++        .copied()?;
++    if anchor.slot >= root {
++        return None;
++    }
++    let ours = checkpoints
++        .iter()
++        .filter(|checkpoint| {
++            checkpoint.height > split_height
++                && known.contains(&checkpoint.bank_hash)
++                && !lost.contains(&checkpoint.bank_hash)
++        })
++        .count();
 +    let trigger_height = *theirs.iter().max()?;
 +    (theirs.len() > ours && trigger_height > saved.handled_height).then_some(Restart {
 +        anchor,
@@ -5390,7 +5631,7 @@ index 0000000..99d2688
 +    pub handled_height: u64,
 +    /// The next start must load a snapshot at or below this slot.
 +    pub restart_to: Option<Slot>,
-+    /// The banks of the last restart, until one of them arrives.
++    /// The banks of the open proof, until one of them arrives.
 +    pub proof: Option<Proof>,
 +    pub distrusted: Vec<Distrust>,
 +}
@@ -5954,7 +6195,7 @@ index 0000000..99d2688
 +                checkpoints.push(checkpoint(201, 64));
 +            }
 +            let screened = screen_root(&checkpoints, &ancestors, &saved);
-+            let vouched = vouched(&screened.absent, |_| vec![node(1)], &saved, 206);
++            let vouched = vouched_with_full_stake(&screened.absent, |_| vec![node(1)], &saved, 206);
 +            let mut choice = choose(96, &banks, &screened.counted, 206, PARAMS);
 +            let pending: Vec<_> = screened
 +                .pending
@@ -6061,13 +6302,74 @@ index 0000000..99d2688
 +        [byte; 32]
 +    }
 +
++    /// `vouched` when each attester alone holds more than 1/3 of the stake.
++    fn vouched_with_full_stake(
++        absent: &[Checkpoint],
++        attesters: impl Fn(&BankHash) -> Vec<NodeId>,
++        saved: &Saved,
++        tip_height: u64,
++    ) -> Vec<Checkpoint> {
++        vouched(absent, attesters, |_| 1, 1, saved, tip_height)
++    }
++
++    #[test]
++    fn attesters_must_hold_more_than_one_third_of_the_stake() {
++        let absent = [unknown(100)];
++        let stake = |node: &NodeId| u64::from(node[0]);
++        let held_by = |nodes: Vec<NodeId>| move |_: &BankHash| nodes.clone();
++        let saved = Saved::default();
++        assert!(vouched(&absent, held_by(vec![node(1)]), stake, 100, &saved, 100).is_empty());
++        assert!(
++            vouched(
++                &absent,
++                held_by(vec![node(30), node(3)]),
++                stake,
++                99,
++                &saved,
++                100
++            )
++            .is_empty()
++        );
++        assert_eq!(
++            vouched(
++                &absent,
++                held_by(vec![node(30), node(4)]),
++                stake,
++                99,
++                &saved,
++                100
++            ),
++            vec![unknown(100)]
++        );
++        let distrusted = Saved {
++            distrusted: vec![Distrust {
++                node: node(30),
++                until_height: 150,
++            }],
++            ..Saved::default()
++        };
++        assert!(
++            vouched(
++                &absent,
++                held_by(vec![node(30), node(4)]),
++                stake,
++                99,
++                &distrusted,
++                100
++            )
++            .is_empty()
++        );
++    }
++
 +    #[test]
 +    fn only_a_checkpoint_that_a_trusted_peer_holds_is_vouched() {
 +        let absent = [unknown(100)];
 +        let held_by = |nodes: Vec<NodeId>| move |_: &BankHash| nodes.clone();
-+        assert!(vouched(&absent, held_by(vec![]), &Saved::default(), 100).is_empty());
++        assert!(
++            vouched_with_full_stake(&absent, held_by(vec![]), &Saved::default(), 100).is_empty()
++        );
 +        assert_eq!(
-+            vouched(&absent, held_by(vec![node(1)]), &Saved::default(), 100),
++            vouched_with_full_stake(&absent, held_by(vec![node(1)]), &Saved::default(), 100),
 +            vec![unknown(100)]
 +        );
 +        let on_hold = Saved {
@@ -6078,7 +6380,7 @@ index 0000000..99d2688
 +            }),
 +            ..Saved::default()
 +        };
-+        assert!(vouched(&absent, held_by(vec![node(1)]), &on_hold, 100).is_empty());
++        assert!(vouched_with_full_stake(&absent, held_by(vec![node(1)]), &on_hold, 100).is_empty());
 +        let awaited = Saved {
 +            proof: Some(Proof {
 +                bank_hashes: vec![[0xee; 32]],
@@ -6088,11 +6390,11 @@ index 0000000..99d2688
 +            ..Saved::default()
 +        };
 +        assert_eq!(
-+            vouched(&absent, held_by(vec![node(1)]), &awaited, 100),
++            vouched_with_full_stake(&absent, held_by(vec![node(1)]), &awaited, 100),
 +            vec![unknown(100)]
 +        );
 +        assert_eq!(
-+            vouched(&absent, held_by(vec![node(1), node(2)]), &on_hold, 100),
++            vouched_with_full_stake(&absent, held_by(vec![node(1), node(2)]), &on_hold, 100),
 +            vec![unknown(100)]
 +        );
 +        let distrusted = Saved {
@@ -6102,9 +6404,11 @@ index 0000000..99d2688
 +            }],
 +            ..Saved::default()
 +        };
-+        assert!(vouched(&absent, held_by(vec![node(1)]), &distrusted, 100).is_empty());
++        assert!(
++            vouched_with_full_stake(&absent, held_by(vec![node(1)]), &distrusted, 100).is_empty()
++        );
 +        assert_eq!(
-+            vouched(&absent, held_by(vec![node(1)]), &distrusted, 150),
++            vouched_with_full_stake(&absent, held_by(vec![node(1)]), &distrusted, 150),
 +            vec![unknown(100)]
 +        );
 +    }
@@ -6154,7 +6458,7 @@ index 0000000..99d2688
 +                },
 +            ]
 +        );
-+        let after = vouched(&[unknown(130)], |_| vec![node(1)], &saved, 130);
++        let after = vouched_with_full_stake(&[unknown(130)], |_| vec![node(1)], &saved, 130);
 +        assert!(after.is_empty());
 +    }
 +
@@ -6321,23 +6625,6 @@ index 0000000..99d2688
 +        assert_eq!(saved.anchors, vec![anchor(50, 100), anchor(60, 200)]);
 +    }
 +
-+    #[test]
-+    fn a_recent_vouched_checkpoint_holds_the_root() {
-+        let checkpoints = [checkpoint(100, 12)];
-+        let mut choice = choose(10, &shared(), &checkpoints, 103, PARAMS);
-+        assert_eq!(choice.new_root, Some(12));
-+        assert_eq!(choice.tied, 1);
-+        assert_eq!(
-+            hold_root(&mut choice, &[unknown(101)], 103, PARAMS),
-+            vec![unknown(101)]
-+        );
-+        assert_eq!(choice.new_root, None);
-+        assert!(choice.new_anchors.is_empty());
-+        let mut later = choose(10, &shared(), &checkpoints, 107, PARAMS);
-+        assert!(hold_root(&mut later, &[unknown(101)], 107, PARAMS).is_empty());
-+        assert_eq!(later.new_root, Some(12));
-+    }
-+
 +    fn fake(height: u64) -> Checkpoint {
 +        Checkpoint {
 +            height,
@@ -6347,27 +6634,40 @@ index 0000000..99d2688
 +    }
 +
 +    #[test]
-+    fn a_peer_that_never_shows_its_banks_holds_the_root_only_until_the_proof_ends() {
++    fn a_vouched_checkpoint_never_holds_the_root() {
++        let banks = tree(&[(10, 0), (11, 10), (12, 10)]);
++        let checkpoints = [checkpoint(100, 11)];
++        let mut vouching = choose(10, &banks, &checkpoints, 102, PARAMS);
++        let mut other = vouching.clone();
++        stop_fallback(&mut vouching, &[], &[fake(101)], 102, PARAMS);
++        stop_fallback(&mut other, &[], &[], 102, PARAMS);
++        assert_eq!(vouching.new_root, Some(11));
++        assert_eq!(vouching, other);
++    }
++
++    #[test]
++    fn a_vouched_checkpoint_stops_the_fallback_only_until_the_proof_ends() {
 +        let liar = |_: &BankHash| vec![node(7)];
-+        let checkpoints = [checkpoint(100, 12)];
-+        let mut saved = Saved::default();
-+        let mut tip = 103;
-+        let first = vouched(&[fake(101)], liar, &saved, tip);
-+        let mut choice = choose(10, &shared(), &checkpoints, tip, PARAMS);
-+        let holding = hold_root(&mut choice, &first, tip, PARAMS);
-+        assert_eq!(choice.new_root, None);
-+        assert!(open_hold_proof(&mut saved, &holding, liar, tip));
-+        let deadline = tip + PROOF_BLOCKS;
-+        while tip < deadline {
-+            tip += 1;
-+            let again = vouched(&[fake(tip - 1)], liar, &saved, tip);
-+            assert!(again.is_empty(), "the liar holds a second bank");
-+            let still = vouched(&[fake(101)], liar, &saved, tip);
-+            let mut choice = choose(10, &shared(), &checkpoints, tip, PARAMS);
-+            hold_root(&mut choice, &still, tip, PARAMS);
-+            if tip >= 101 + PARAMS.fallback_blocks {
-+                assert_eq!(choice.new_root, Some(12));
++        let banks = tree(&[(11, 0), (12, 11), (13, 12)]);
++        let checkpoints = [checkpoint(100, 11)];
++        let mut saved = saved(&[anchor(100, 11)], &[], 0);
++        let first = 110;
++        let deadline = first + PROOF_BLOCKS;
++        for tip in first..deadline + PARAMS.fallback_blocks {
++            let absent: Vec<Checkpoint> = (first - 1..tip).map(fake).collect();
++            let named = vouched_with_full_stake(&absent, liar, &saved, tip);
++            assert!(named.len() <= 1, "the liar names a second bank");
++            let mut choice = choose(11, &banks, &checkpoints, tip, PARAMS);
++            assert!(choice.fallback);
++            let stopping = stop_fallback(&mut choice, &[], &named, tip, PARAMS);
++            if !stopping.is_empty() {
++                assert_eq!(open_proof(&mut saved, &stopping, liar, tip), tip == first);
 +            }
++            assert_eq!(
++                choice.fallback,
++                tip >= first - 1 + PARAMS.fallback_blocks,
++                "fallback at tip {tip}"
++            );
 +            settle_proof(&mut saved, |_| false, tip);
 +        }
 +        assert_eq!(saved.proof, None);
@@ -6377,7 +6677,6 @@ index 0000000..99d2688
 +                .iter()
 +                .any(|distrust| distrust.node == node(7))
 +        );
-+        assert!(vouched(&[fake(200)], liar, &saved, tip + 1).is_empty());
 +    }
 +
 +    #[test]
@@ -6851,6 +7150,81 @@ index 0000000..99d2688
 +        );
 +    }
 +
++    #[test]
++    fn a_restart_without_an_active_anchor_goes_to_the_newest_saved_anchor() {
++        let saved = Saved {
++            anchors: vec![anchor(90, 4000), anchor(100, 5000)],
++            base: Some(base(0, 0)),
++            ..Saved::default()
++        };
++        let banks = tree(&[(9000, 0)]);
++        let expected = Some(Restart {
++            anchor: anchor(100, 5000),
++            trigger_height: 4990,
++        });
++        assert_eq!(
++            restart(9000, &banks, &[fake(4990)], 5000, &saved, &[], 4995, PARAMS),
++            expected
++        );
++        let in_view = [checkpoint(100, 5000), fake(4990)];
++        assert_eq!(
++            restart(9000, &banks, &in_view, 5000, &saved, &[], 4995, PARAMS),
++            expected
++        );
++    }
++
++    #[test]
++    fn an_ancestor_checkpoint_above_the_split_never_becomes_the_anchor() {
++        let saved = Saved {
++            anchors: vec![anchor(10, 50)],
++            base: Some(base(0, 0)),
++            ..Saved::default()
++        };
++        let banks = tree(&[(200, 0)]);
++        let record = [
++            RecordedBlock {
++                credited_height: 18,
++                ..ancestor(100)
++            },
++            RecordedBlock {
++                credited_height: 20,
++                ..ancestor(150)
++            },
++        ];
++        let restart_with = |checkpoints: &[Checkpoint], tip_height, credited_tip| {
++            restart(
++                200,
++                &banks,
++                checkpoints,
++                tip_height,
++                &saved,
++                &record,
++                credited_tip,
++                PARAMS,
++            )
++        };
++        let mut checkpoints = vec![checkpoint(10, 50), fake(20), fake(21), fake(22)];
++        let expected = Some(Restart {
++            anchor: anchor(10, 50),
++            trigger_height: 22,
++        });
++        assert_eq!(restart_with(&checkpoints, 28, 22), expected);
++        let below_root = BelowRoot::new(&saved.anchors, &record, Some(6), |_| None);
++        let late = checkpoint(25, 150);
++        let screened = screen(&[late], &HashMap::new(), &below_root);
++        assert_eq!(screened.counted, vec![late]);
++        checkpoints.push(late);
++        assert_eq!(restart_with(&checkpoints, 28, 22), expected);
++        checkpoints.extend([fake(26), fake(27)]);
++        assert_eq!(
++            restart_with(&checkpoints, 30, 27),
++            Some(Restart {
++                anchor: anchor(10, 50),
++                trigger_height: 27,
++            })
++        );
++    }
++
 +    fn beaten_by(checkpoint: Checkpoint, winner: u64) -> Pruned {
 +        Pruned {
 +            checkpoint,
@@ -7096,10 +7470,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..48adcf1
+index 0000000..e507be6
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,1842 @@
+@@ -0,0 +1,1916 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -7782,8 +8156,8 @@ index 0000000..48adcf1
 +
 +/// A lookup inside the view. `Ahead` names a block more than `MAX_AHEAD`
 +/// blocks past what the view can answer. `Mismatch` names another block than
-+/// the view holds, which an eCash reorg can still change. `Backfill` waits
-+/// for older blocks.
++/// the view holds with exactly `depth` blocks on top, which a reorg to a
++/// chain one block longer can still change. `Backfill` waits for older blocks.
 +enum Found<T> {
 +    Ready(T),
 +    NotYet,
@@ -7875,6 +8249,8 @@ index 0000000..48adcf1
 +            Some(block) if missing == 0 => {
 +                if &block.hash == block_hash {
 +                    Found::Ready(block.clone())
++                } else if tip_height.saturating_sub(height) > depth {
++                    Found::Never
 +                } else {
 +                    Found::Mismatch
 +                }
@@ -8049,13 +8425,26 @@ index 0000000..48adcf1
 +    }
 +
 +    /// Replaces the active chain from the lowest height in `blocks` upward.
-+    /// `blocks` runs from low to high and ends at the new tip.
++    /// `blocks` runs from low to high and ends at the new tip. When the parent
++    /// of the lowest block is not the view block below it, the view drops all
++    /// blocks below too, so a gap asks for a backfill.
 +    pub fn replace_from(&self, blocks: &[(u64, Block)]) {
-+        let (Some(&(lowest, _)), Some(&(tip_height, _))) = (blocks.first(), blocks.last()) else {
++        let (Some((lowest, oldest)), Some(&(tip_height, _))) = (blocks.first(), blocks.last())
++        else {
 +            return;
 +        };
++        let lowest = *lowest;
 +        let mut state = self.state.lock().unwrap();
 +        state.active.split_off(&lowest);
++        let joins = lowest.checked_sub(1).is_none_or(|below| {
++            state
++                .active
++                .get(&below)
++                .is_some_and(|parent| parent.hash == oldest.prev_hash)
++        });
++        if !joins {
++            state.active.clear();
++        }
 +        state.active.extend(blocks.iter().cloned());
 +        state.tip_height = Some(tip_height);
 +        if state.wanted_low.is_some_and(|wanted| wanted >= lowest) {
@@ -8286,6 +8675,25 @@ index 0000000..48adcf1
 +            deposit(1, checksummed("s8", "abc").as_bytes()).target(8),
 +            None
 +        );
++    }
++
++    #[test]
++    fn a_deposit_address_longer_than_the_longest_form_names_nothing() {
++        let key = Pubkey::new_from_array([255; 32]).to_string();
++        let longest = checksummed("s255", &key);
++        assert_eq!(longest.len(), 56);
++        assert_eq!(deposit(1, longest.as_bytes()).target(255), Some([255; 32]));
++        let long = "z".repeat(2_200_000);
++        assert_eq!(deposit(1, long.as_bytes()).target(8), None);
++        assert_eq!(
++            deposit(1, checksummed("s8", &long).as_bytes()).target(8),
++            None
++        );
++        assert_eq!(
++            deposit(1, format!("{key}{long}").as_bytes()).target(8),
++            None
++        );
++        assert_eq!(deposit(1, "_".repeat(2_200_000).as_bytes()).target(8), None);
 +    }
 +
 +    #[test]
@@ -8601,11 +9009,19 @@ index 0000000..48adcf1
 +        assert_eq!(ask(&view, 105, hash(200), 6), Lookup::NotYet);
 +    }
 +
++    /// A fork of `chain(from, to, salt)` whose lowest block has the parent
++    /// `chain(.., 0)` at `from - 1`.
++    fn fork(from: u64, to: u64, salt: u8) -> Vec<(u64, Block)> {
++        let mut blocks = chain(from, to, salt);
++        blocks[0].1.prev_hash = hash((from as u8).wrapping_sub(1));
++        blocks
++    }
++
 +    #[test]
 +    fn a_reorg_replaces_the_active_blocks() {
 +        let view = BmmView::default();
 +        view.replace_from(&chain(100, 110, 0));
-+        view.replace_from(&chain(104, 120, 50));
++        view.replace_from(&fork(104, 120, 50));
 +        assert_eq!(ask(&view, 104, hash(104), 6), Lookup::Never);
 +        assert_eq!(
 +            ask(&view, 104, hash(104 + 50), 6),
@@ -8621,6 +9037,21 @@ index 0000000..48adcf1
 +        view.replace_from(&chain(110, 112, 50));
 +        assert_eq!(view.block_at(115), None);
 +        assert_eq!(view.tip(), Some((112, hash(112 + 50))));
++    }
++
++    #[test]
++    fn a_run_that_does_not_join_drops_the_blocks_below_it() {
++        let view = BmmView::default();
++        view.replace_from(&chain(1, 4000, 0));
++        view.replace_from(&chain(5000, 9032, 0));
++        assert_eq!(view.lowest(), Some(5000));
++        assert_eq!(
++            view.deep_block(4500, &hash(4500u64 as u8), 6, 0, Wait::No),
++            Lookup::NotYet
++        );
++        assert_eq!(view.wanted_low(), Some(4500));
++        assert_eq!(view.hash_at(4400, 0, Wait::No), Lookup::NotYet);
++        assert_eq!(view.wanted_low(), Some(4400));
 +    }
 +
 +    #[test]
@@ -8684,7 +9115,7 @@ index 0000000..48adcf1
 +        let writer = Arc::clone(&view);
 +        let handle = std::thread::spawn(move || {
 +            std::thread::sleep(Duration::from_millis(100));
-+            writer.replace_from(&chain(104, 110, 50));
++            writer.replace_from(&fork(104, 111, 50));
 +            writer.mark_synced();
 +        });
 +        assert_eq!(
@@ -8692,7 +9123,7 @@ index 0000000..48adcf1
 +            Lookup::Ready(Some([104; 32]))
 +        );
 +        handle.join().unwrap();
-+        assert_eq!(view.answer(104, &hash(200), 6, 0, Wait::No), Lookup::Never);
++        assert_eq!(view.answer(105, &hash(200), 6, 0, Wait::No), Lookup::Never);
 +        view.state
 +            .lock()
 +            .unwrap()
@@ -8700,8 +9131,25 @@ index 0000000..48adcf1
 +            .insert(9, Duration::from_millis(100));
 +        let start = Instant::now();
 +        assert_eq!(
-+            view.answer(104, &hash(200), 6, 0, Wait::Replay { slot: 9 }),
++            view.answer(105, &hash(200), 6, 0, Wait::Replay { slot: 9 }),
 +            Lookup::NotYet
++        );
++        assert!(start.elapsed() < Duration::from_secs(1));
++    }
++
++    #[test]
++    fn a_replay_gives_never_at_once_for_another_block_below_the_depth() {
++        let view = BmmView::default();
++        view.replace_from(&chain(100, 120, 0));
++        view.mark_synced();
++        let start = Instant::now();
++        assert_eq!(
++            view.answer(104, &hash(200), 6, 0, Wait::Replay { slot: 14 }),
++            Lookup::Never
++        );
++        assert_eq!(
++            view.deep_block(110, &hash(200), 6, 0, Wait::Replay { slot: 14 }),
++            Lookup::Never
 +        );
 +        assert!(start.elapsed() < Duration::from_secs(1));
 +    }
@@ -9889,10 +10337,10 @@ index 0000000..83b113c
 +}
 diff --git a/sol-drivechain-bmm/src/poller.rs b/sol-drivechain-bmm/src/poller.rs
 new file mode 100644
-index 0000000..29e612a
+index 0000000..7d2ee05
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/poller.rs
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,410 @@
 +//! Copies the active eCash chain from the local enforcer into the view.
 +
 +use {
@@ -10165,26 +10613,63 @@ index 0000000..29e612a
 +        cursor_height = below;
 +    }
 +    blocks.reverse();
-+    let Some((lowest, oldest)) = blocks.first() else {
-+        return Ok(blocks);
-+    };
-+    let start = (*lowest > 0).then(|| reverse_hex(&oldest.prev_hash));
-+    let mut deposits: HashMap<BlockHash, Vec<_>> = enforcer
-+        .deposits(sidechain_slot, start.as_deref(), top)
-+        .await?
-+        .into_iter()
-+        .collect();
-+    for (_, block) in blocks.iter_mut() {
-+        if let Some(found) = deposits.remove(&block.hash) {
-+            block.deposits = Arc::from(found);
++    read_deposits(enforcer, sidechain_slot, &mut blocks).await?;
++    Ok(blocks)
++}
++
++/// Puts the deposits of each block of `blocks`, from low to high, in place.
++/// A reply above the size limit splits its span in two, down to one block,
++/// so a large block cannot stop the reads of the other blocks.
++async fn read_deposits(
++    enforcer: &mut Enforcer,
++    sidechain_slot: u8,
++    blocks: &mut [(u64, Block)],
++) -> Result<(), EnforcerError> {
++    let mut parts = vec![(0, blocks.len())];
++    while let Some((first, end)) = parts.pop() {
++        let (Some((lowest, oldest)), Some((highest, newest))) = (
++            blocks.get(first),
++            end.checked_sub(1).and_then(|last| blocks.get(last)),
++        ) else {
++            continue;
++        };
++        let start = (*lowest > 0).then(|| reverse_hex(&oldest.prev_hash));
++        let read = match enforcer
++            .deposits(sidechain_slot, start.as_deref(), &reverse_hex(&newest.hash))
++            .await
++        {
++            Ok(read) => read,
++            Err(error) if error.is_reply_too_large() && end.saturating_sub(first) > 1 => {
++                let middle = first.midpoint(end);
++                log::warn!(
++                    "the enforcer reply for eCash heights {lowest} to {highest} is too large, and \
++                     the poller reads it in two parts: {error}"
++                );
++                parts.push((middle, end));
++                parts.push((first, middle));
++                continue;
++            }
++            Err(error) => return Err(error),
++        };
++        let mut deposits: HashMap<BlockHash, Vec<_>> = read.into_iter().collect();
++        for (_, block) in &mut blocks[first..end] {
++            if let Some(found) = deposits.remove(&block.hash) {
++                block.deposits = Arc::from(found);
++            }
 +        }
 +    }
-+    Ok(blocks)
++    Ok(())
 +}
 +
 +#[cfg(test)]
 +mod tests {
-+    use super::*;
++    use {
++        super::*,
++        crate::{
++            Deposit,
++            enforcer::{MAX_REPLY_BYTES, fake},
++        },
++    };
 +
 +    fn block(byte: u8, prev: u8) -> Block {
 +        Block {
@@ -10193,6 +10678,38 @@ index 0000000..29e612a
 +            commitment: None,
 +            deposits: Arc::from([]),
 +        }
++    }
++
++    #[tokio::test]
++    async fn a_span_with_too_much_peg_data_splits_until_each_part_fits() {
++        let deposit = |sequence_number, len| Deposit {
++            sequence_number,
++            value_sats: 5000,
++            address: vec![b'a'; len],
++        };
++        let heavy = MAX_REPLY_BYTES * 3 / 10;
++        let mut chain: Vec<(u64, Block)> = (1..=8)
++            .map(|height| (height, block(height as u8, height as u8 - 1)))
++            .collect();
++        chain[2].1.deposits = Arc::from([deposit(1, heavy)]);
++        chain[3].1.deposits = Arc::from([deposit(2, heavy)]);
++        chain[5].1.deposits = Arc::from([deposit(3, 10)]);
++        let url = fake::serve(chain.clone());
++        let mut enforcer = Enforcer::connect(&url).await.unwrap();
++        let mut blocks: Vec<(u64, Block)> = chain
++            .iter()
++            .map(|(height, found)| {
++                (
++                    *height,
++                    Block {
++                        deposits: Arc::from([]),
++                        ..found.clone()
++                    },
++                )
++            })
++            .collect();
++        read_deposits(&mut enforcer, 8, &mut blocks).await.unwrap();
++        assert_eq!(blocks, chain);
 +    }
 +
 +    #[test]
