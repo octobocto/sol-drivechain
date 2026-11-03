@@ -64,7 +64,8 @@ TIP="$("$DAEMON" ecash-tip --network "$NETWORK" --enforcer-url "$ENFORCER_URL" \
 echo "BMM on the new chain settles from eCash height $TIP"
 STATE="$STATE" ECASH_START_HEIGHT="$TIP" LEDGER="$LEDGER" KEYS="$KEYS" DAEMON="$DAEMON" \
   NETWORK="$NETWORK" DEPOSIT_CONFIRMATIONS="${DEPOSIT_CONFIRMATIONS:-}" \
-  DEPOSIT_LAG="${DEPOSIT_LAG:-}" bash "$REPO/genesis/build-genesis.sh"
+  DEPOSIT_LAG="${DEPOSIT_LAG:-}" SIDECHAIN_SLOT="$SIDECHAIN_SLOT" \
+  bash "$REPO/genesis/build-genesis.sh"
 
 echo
 echo "the new ledger is at $LEDGER, and the state of the old chain is in $STATE"

@@ -202,6 +202,7 @@ up() {
   if [ ! -d "$ROOT/ledger" ]; then
     NETWORK=regtest LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" \
       ECASH_START_HEIGHT="$(btc getblockcount)" BUNDLE_MIN_SLOTS=0 \
+      SIDECHAIN_SLOT="$SLOT" BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" \
       bash "$REPO/genesis/build-genesis.sh" >/dev/null
   fi
   start_process validator env \

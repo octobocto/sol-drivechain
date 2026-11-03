@@ -3,8 +3,6 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=genesis/depths.sh
-. "$REPO/genesis/depths.sh"
 LEDGER="${LEDGER:-$REPO/genesis/ledger}"
 KEYS="${KEYS:-$REPO/keys}"
 RPC_PORT="${RPC_PORT:-8899}"
@@ -53,13 +51,11 @@ for known in ${KNOWN_VALIDATOR:-}; do
   JOIN_ARGS+=(--known-validator "$known")
 done
 # Each validator reads eCash from its own enforcer, or it cannot check a block
-# that settles a BMM height. NETWORK selects N, K, and L.
-if [ -z "${ENFORCER_URL:-}" ] || [ -z "${SIDECHAIN_SLOT:-}" ]; then
-  echo "error: set ENFORCER_URL and SIDECHAIN_SLOT for the local eCash enforcer." >&2
+# that settles a BMM height. The genesis holds the slot, N, K, and L.
+if [ -z "${ENFORCER_URL:-}" ]; then
+  echo "error: set ENFORCER_URL for the local eCash enforcer." >&2
   exit 1
 fi
-network_depths
-require_depths BMM_CONFIRMATIONS BMM_ROOT_DEPTH BMM_FALLBACK_BLOCKS
 if [ -n "${EXPECTED_GENESIS_HASH:-}" ]; then
   JOIN_ARGS+=(--expected-genesis-hash "$EXPECTED_GENESIS_HASH")
 fi
@@ -153,10 +149,6 @@ exec "$AGAVE_VALIDATOR" \
   ${JOIN_ARGS[@]+"${JOIN_ARGS[@]}"} \
   --no-poh-speed-test \
   --bmm-enforcer-url "$ENFORCER_URL" \
-  --bmm-sidechain-slot "$SIDECHAIN_SLOT" \
-  --bmm-confirmations "$BMM_CONFIRMATIONS" \
-  --bmm-root-depth "$BMM_ROOT_DEPTH" \
-  --bmm-fallback-blocks "$BMM_FALLBACK_BLOCKS" \
   --no-os-network-limits-test \
   --full-rpc-api \
   --enable-rpc-transaction-history \

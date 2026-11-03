@@ -99,6 +99,11 @@ jobs:
           echo "== errors of the halted node =="
           grep -aE " (ERROR|WARN) " "$HOME/peg-regtest/validator-halted.log" 2>/dev/null \
             | grep -av datapoint | tail -60 || echo "(absent)"
+          echo "== the second validator =="
+          grep -av datapoint "$HOME/peg-regtest/validator2.log" 2>/dev/null | tail -60 || echo "(absent)"
+          echo "== errors, panics, and BMM lines of the second validator =="
+          grep -aE " (ERROR|WARN) |panicked|BMM|sol_drivechain_bmm" "$HOME/peg-regtest/validator2.log" \
+            2>/dev/null | grep -av datapoint | tail -80 || echo "(absent)"
 
   bmm-fork:
     name: BMM fork choice on regtest
@@ -178,4 +183,9 @@ jobs:
                      "$RUNNER_TEMP/bmm-fork/bitcoin-stack/enforcer/enforcer.log"; do
             echo "== $log =="
             sudo tail -80 "$log" 2>/dev/null || echo "(absent)"
+          done
+          for log in "$RUNNER_TEMP/bmm-fork/m.log" "$RUNNER_TEMP/bmm-fork/h.log"; do
+            echo "== the BMM lines of $log =="
+            sudo grep -aE "BMM|sol_drivechain_bmm" "$log" 2>/dev/null | grep -av datapoint | tail -80 \
+              || echo "(absent)"
           done
