@@ -133,6 +133,7 @@ BMM_START="$(btc getblockcount)"
 NETWORK=regtest LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$BMM_START" \
   DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 \
   ORACLE_LAMPORTS=2000000 BOOTSTRAP_LAMPORTS=2000000 \
+  SIDECHAIN_SLOT="$SLOT" BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" \
   bash "$REPO/genesis/build-genesis.sh" > "$ROOT/genesis.log"
 # A copy of the fresh ledger lets a second validator replay from the genesis,
 # with no snapshot download.
@@ -182,7 +183,7 @@ step "the bridge config and the block record come from the genesis"
 "$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID"
 [ "$("$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
   | awk '/^credited height/ {print $3}')" = "$BMM_START" ] || fail "the genesis config does not start at eCash height $BMM_START"
-RECORD="$(rpc getAccountInfo '["BmmB1ocks1111111111111111111111111111111111",{"encoding":"base64","dataSlice":{"offset":0,"length":0}}]' \
+RECORD="$(rpc getAccountInfo '["BmmB1ocks1111111111111111111111111111111111",{"encoding":"base64","commitment":"confirmed","dataSlice":{"offset":0,"length":0}}]' \
   | python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]["value"]; print(v["lamports"], v["owner"], v["space"])')"
 [ "$RECORD" = "$(rpc getMinimumBalanceForRentExemption '[229376]' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"])') Sysvar1111111111111111111111111111111111111 229376" ] \
   || fail "the block record is $RECORD"
@@ -250,6 +251,18 @@ deposit() {
 }
 
 start_peg
+# The peg acts only on the finalized state, and only a BMM checkpoint moves
+# it. So the bid loop runs from the start.
+start_bid_loop() {
+  nohup "$D" bmm --network regtest --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
+    --slot "$SLOT" --program-id "$PROGRAM_ID" \
+    --identity "$ROOT/keys/validator-identity.json" \
+    --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --max-bid-sats 100000000 --interval-secs 1 \
+    >> "$ROOT/bmm.log" 2>&1 &
+  BMM_PID=$!
+  PIDS+=("$BMM_PID")
+}
+start_bid_loop
 
 deposit --pubkey "$USER_PUBKEY" --sats "$DEPOSIT_SATS"
 "$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
@@ -339,7 +352,8 @@ bridge_value() {
 }
 TREASURY_BEFORE="$(bridge_value "treasury lamports")"
 echo "the treasury holds $TREASURY_BEFORE lamports of fees and reserve"
-[ "$TREASURY_BEFORE" -gt 512 ] || fail "the treasury got no fees"
+# The bid loop runs from the start, so the settles can have paid out the fees.
+[ $((TREASURY_BEFORE + $(bridge_value "bmm paid total"))) -gt 512 ] || fail "the treasury got no fees"
 
 # A bid offers a part of the fee income, so the chain must earn fees. Ten
 # transfers pay 100 lamports, which is 10 satoshis.
@@ -382,19 +396,9 @@ for _ in $(seq 1 60); do
   sleep 3
 done
 [ "$SECOND_UP" = yes ] || { tail -20 "$ROOT/validator2.log" >&2; fail "the second validator never answered"; }
-SECOND_SLOT_BEFORE="$("$SOLANA" -u "$SECOND_URL" slot)"
+SECOND_SLOT_BEFORE="$("$SOLANA" -u "$SECOND_URL" slot --commitment processed)"
 echo "the second validator replays at slot $SECOND_SLOT_BEFORE"
 
-start_bid_loop() {
-  nohup "$D" bmm --network regtest --enforcer-url "$ENFORCER_URL" --solana-rpc-url "$SOLANA_URL" \
-    --slot "$SLOT" --program-id "$PROGRAM_ID" \
-    --identity "$ROOT/keys/validator-identity.json" \
-    --confirmations "$BMM_CONFIRMATIONS" --min-bid-sats 1 --max-bid-sats 100000000 --interval-secs 1 \
-    >> "$ROOT/bmm.log" 2>&1 &
-  BMM_PID=$!
-  PIDS+=("$BMM_PID")
-}
-start_bid_loop
 
 # Each block gives the loop a new tip to bid on, and the loop publishes the
 # pair of each bid. A win settles N + 1 blocks later, so the whole round takes
@@ -415,13 +419,21 @@ grep -m1 "the loop settled its own win" "$ROOT/bmm.log" \
   || fail "the loop paid somebody else"
 PAID_TOTAL="$(bridge_value "bmm paid total")"
 NEXT_HEIGHT="$(bridge_value "bmm next height")"
+# Every settle so far lies at or below this slot.
+SETTLED_SLOT="$("$SOLANA" -u "$SOLANA_URL" slot --commitment processed)"
 [ "$NEXT_HEIGHT" -gt "$BMM_START" ] || fail "BMM settled no eCash height"
 echo "PASS: a bid won, a settle paid $PAID_TOTAL lamports, and eCash height $NEXT_HEIGHT is next"
 
 step "the second validator follows the settles"
-SECOND_SLOT_AFTER="$("$SOLANA" -u "$SECOND_URL" slot)" || fail "the second validator stopped"
-[ "$SECOND_SLOT_AFTER" -gt "$SECOND_SLOT_BEFORE" ] || \
-  fail "the second validator stopped at slot $SECOND_SLOT_AFTER"
+# The bid loop runs from the start, so the settles came before this node. It
+# must replay past the slot of the last settle.
+for _ in $(seq 1 90); do
+  SECOND_SLOT_AFTER="$("$SOLANA" -u "$SECOND_URL" slot --commitment processed)" || fail "the second validator stopped"
+  [ "$SECOND_SLOT_AFTER" -ge "$SETTLED_SLOT" ] && break
+  sleep 2
+done
+[ "$SECOND_SLOT_AFTER" -ge "$SETTLED_SLOT" ] || \
+  fail "the second validator stopped at slot $SECOND_SLOT_AFTER, before the settles up to slot $SETTLED_SLOT"
 echo "PASS: the second validator replayed the settles, up to slot $SECOND_SLOT_AFTER"
 
 step "BMM through the JSON-RPC: one round as drivechaind drives it"
@@ -592,6 +604,15 @@ for _ in $(seq 1 10); do
   earn_fees
   "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
 done
+# A node that has not replayed a settle before a reorg drops its eCash block
+# cannot check it later, so the second validator catches up first.
+for _ in $(seq 1 90); do
+  MAIN_SLOT="$("$SOLANA" -u "$SOLANA_URL" slot --commitment processed)"
+  SECOND_SLOT="$("$SOLANA" -u "$SECOND_URL" slot --commitment processed)" || fail "the second validator stopped"
+  [ "$SECOND_SLOT" -ge $((MAIN_SLOT - 20)) ] && break
+  sleep 2
+done
+[ "$SECOND_SLOT" -ge $((MAIN_SLOT - 20)) ] || fail "the second validator stays at slot $SECOND_SLOT, behind slot $MAIN_SLOT"
 DEEP_TIP="$(btc getblockcount)"
 DEEP_FROM=$((DEEP_TIP - 8))
 PAID_BEFORE="$(bridge_value "bmm paid total")"
@@ -616,7 +637,7 @@ for _ in $(seq 1 20); do
 done
 [ "$ALIVE" = yes ] || { tail -30 "$ROOT/bmm.log" >&2; fail "the chain stopped after a deep reorg"; }
 [ "$(bridge_value "bmm paid total")" -ge "$PAID_BEFORE" ] || fail "the treasury paid a winner twice"
-SECOND_SLOT_DEEP="$("$SOLANA" -u "$SECOND_URL" slot)" || fail "the second validator stopped"
+SECOND_SLOT_DEEP="$("$SOLANA" -u "$SECOND_URL" slot --commitment processed)" || fail "the second validator stopped"
 [ "$SECOND_SLOT_DEEP" -gt "$SECOND_SLOT_AFTER" ] || fail "the second validator stopped after the reorg"
 echo "PASS: both validators run after a reorg deeper than N"
 
@@ -734,6 +755,7 @@ step "migration: the new chain credits only new deposits, and pays the open with
 BEFORE_OPEN="$(received "$OPEN_ADDRESS")"
 PEGGED_BEFORE="$(bridge_value "pegged lamports")"
 start_peg
+start_bid_loop
 NEW_SATS=700000
 NEW_PUBKEY="$("$D" seed-pubkey --mnemonic-file "$MNEMONIC_FILE" --account 2 | awk '{print $2}')"
 deposit --pubkey "$NEW_PUBKEY" --sats "$NEW_SATS"

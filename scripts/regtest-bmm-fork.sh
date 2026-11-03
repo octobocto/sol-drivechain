@@ -369,8 +369,7 @@ start_validator() {
     ip netns exec "$ns" env \
       LEDGER="$ledger" KEYS="$keys" RPC_PORT="$SOLANA_RPC_PORT" GOSSIP_PORT=8001 \
       XDP=0 BIND_ADDRESS="$ip" RPC_BIND_ADDRESS="$ip" ALLOW_PRIVATE_ADDR=1 NO_SNAPSHOT_FETCH=1 \
-      NETWORK=regtest ENFORCER_URL="http://$enforcer:$GRPC_PORT" SIDECHAIN_SLOT="$SLOT" \
-      BMM_ROOT_DEPTH="$K" BMM_FALLBACK_BLOCKS="$L" BMM_CONFIRMATIONS="$N" \
+      ENFORCER_URL="http://$enforcer:$GRPC_PORT" \
       FULL_SNAPSHOT_INTERVAL_SLOTS=100 INCREMENTAL_SNAPSHOT_INTERVAL_SLOTS=50 \
       FULL_SNAPSHOTS_TO_RETAIN=100 \
       AGAVE_VALIDATOR="$AGAVE_VALIDATOR" SOLANA_KEYGEN="$SOLANA_KEYGEN" \
@@ -463,6 +462,8 @@ EOF
   --faucet-pubkey "$("$SOLANA_KEYGEN" pubkey "$ROOT/faucet.json")" \
   --faucet-lamports 1000000000000 --hashes-per-tick sleep \
   --primordial-accounts-file "$ROOT/primordial.yaml" \
+  --bmm-sidechain-slot "$SLOT" --bmm-confirmations "$N" \
+  --bmm-root-depth "$K" --bmm-fallback-blocks "$L" \
   --bpf-program "$PROGRAM_ID" "$LOADER" "$PROGRAM_SO" >/dev/null
 cp -R "$ROOT/ledger-m" "$ROOT/ledger-h"
 
@@ -479,7 +480,14 @@ for _ in $(seq 1 120); do
   sleep 2
 done
 [ $((M_SLOT - H_SLOT)) -lt 10 ] || fail "H did not catch up: M at $M_SLOT, H at $H_SLOT"
-sol M validators | grep -E "$M_ID|$H_ID" || fail "the validators are not active"
+# A finalized read fails before the first BMM root, so the check reads at
+# confirmed.
+VOTERS="$(in_ns "$NS_M" curl -s --max-time 5 -X POST -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getVoteAccounts","params":[{"commitment":"confirmed"}]}' \
+  "$(url_of M)")"
+for id in "$M_ID" "$H_ID"; do
+  printf '%s' "$VOTERS" | grep -q "\"nodePubkey\":\"$id\"" || fail "the validators are not active"
+done
 start_credit M
 start_credit H
 mine "$DEPOSIT_D"
@@ -569,7 +577,7 @@ wait_log H "moves the root from [0-9]+ to anchor $B3\$" "$MARK_H"
 pass "the checkpoint for slot $B3 stayed pending on M, and it counted when M replayed the block"
 
 # ---------------------------------------------------------------------------
-step "4. tie: equal counts select the lower bank hash"
+step "4. tie: a tie roots nothing, and the next checkpoint decides it"
 partition
 SPLIT4="$(sol M slot)"
 sleep 20
@@ -580,19 +588,33 @@ read -r _ A4 A4_HASH < <(checkpoint M)
 read -r _ B4 B4_HASH < <(checkpoint H)
 [ "$A4" -gt "$SPLIT4" ] && [ "$B4" -gt "$SPLIT4" ] || fail "a bid names a slot before the split"
 if lower_hash "$A4_HASH" "$B4_HASH"; then
-  WINNER=$A4
+  LEAD=$A4 LEAD_NODE=M
 else
-  WINNER=$B4
+  LEAD=$B4 LEAD_NODE=H
 fi
-echo "slot $A4 ($A4_HASH) on A and slot $B4 ($B4_HASH) on B each have one checkpoint; slot $WINNER has the lower hash"
+echo "slot $A4 ($A4_HASH) on A and slot $B4 ($B4_HASH) on B each have one checkpoint; the nodes build on slot $LEAD, the lower bank hash"
 heal
-wait_log M "head Some\($WINNER\)" "$MARK_M" 240
-wait_log H "head Some\($WINNER\)" "$MARK_H" 240
+wait_log M "head Some\($LEAD\)" "$MARK_M" 240
+wait_log H "head Some\($LEAD\)" "$MARK_H" 240
 mine "$K"
-wait_log M "moves the root from [0-9]+ to anchor $WINNER\$" "$MARK_M"
-wait_log H "moves the root from [0-9]+ to anchor $WINNER\$" "$MARK_H"
+sleep 10
+for node in "M $MARK_M" "H $MARK_H"; do
+  # shellcheck disable=SC2086
+  set -- $node
+  if log_since "$1" "$2" | grep -aE "moves the root from [0-9]+ to anchor ($A4|$B4)\$"; then
+    fail "node $1 rooted a branch of the tie"
+  fi
+done
+echo "the tie rooted nothing"
+MARK_M=$(lines M) MARK_H=$(lines H)
+read -r _ T4 _ < <(checkpoint "$LEAD_NODE")
+echo "a checkpoint for slot $T4 on the branch of slot $LEAD breaks the tie"
+mine "$K"
+wait_log M "moves the root from [0-9]+ to anchor $T4\$" "$MARK_M" 240
+wait_log H "moves the root from [0-9]+ to anchor $T4\$" "$MARK_H" 240
+WINNER=$T4
 ANCHOR4=$WINNER
-pass "both nodes selected slot $WINNER, the lower bank hash, and rooted it"
+pass "the tie rooted nothing, and both nodes rooted slot $WINNER after the next checkpoint"
 
 # ---------------------------------------------------------------------------
 step "5. fallback: stake roots after L blocks, then a restart joins the BMM branch"

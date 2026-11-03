@@ -91,7 +91,10 @@ VOTE_LAMPORTS=$(((128 + 3762) * LAMPORTS_PER_BYTE_YEAR))
 LAMPORTS_PER_SIGNATURE="${LAMPORTS_PER_SIGNATURE:-10}"
 
 network_depths
-require_depths DEPOSIT_CONFIRMATIONS DEPOSIT_LAG
+require_depths DEPOSIT_CONFIRMATIONS DEPOSIT_LAG BMM_CONFIRMATIONS BMM_ROOT_DEPTH \
+  BMM_FALLBACK_BLOCKS
+# The genesis holds the slot, N, K, and L, so every validator uses the same.
+SIDECHAIN_SLOT="${SIDECHAIN_SLOT:-8}"
 
 if [ -z "$LEDGER" ]; then
   echo "error: set LEDGER to the directory of the new ledger." >&2
@@ -212,6 +215,10 @@ mkdir -p "$LEDGER"
   --lamports-per-byte-year "$LAMPORTS_PER_BYTE_YEAR" \
   --target-lamports-per-signature "$LAMPORTS_PER_SIGNATURE" \
   --deactivate-feature "$VAT_FEATURE" \
+  --bmm-sidechain-slot "$SIDECHAIN_SLOT" \
+  --bmm-confirmations "$BMM_CONFIRMATIONS" \
+  --bmm-root-depth "$BMM_ROOT_DEPTH" \
+  --bmm-fallback-blocks "$BMM_FALLBACK_BLOCKS" \
   --primordial-accounts-file "$REPO/genesis/primordial.yaml" \
   --bpf-program "$PROGRAM_ID" "$LOADER" "$PROGRAM_SO" \
   ${DEX_FLAGS[@]+"${DEX_FLAGS[@]}"}
