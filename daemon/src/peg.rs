@@ -351,6 +351,7 @@ pub async fn run(settings: Settings, oracle: Keypair) -> Result<(), PegError> {
             settings.solana_rpc_url.clone(),
             settings.program_id,
             &oracle,
+            settings.sidechain_id,
         ) => result.map_err(PegError::from),
     }
 }
@@ -375,10 +376,33 @@ async fn peg_loop(
     let mut memory = Memory::default();
     loop {
         ticker.tick().await;
-        if let Err(error) = pass(enforcer, rpc, settings, oracle, &mut memory).await {
-            tracing::error!(%error, "the peg pass failed, and the next pass tries again");
+        match pass(enforcer, rpc, settings, oracle, &mut memory).await {
+            Ok(()) => (),
+            Err(PegError::Rpc { source, .. }) if finalized_unavailable(&source) => {
+                tracing::warn!(
+                    "the validator holds no BMM finalized state, so the peg waits for a BMM \
+                     checkpoint"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    cause = ?std::error::Error::source(&error),
+                    "the peg pass failed, and the next pass tries again"
+                )
+            }
         }
     }
+}
+
+/// True for the RPC error of a `finalized` read while the validator holds no
+/// BMM finalized state, as in a long fallback.
+pub fn finalized_unavailable(error: &solana_rpc_client_api::client_error::Error) -> bool {
+    use solana_rpc_client_api::{client_error::ErrorKind, request::RpcError};
+    matches!(
+        error.kind(),
+        ErrorKind::RpcError(RpcError::RpcResponseError { code: -32004, .. })
+    ) || error.to_string().contains("Block not available")
 }
 
 /// Reads the bridge config and the vault balance from one bank.
@@ -700,6 +724,29 @@ mod tests {
 
     fn an_m6id(byte: u8) -> Txid {
         Txid::from_byte_array([byte; 32])
+    }
+
+    #[test]
+    fn a_missing_finalized_state_is_a_wait_and_not_a_failure() {
+        use solana_rpc_client_api::{
+            client_error::{Error, ErrorKind},
+            request::{RpcError, RpcResponseErrorData},
+        };
+        let response = |code, message: &str| {
+            Error::from(ErrorKind::RpcError(RpcError::RpcResponseError {
+                code,
+                message: message.to_owned(),
+                data: RpcResponseErrorData::Empty,
+            }))
+        };
+        assert!(finalized_unavailable(&response(
+            -32004,
+            "Block not available for slot 0"
+        )));
+        assert!(!finalized_unavailable(&response(
+            -32002,
+            "Transaction simulation failed"
+        )));
     }
 
     #[test]
