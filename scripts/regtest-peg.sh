@@ -641,6 +641,21 @@ SECOND_SLOT_DEEP="$("$SOLANA" -u "$SECOND_URL" slot --commitment processed)" || 
 [ "$SECOND_SLOT_DEEP" -gt "$SECOND_SLOT_AFTER" ] || fail "the second validator stopped after the reorg"
 echo "PASS: both validators run after a reorg deeper than N"
 
+step "BMM: the settles reach finality before migration"
+# Halt replay uses saved answers only at or below the root.
+DEEP_SETTLED_SLOT="$("$SOLANA" -u "$SOLANA_URL" slot --commitment processed)"
+FINALIZED_SLOT=0
+for _ in $(seq 1 40); do
+  kill -0 "$BMM_PID" 2>/dev/null || { tail -30 "$ROOT/bmm.log" >&2; fail "the BMM loop stopped before finality"; }
+  sleep 3
+  earn_fees
+  "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
+  FINALIZED_SLOT="$("$SOLANA" -u "$SOLANA_URL" slot --commitment finalized)"
+  [ "$FINALIZED_SLOT" -ge "$DEEP_SETTLED_SLOT" ] && break
+done
+[ "$FINALIZED_SLOT" -ge "$DEEP_SETTLED_SLOT" ] || fail "slot $DEEP_SETTLED_SLOT did not reach finality"
+echo "PASS: slot $DEEP_SETTLED_SLOT reached finality at slot $FINALIZED_SLOT"
+
 step "the books close at the end, and the supply never changed"
 books_close
 SUPPLY_END="$(supply)"
