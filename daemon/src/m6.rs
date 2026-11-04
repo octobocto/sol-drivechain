@@ -22,6 +22,14 @@ pub enum M6Error {
     TooHeavy(usize),
     #[error("the first record {0} of the bundle does not fit the lock time")]
     FirstRecordTooLarge(u64),
+    #[error("payout {0} has the form of a treasury output")]
+    TreasuryForm(usize),
+}
+
+/// True for the OP_DRIVECHAIN form of a treasury output, under either opcode
+/// of the enforcer. An M6 with one more such output can never pay.
+pub fn is_treasury_form(script: &[u8]) -> bool {
+    matches!(script, [0xb4 | 0xb7, 0x01, _, 0x51])
 }
 
 /// The heaviest blinded M6 that the daemon proposes, in weight units. The
@@ -38,6 +46,14 @@ pub fn build_blinded_m6(fee_sats: u64, payouts: &[Payout]) -> Result<Transaction
         return Err(M6Error::NoPayouts);
     }
 
+    // The bridge program guards each new script. An old record can hold any
+    // script that an earlier bridge took, so only this form stops a bundle.
+    if let Some(at) = payouts
+        .iter()
+        .position(|payout| is_treasury_form(payout.script_pubkey.as_bytes()))
+    {
+        return Err(M6Error::TreasuryForm(at));
+    }
     let mut total: u64 = 0;
     for payout in payouts {
         total = total
@@ -130,6 +146,39 @@ mod tests {
     }
 
     #[test]
+    fn only_a_treasury_form_payout_fails() {
+        for script in [vec![0xb4, 0x01, 8, 0x51], vec![0xb7, 0x01, 8, 0x51]] {
+            let payouts = [
+                a_payout(50_000),
+                Payout {
+                    script_pubkey: ScriptBuf::from_bytes(script.clone()),
+                    sats: 50_000,
+                },
+            ];
+            assert!(
+                matches!(
+                    build_blinded_m6(1_000, &payouts),
+                    Err(M6Error::TreasuryForm(1))
+                ),
+                "{script:02x?}"
+            );
+        }
+        // An old record can hold a script that an earlier bridge took, for
+        // example pay to anchor, and its bundle must still build.
+        for script in [
+            vec![0x51, 0x02, 0x4e, 0x73],
+            vec![0x6a, 0x01, 1],
+            vec![0xb4, 0x01, 8, 0x51, 0x51],
+        ] {
+            let payouts = [Payout {
+                script_pubkey: ScriptBuf::from_bytes(script.clone()),
+                sats: 50_000,
+            }];
+            assert!(build_blinded_m6(1_000, &payouts).is_ok(), "{script:02x?}");
+        }
+    }
+
+    #[test]
     fn the_bundle_holds_no_inputs() {
         let tx = build_blinded_m6(1_000, &[a_payout(50_000)]).unwrap();
         assert!(tx.input.is_empty());
@@ -208,7 +257,7 @@ mod tests {
     #[test]
     fn a_bundle_of_the_record_cap_with_the_longest_scripts_fits_the_weight() {
         let longest = Payout {
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 34]),
+            script_pubkey: ScriptBuf::from_bytes([&[0x51, 0x20][..], &[7u8; 32]].concat()),
             sats: 1_000,
         };
         let cap = usize::try_from(crate::bridge::MAX_BUNDLE_RECORDS).unwrap();

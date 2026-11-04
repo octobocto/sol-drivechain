@@ -11,8 +11,8 @@ use anchor_lang::{
 };
 use litesvm::LiteSVM;
 use sol_drivechain_bridge::{
-    accounts, commitment_of, instruction, AnsweredDeposit, BmmAnswer, Config, DepositAnswer,
-    WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, DEPOSIT_ANSWER_ENTRY_LEN,
+    accounts, commitment_of, instruction, min_fee_sats, AnsweredDeposit, BmmAnswer, Config,
+    DepositAnswer, WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, DEPOSIT_ANSWER_ENTRY_LEN,
     DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID, LAMPORTS_PER_SAT, MAX_BUNDLE_RECORDS,
     MAX_SCRIPT_PUBKEY_LEN, MIN_FEE_SATS,
 };
@@ -1230,9 +1230,10 @@ fn check_treasury_script(opcode: u8) {
     chain
         .deposit(0, A_DEPOSIT_SATS)
         .expect("the deposit passes");
-    let lamports = (MIN_FEE_SATS + 600) * LAMPORTS_PER_SAT;
     for slot in 0..=u8::MAX {
         let index = u64::from(slot);
+        let fee_sats = min_fee_sats(index);
+        let lamports = (fee_sats + 600) * LAMPORTS_PER_SAT;
         let config = chain.svm.get_account(&chain.config).unwrap();
         let vault = chain.svm.get_account(&chain.vault).unwrap();
         let user_balance = chain.balance(&chain.user.pubkey());
@@ -1240,7 +1241,7 @@ fn check_treasury_script(opcode: u8) {
 
         assert!(
             chain
-                .withdraw(index, lamports, MIN_FEE_SATS, &[opcode, 0x01, slot, 0x51])
+                .withdraw(index, lamports, fee_sats, &[opcode, 0x01, slot, 0x51])
                 .is_err(),
             "the bridge accepts treasury opcode {opcode:#x} for slot {slot}"
         );
@@ -1251,7 +1252,7 @@ fn check_treasury_script(opcode: u8) {
         assert!(chain.svm.get_account(&chain.record_key(index)).is_none());
 
         chain
-            .withdraw(index, lamports, MIN_FEE_SATS, &A_P2WPKH)
+            .withdraw(index, lamports, fee_sats, &A_P2WPKH)
             .expect("the valid withdrawal passes after the rejection");
         assert_eq!(chain.config().withdrawal_count, index + 1);
         assert_eq!(chain.record(index).unwrap().script_pubkey, A_P2WPKH);
@@ -1270,27 +1271,82 @@ fn a_nop8_treasury_script_fails_for_each_slot() {
     check_treasury_script(0xb7);
 }
 
+fn a_hash(len: usize) -> Vec<u8> {
+    (1..=len as u8).collect()
+}
+
+/// The five standard templates, byte for byte.
+fn standard_scripts() -> Vec<Vec<u8>> {
+    vec![
+        [&[0x76, 0xa9, 0x14][..], &a_hash(20), &[0x88, 0xac]].concat(),
+        [&[0xa9, 0x14][..], &a_hash(20), &[0x87]].concat(),
+        [&[0x00, 0x14][..], &a_hash(20)].concat(),
+        [&[0x00, 0x20][..], &a_hash(32)].concat(),
+        [&[0x51, 0x20][..], &a_hash(32)].concat(),
+    ]
+}
+
 #[test]
-fn a_script_outside_the_treasury_form_passes() {
+fn each_standard_template_passes() {
+    let mut chain = Chain::start();
+    chain
+        .deposit(0, A_DEPOSIT_SATS)
+        .expect("the deposit passes");
+    for script in standard_scripts() {
+        assert!(sol_drivechain_bridge::is_standard_script(&script));
+        let index = chain.config().withdrawal_count;
+        let fee_sats = min_fee_sats(index);
+        let lamports = (fee_sats + 600) * LAMPORTS_PER_SAT;
+        chain
+            .withdraw(index, lamports, fee_sats, &script)
+            .expect("the standard withdrawal passes");
+        assert_eq!(chain.record(index).unwrap().script_pubkey, script);
+    }
+}
+
+#[test]
+fn every_other_script_fails() {
     let mut chain = Chain::start();
     chain
         .deposit(0, A_DEPOSIT_SATS)
         .expect("the deposit passes");
     let lamports = (MIN_FEE_SATS + 600) * LAMPORTS_PER_SAT;
-    for opcode in [0xb4, 0xb7] {
-        for script in [
-            vec![opcode, 0x01, 9, 0x51, 0x51],
-            vec![0x51, opcode, 0x01, 9, 0x51],
-            vec![opcode, 0x01, 9, 0x52],
-            vec![opcode, 0x4c, 0x01, 9, 0x51],
-        ] {
-            let index = chain.config().withdrawal_count;
+    let mut bad: Vec<Vec<u8>> = Vec::new();
+    for opcode in [0xb4u8, 0xb7] {
+        bad.push(vec![opcode, 0x01, 9, 0x51]);
+        bad.push(vec![opcode, 0x01, 9, 0x51, 0x51]);
+        bad.push(vec![0x51, opcode, 0x01, 9, 0x51]);
+        bad.push(vec![opcode, 0x4c, 0x01, 9, 0x51]);
+        bad.push([&[0x00, 0x13][..], &a_hash(19)].concat());
+    }
+    for script in standard_scripts() {
+        // One byte short, one byte long, and one wrong push length.
+        bad.push(script[..script.len() - 1].to_vec());
+        bad.push([&script[..], &[0x00]].concat());
+        let mut wrong = script.clone();
+        let push = if script[0] == 0x76 { 2 } else { 1 };
+        wrong[push] ^= 0x01;
+        bad.push(wrong);
+    }
+    bad.push([&[0x52, 0x20][..], &a_hash(32)].concat());
+    bad.push([&[0x21][..], &a_hash(33), &[0xac]].concat());
+    bad.push(vec![0x6a, 0x04, 1, 2, 3, 4]);
+    bad.push(vec![0x51]);
+    bad.push(Vec::new());
+    for script in bad {
+        assert!(
+            !sol_drivechain_bridge::is_standard_script(&script),
+            "{script:02x?} reads as standard"
+        );
+        let index = chain.config().withdrawal_count;
+        assert!(
             chain
                 .withdraw(index, lamports, MIN_FEE_SATS, &script)
-                .expect("the non-treasury withdrawal passes");
-            assert_eq!(chain.record(index).unwrap().script_pubkey, script);
-        }
+                .is_err(),
+            "the bridge takes {script:02x?}"
+        );
     }
+    assert_eq!(chain.config().withdrawal_count, 0);
 }
 
 #[test]
@@ -1316,7 +1372,7 @@ fn two_withdrawals_take_two_record_addresses() {
         .withdraw(0, 5_000_000, 1_000, &A_P2WPKH)
         .expect("the first withdrawal lands");
     chain
-        .withdraw(1, 2_000_000, 1_000, &A_P2WPKH)
+        .withdraw(1, 2_000_000, 1_010, &A_P2WPKH)
         .expect("the second withdrawal lands");
     assert_eq!(chain.config().withdrawal_count, 2);
     assert!(chain.record(0).is_some());
@@ -1393,11 +1449,11 @@ fn a_seal_without_an_open_record_fails() {
 fn a_bundle_holds_at_most_the_record_cap() {
     let mut chain = Chain::start();
     chain.deposit(0, 100_000_000).expect("the deposit lands");
-    let each = (MIN_FEE_SATS + 600) * LAMPORTS_PER_SAT;
     for index in 0..=MAX_BUNDLE_RECORDS {
-        chain.svm.expire_blockhash();
+        let fee_sats = min_fee_sats(index);
+        let each = (fee_sats + 600) * LAMPORTS_PER_SAT;
         chain
-            .withdraw(index, each, MIN_FEE_SATS, &A_P2WPKH)
+            .withdraw(index, each, fee_sats, &A_P2WPKH)
             .expect("the withdrawal lands");
     }
     chain.seal().expect("the bundle seals");
@@ -1845,4 +1901,77 @@ fn the_vault_as_the_payee_gets_nothing_and_the_height_settles() {
     assert_eq!(chain.balance(&vault), VAULT_LAMPORTS);
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 2_000_000);
     assert_eq!(chain.config().bmm_next_height, BMM_START + 1);
+}
+
+/// The compute limit of one credit in the daemon.
+const CREDIT_COMPUTE_UNITS: u32 = 1_400_000;
+
+#[test]
+fn a_full_part_of_new_targets_fits_the_credit_compute_limit() {
+    let mut chain = Chain::start();
+    let height = DEPOSIT_START + 1;
+    let deposits: Vec<AnsweredDeposit> = (0..16)
+        .map(|index| to(Keypair::new().pubkey(), index, 1_000_000))
+        .collect();
+    chain.deposit_answer(height, ecash_block(height - 1), &deposits, 0, 16);
+    let mut limit = CREDIT_COMPUTE_UNITS.to_le_bytes().to_vec();
+    limit.insert(0, 2);
+    let budget = Instruction {
+        program_id: Pubkey::from_str_const("ComputeBudget111111111111111111111111111111"),
+        accounts: Vec::new(),
+        data: limit,
+    };
+    let credit = chain.credit_ix(height, &deposits, 0, 16);
+    let sender = chain.a_stranger();
+    chain.svm.expire_blockhash();
+    let transaction = Transaction::new_signed_with_payer(
+        &[budget, credit],
+        Some(&sender.pubkey()),
+        &[&sender],
+        chain.svm.latest_blockhash(),
+    );
+    let units = chain
+        .svm
+        .send_transaction(transaction)
+        .expect("the full part lands")
+        .compute_units_consumed;
+    println!("a part of 16 new targets takes {units} compute units");
+    assert!(units < u64::from(CREDIT_COMPUTE_UNITS) / 4);
+    assert_eq!(chain.config().credited_height, height);
+    assert_eq!(
+        chain.config().pegged_lamports,
+        16 * 1_000_000 * LAMPORTS_PER_SAT
+    );
+}
+
+#[test]
+fn the_fee_rises_with_the_records_that_wait_for_a_seal() {
+    assert_eq!(min_fee_sats(0), 1_000);
+    assert_eq!(min_fee_sats(1), 1_010);
+    assert_eq!(min_fee_sats(100), 2_000);
+    assert_eq!(min_fee_sats(1_499), 15_990);
+    assert_eq!(min_fee_sats(u64::MAX), 1_000 + u64::MAX / 100);
+    let mut chain = Chain::start();
+    chain.deposit(0, 10_000_000).expect("the deposit lands");
+    for index in 0..100 {
+        let fee_sats = min_fee_sats(index);
+        chain
+            .withdraw(
+                index,
+                (fee_sats + 600) * LAMPORTS_PER_SAT,
+                fee_sats,
+                &A_P2WPKH,
+            )
+            .expect("a withdrawal at the quoted fee lands");
+    }
+    let lamports = (2_000 + 600) * LAMPORTS_PER_SAT;
+    assert!(chain.withdraw(100, lamports, 1_999, &A_P2WPKH).is_err());
+    chain
+        .withdraw(100, lamports, 2_000, &A_P2WPKH)
+        .expect("the fee of 100 waiting records lands");
+    chain.seal().expect("the bundle seals");
+    let lamports = (MIN_FEE_SATS + 600) * LAMPORTS_PER_SAT;
+    chain
+        .withdraw(101, lamports, MIN_FEE_SATS, &A_P2WPKH)
+        .expect("a seal takes the price back down");
 }
