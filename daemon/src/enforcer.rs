@@ -49,6 +49,8 @@ pub enum EnforcerError {
     NoBlockAtHeight(u32),
     #[error("the enforcer does not know block {0}")]
     BlockNotFound(BlockHash),
+    #[error("the wallet scan of the enforcer took longer than the limit")]
+    ScanTimeout,
     #[error("the enforcer sent a commitment of {0} bytes, not 32")]
     BadCommitmentLength(usize),
 }
@@ -254,6 +256,33 @@ pub struct Enforcer {
     mining: MiningServiceClient<Channel>,
     wallet: WalletServiceClient<Channel>,
     sidechain_id: u32,
+    scans: std::sync::Arc<ScanGate>,
+}
+
+/// The longest wait for one wallet scan. The enforcer can go on with it after
+/// that, and the bid of that round fails.
+pub const FULL_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Lets one wallet scan run at a time, and at most one for each eCash tip.
+#[derive(Default)]
+pub struct ScanGate {
+    last_tip: tokio::sync::Mutex<Option<BlockHash>>,
+}
+
+impl ScanGate {
+    /// The right to scan for `tip`, or `None` while a scan runs or after a
+    /// scan for the same tip.
+    pub fn try_begin(
+        &self,
+        tip: BlockHash,
+    ) -> Option<tokio::sync::MutexGuard<'_, Option<BlockHash>>> {
+        let mut last = self.last_tip.try_lock().ok()?;
+        if *last == Some(tip) {
+            return None;
+        }
+        *last = Some(tip);
+        Some(last)
+    }
 }
 
 impl Enforcer {
@@ -267,6 +296,7 @@ impl Enforcer {
             mining: MiningServiceClient::new(channel.clone()),
             wallet: WalletServiceClient::new(channel),
             sidechain_id,
+            scans: std::sync::Arc::default(),
         })
     }
 
@@ -748,8 +778,15 @@ impl Enforcer {
     ) -> Result<Txid> {
         match self.send_bmm_request(bid_sats, tip, h_star).await {
             Err(error) if spends_a_gone_coin(&error) => {
+                let scans = std::sync::Arc::clone(&self.scans);
+                let Some(_scan) = scans.try_begin(tip.0) else {
+                    return Err(error);
+                };
                 tracing::warn!(%error, "the enforcer wallet holds a spent coin, so it scans again");
-                self.full_scan().await?;
+                match tokio::time::timeout(FULL_SCAN_TIMEOUT, self.full_scan()).await {
+                    Ok(scanned) => scanned?,
+                    Err(_) => return Err(EnforcerError::ScanTimeout),
+                }
                 self.send_bmm_request(bid_sats, tip, h_star).await
             }
             result => result,
@@ -1004,6 +1041,25 @@ pub fn spends_a_gone_coin(error: &EnforcerError) -> bool {
         EnforcerError::Call { source, .. }
             if source.message().contains("bad-txns-inputs-missingorspent")
     )
+}
+
+/// True when the node or the wallet refused the bid tx for sure, so no tx
+/// went out and a new bid cannot pay twice.
+pub fn bid_rejected(error: &EnforcerError) -> bool {
+    match error {
+        EnforcerError::Call { source, .. } => {
+            let text = source.message();
+            [
+                "bad-txns",
+                "ServerError(-25)",
+                "ServerError(-26)",
+                "txn-mempool-conflict",
+            ]
+            .iter()
+            .any(|mark| text.contains(mark))
+        }
+        _ => false,
+    }
 }
 
 /// Reads the Bitcoin network out of the enforcer answer.
@@ -1298,6 +1354,44 @@ mod tests {
         };
         assert!(!spends_a_gone_coin(&other));
         assert!(!spends_a_gone_coin(&EnforcerError::MissingField("txid")));
+    }
+
+    #[test]
+    fn only_a_clear_refusal_counts_as_a_rejected_bid() {
+        let refused = |text: &str| EnforcerError::Call {
+            call: "CreateBmmCriticalDataTransaction",
+            source: tonic::Status::unknown(text),
+        };
+        assert!(bid_rejected(&refused(
+            "ErrorObject { code: ServerError(-25), message: \"bad-txns-inputs-missingorspent\" }"
+        )));
+        assert!(bid_rejected(&refused(
+            "ServerError(-26) min relay fee not met"
+        )));
+        assert!(!bid_rejected(&refused("connection reset")));
+        assert!(!bid_rejected(&EnforcerError::Call {
+            call: "CreateBmmCriticalDataTransaction",
+            source: tonic::Status::deadline_exceeded("timeout"),
+        }));
+        assert!(!bid_rejected(&EnforcerError::ScanTimeout));
+    }
+
+    #[tokio::test]
+    async fn one_scan_runs_at_a_time_and_once_for_each_tip() {
+        let gate = ScanGate::default();
+        let tip = BlockHash::from_byte_array([1u8; 32]);
+        let first = gate.try_begin(tip);
+        assert!(first.is_some());
+        assert!(
+            gate.try_begin(BlockHash::from_byte_array([2u8; 32]))
+                .is_none(),
+            "a scan runs"
+        );
+        drop(first);
+        assert!(gate.try_begin(tip).is_none(), "the tip was scanned");
+        assert!(gate
+            .try_begin(BlockHash::from_byte_array([2u8; 32]))
+            .is_some());
     }
 
     #[test]
