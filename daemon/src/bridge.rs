@@ -13,6 +13,15 @@ pub const LAMPORTS_PER_SAT: u64 = 10;
 /// The most records in one bundle. It must match the bridge program.
 pub const MAX_BUNDLE_RECORDS: u64 = 1_500;
 
+/// The lowest mainchain fee of one withdrawal. It must match the bridge program.
+pub const MIN_FEE_SATS: u64 = 1_000;
+
+/// The lowest fee while `waiting` records wait for a seal. It must match
+/// `min_fee_sats` of the bridge program.
+pub fn min_fee_sats(waiting: u64) -> u64 {
+    MIN_FEE_SATS.saturating_add(MIN_FEE_SATS.saturating_mul(waiting) / 100)
+}
+
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";
@@ -177,6 +186,11 @@ pub struct Config {
 
 impl Config {
     pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 7;
+
+    /// The lowest fee that `withdraw` takes now.
+    pub fn min_fee_sats(&self) -> u64 {
+        min_fee_sats(self.withdrawal_count.saturating_sub(self.bundled_through))
+    }
 
     /// The record indices of the live bundle, if one is live.
     pub fn live_bundle(&self) -> Option<std::ops::Range<u64>> {
@@ -870,6 +884,22 @@ mod tests {
         assert_eq!(at(219), 990);
         assert_eq!(at(227), 77);
         assert_eq!(at(235), 1_000);
+    }
+
+    #[test]
+    fn the_fee_quote_rises_with_the_records_that_wait() {
+        assert_eq!(min_fee_sats(0), 1_000);
+        assert_eq!(min_fee_sats(1), 1_010);
+        assert_eq!(min_fee_sats(100), 2_000);
+        assert_eq!(min_fee_sats(1_499), 15_990);
+        let mut config = a_config();
+        config.withdrawal_count = 109;
+        config.bundled_through = 9;
+        assert_eq!(config.min_fee_sats(), 2_000);
+        config.bundled_through = 109;
+        assert_eq!(config.min_fee_sats(), 1_000);
+        config.bundled_through = 200;
+        assert_eq!(config.min_fee_sats(), 1_000);
     }
 
     #[test]

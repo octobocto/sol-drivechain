@@ -161,9 +161,10 @@ enum Command {
         user: PathBuf,
         #[arg(long)]
         sats: u64,
-        /// The mainchain fee. It comes out of the amount.
-        #[arg(long, default_value_t = 10_000)]
-        fee_sats: u64,
+        /// The mainchain fee. It comes out of the amount. It defaults to the
+        /// lowest fee that the bridge takes for the records that wait.
+        #[arg(long)]
+        fee_sats: Option<u64>,
         /// The Bitcoin address that takes the payout.
         #[arg(long)]
         address: String,
@@ -532,6 +533,8 @@ enum CliError {
     Books(#[from] books::BooksError),
     #[error("the books do not close")]
     BooksOpen,
+    #[error("a fee of {fee_sats} sats is below the {quote} sats that the bridge takes now")]
+    FeeBelowQuote { fee_sats: u64, quote: u64 },
     #[error("the vault holds less than the supply less the pegged lamports, so no gift is safe")]
     VaultShort,
     #[error("the state file `{path}` is not valid")]
@@ -775,6 +778,11 @@ fn main() -> Result<(), CliError> {
                     source,
                 })?;
             let config = bridge::Config::decode(&data)?;
+            let quote = config.min_fee_sats();
+            let fee_sats = fee_sats.unwrap_or(quote);
+            if fee_sats < quote {
+                return Err(CliError::FeeBelowQuote { fee_sats, quote });
+            }
             let lamports = sats
                 .checked_mul(bridge::LAMPORTS_PER_SAT)
                 .ok_or(CliError::VaultTooLarge(sats))?;
@@ -870,6 +878,7 @@ fn main() -> Result<(), CliError> {
             println!("bundle sealed at  {}", config.bundle_sealed_height);
             println!("bundle sealed slot {}", config.bundle_sealed_slot);
             println!("bundle min slots  {}", config.bundle_min_slots);
+            println!("withdrawal fee    {} sats", config.min_fee_sats());
             if !books {
                 return Ok(());
             }

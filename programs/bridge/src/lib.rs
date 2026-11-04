@@ -16,6 +16,13 @@ pub const MIN_PAYOUT_SATS: u64 = 546;
 /// its output at more than 20 sat/vB, so a flood of records costs real money.
 pub const MIN_FEE_SATS: u64 = 1_000;
 
+/// The lowest mainchain fee while `waiting` records wait for a seal:
+/// `MIN_FEE_SATS × (1 + waiting / 100)`. A flood of records then costs more
+/// with each record.
+pub fn min_fee_sats(waiting: u64) -> u64 {
+    MIN_FEE_SATS.saturating_add(MIN_FEE_SATS.saturating_mul(waiting) / 100)
+}
+
 /// The most records in one bundle. Each payout output is at most 43 bytes,
 /// so a bundle stays near 260,000 weight units, below the standard 400,000.
 pub const MAX_BUNDLE_RECORDS: u64 = 1_500;
@@ -48,8 +55,6 @@ pub const DEPOSIT_ANSWER_HEAD_LEN: usize = 8 + 32 + 32 + 4 + 4 + 1;
 /// One `DepositAnswer` entry: sequence number, value in sats, a flag, and the
 /// target pubkey.
 pub const DEPOSIT_ANSWER_ENTRY_LEN: usize = 8 + 8 + 1 + 32;
-
-const OP_RETURN: u8 = 0x6a;
 
 /// The owner of every sysvar. The runtime sends a sysvar read-only.
 const SYSVAR_OWNER: Pubkey = pubkey!("Sysvar1111111111111111111111111111111111111");
@@ -336,18 +341,9 @@ pub mod bridge {
             lamports.is_multiple_of(LAMPORTS_PER_SAT),
             BridgeError::AmountNotAWholeSat
         );
-        require!(!script_pubkey.is_empty(), BridgeError::ScriptPubkeyEmpty);
         require!(
-            script_pubkey.len() <= MAX_SCRIPT_PUBKEY_LEN,
-            BridgeError::ScriptPubkeyTooLong
-        );
-        require!(
-            script_pubkey[0] != OP_RETURN,
-            BridgeError::ScriptPubkeyUnspendable
-        );
-        require!(
-            !matches!(script_pubkey.as_slice(), [0xb4 | 0xb7, 0x01, _, 0x51]),
-            BridgeError::ScriptPubkeyTreasury
+            is_standard_script(&script_pubkey),
+            BridgeError::ScriptPubkeyNotStandard
         );
 
         let total_sats = lamports / LAMPORTS_PER_SAT;
@@ -355,9 +351,11 @@ pub mod bridge {
             .checked_sub(fee_sats)
             .ok_or(BridgeError::FeeAboveAmount)?;
         require!(payout_sats >= MIN_PAYOUT_SATS, BridgeError::PayoutIsDust);
-        require_gte!(fee_sats, MIN_FEE_SATS, BridgeError::FeeTooLow);
-
         let config = &mut ctx.accounts.config;
+        let waiting = config
+            .withdrawal_count
+            .saturating_sub(config.bundled_through);
+        require_gte!(fee_sats, min_fee_sats(waiting), BridgeError::FeeTooLow);
         // The genesis float circulates beside the pegged lamports, so no
         // lamport pegs out until gifts to the vault back the whole float.
         let backed = ctx
@@ -474,6 +472,18 @@ pub mod bridge {
 fn vault_pda(bump: u8) -> Result<Pubkey> {
     Pubkey::create_program_address(&[VAULT_SEED, &[bump]], &crate::ID)
         .map_err(|_| error!(BridgeError::BadBump))
+}
+
+/// True for the byte-exact P2PKH, P2SH, P2WPKH, P2WSH, and P2TR templates.
+/// No other output can go in an M6: the enforcer reads an OP_DRIVECHAIN or
+/// odd output as a treasury or a deposit, and then refuses the M6.
+pub fn is_standard_script(script: &[u8]) -> bool {
+    matches!(
+        script,
+        [0x76, 0xa9, 0x14, hash @ .., 0x88, 0xac] if hash.len() == 20
+    ) || matches!(script, [0xa9, 0x14, hash @ .., 0x87] if hash.len() == 20)
+        || matches!(script, [0x00, 0x14, hash @ ..] if hash.len() == 20)
+        || matches!(script, [0x00 | 0x51, 0x20, key @ ..] if key.len() == 32)
 }
 
 /// h* of a BMM bid: SHA-256(Solana block ‖ payee).
@@ -790,12 +800,8 @@ pub enum BridgeError {
     FeeAboveAmount,
     #[msg("The payout is dust.")]
     PayoutIsDust,
-    #[msg("The script pubkey is empty.")]
-    ScriptPubkeyEmpty,
-    #[msg("The script pubkey is longer than 34 bytes.")]
-    ScriptPubkeyTooLong,
-    #[msg("The script pubkey starts with OP_RETURN, so no wallet can spend it.")]
-    ScriptPubkeyUnspendable,
+    #[msg("The script pubkey is not P2PKH, P2SH, P2WPKH, P2WSH, or P2TR.")]
+    ScriptPubkeyNotStandard,
     #[msg("The amount is above the total that the mainchain treasury holds.")]
     AmountAbovePeggedTotal,
     #[msg("The amount overflows a u64.")]
@@ -834,7 +840,7 @@ pub enum BridgeError {
     CreditsDropped,
     #[msg("The tx sends a BMM payee read-only.")]
     PayeeNotWritable,
-    #[msg("The mainchain fee is below the minimum.")]
+    #[msg("The mainchain fee is below the minimum for the records that wait.")]
     FeeTooLow,
     #[msg("Gifts to the vault do not yet back the genesis float.")]
     FloatNotBacked,
@@ -852,6 +858,4 @@ pub enum BridgeError {
     RecordNotPaid,
     #[msg("The config holds a bump that gives no address.")]
     BadBump,
-    #[msg("The script pubkey names a mainchain treasury.")]
-    ScriptPubkeyTreasury,
 }
