@@ -1056,6 +1056,8 @@ fn a_target_that_the_runtime_makes_read_only_strands_and_the_next_height_credits
         Pubkey::from_str_const("NativeLoader1111111111111111111111111111111"),
         Pubkey::from_str_const("ZkTokenProof1111111111111111111111111111111"),
         Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111"),
+        sol_drivechain_bridge::BMM_PAID_ID,
+        sol_drivechain_bridge::BMM_PARAMS_ID,
     ];
     let mut deposits: Vec<AnsweredDeposit> = reserved
         .iter()
@@ -1088,6 +1090,45 @@ fn the_bridge_knows_every_reserved_account_key_of_agave() {
             sol_drivechain_bridge::RESERVED_KEYS.contains(key),
             "the bridge does not know the reserved key {key}"
         );
+    }
+}
+
+/// The keys that the patch adds to the reserved account keys, read from the
+/// patch: each `ReservedAccount::new_active(sol_drivechain_bmm::NAME)`, and
+/// the base58 address of `NAME` in the patch.
+fn patch_reserved_keys() -> std::collections::BTreeSet<Pubkey> {
+    let patch = include_str!("../../../patches/agave-sol-drivechain.patch");
+    let address_of = |name: &str| {
+        let head = format!("+pub const {name}: Pubkey =");
+        let at = patch
+            .find(&head)
+            .unwrap_or_else(|| panic!("the patch has no {name}"));
+        let rest = &patch[at..];
+        let start = rest.find("from_str_const(\"").unwrap() + "from_str_const(\"".len();
+        let end = start + rest[start..].find('"').unwrap();
+        Pubkey::from_str_const(&rest[start..end])
+    };
+    patch
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix('+')?
+                .trim()
+                .strip_prefix("ReservedAccount::new_active(sol_drivechain_bmm::")?
+                .strip_suffix("),")
+        })
+        .map(address_of)
+        .collect()
+}
+
+#[test]
+fn the_bridge_and_the_patch_reserve_the_same_chain_keys() {
+    let bridge: std::collections::BTreeSet<Pubkey> = sol_drivechain_bridge::CHAIN_RESERVED_KEYS
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(bridge, patch_reserved_keys());
+    for key in sol_drivechain_bridge::CHAIN_RESERVED_KEYS {
+        assert!(sol_drivechain_bridge::RESERVED_KEYS.contains(key));
     }
 }
 

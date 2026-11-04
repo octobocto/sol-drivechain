@@ -43,6 +43,13 @@ pub const BMM_ANSWER_LEN: usize = 8 + 32 + 1 + 32 + 32 + 1 + 8 + 1;
 /// The block record that the patched validator writes.
 pub const BMM_BLOCKS_ID: Pubkey = pubkey!("BmmB1ocks1111111111111111111111111111111111");
 
+/// The BMM values of the cluster, which only the genesis writes.
+pub const BMM_PARAMS_ID: Pubkey = pubkey!("BmmParams1111111111111111111111111111111111");
+
+/// The account that the patched validator builds for each tx with a
+/// top-level `bundle_paid`.
+pub const BMM_PAID_ID: Pubkey = pubkey!("BmmPaid111111111111111111111111111111111111");
+
 /// The account that the patched validator builds for each tx with a
 /// top-level `credit_deposits`. It holds the deposits of one eCash block from
 /// the local enforcer.
@@ -97,6 +104,17 @@ pub const RESERVED_KEYS: &[Pubkey] = &[
     SYSVAR_OWNER,
     BMM_ANSWER_ID,
     BMM_BLOCKS_ID,
+    BMM_PAID_ID,
+    BMM_PARAMS_ID,
+    DEPOSIT_ANSWER_ID,
+];
+
+/// The keys that the patch adds to the reserved account keys of Agave.
+pub const CHAIN_RESERVED_KEYS: &[Pubkey] = &[
+    BMM_ANSWER_ID,
+    BMM_BLOCKS_ID,
+    BMM_PAID_ID,
+    BMM_PARAMS_ID,
     DEPOSIT_ANSWER_ID,
 ];
 
