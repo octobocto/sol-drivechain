@@ -387,6 +387,10 @@ causes no restart while the checkpoint that beat it stays on the active eCash
 chain. `run-validator.sh` keeps ten full snapshots, 25000 slots
 apart, about 28 hours.
 
+A later checkpoint for the bank of an anchor out of the block record does not
+count, and it does not stop the fallback. The node cannot check the credits of
+that bank.
+
 An eCash reorg deeper than D can remove a credited deposit. Every checkpoint on
 a block after that credit then fails rule 3. Honest bidders commit to a branch
 without the credit, and rule 6 moves all nodes to it. No leader builds on a
