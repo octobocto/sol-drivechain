@@ -256,10 +256,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..e7237b7
+index 0000000..a66070a
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,611 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -709,23 +709,13 @@ index 0000000..e7237b7
 +
 +    /// A restart request when a branch that splits behind the root holds more
 +    /// checkpoints. It writes the request to disk. The request waits while no
-+    /// snapshot archive at or below the anchor exists. A vouched checkpoint
-+    /// counts only when `delivered` gives true for a slot that its peers name.
-+    pub(crate) fn take_restart(
-+        &mut self,
-+        root: Slot,
-+        delivered: impl Fn(Slot) -> bool,
-+    ) -> io::Result<Option<Restart>> {
++    /// snapshot archive at or below the anchor exists.
++    pub(crate) fn take_restart(&mut self, root: Slot) -> io::Result<Option<Restart>> {
 +        let candidates: Vec<Checkpoint> = self
 +            .checkpoints
 +            .iter()
++            .chain(self.vouched.iter())
 +            .copied()
-+            .chain(self.vouched.iter().copied().filter(|checkpoint| {
-+                peers()
-+                    .attested_slots(&checkpoint.bank_hash)
-+                    .into_iter()
-+                    .any(&delivered)
-+            }))
 +            .collect();
 +        let restart = fork_choice::restart(
 +            root,
@@ -979,7 +969,7 @@ index 5180157..7eafc97 100644
  pub mod cluster_slots_service;
  pub mod commitment_service;
 diff --git a/core/src/replay_stage.rs b/core/src/replay_stage.rs
-index c5a5f4d..3ef6c07 100644
+index c5a5f4d..65a3936 100644
 --- a/core/src/replay_stage.rs
 +++ b/core/src/replay_stage.rs
 @@ -4,6 +4,7 @@ use {
@@ -1168,7 +1158,7 @@ index c5a5f4d..3ef6c07 100644
  
          if let Some(new_root) = new_root {
              let highest_super_majority_root = Some(
-@@ -4955,6 +5056,94 @@ impl ReplayStage {
+@@ -4955,6 +5056,91 @@ impl ReplayStage {
          duplicate_confirmed_forks
      }
  
@@ -1195,10 +1185,7 @@ index c5a5f4d..3ef6c07 100644
 +    ) -> Option<Slot> {
 +        let root = bank_forks.read().unwrap().root();
 +        bmm_fork_choice::prune_answers(blockstore.lowest_slot());
-+        // sol-drivechain: a full slot that this node did not freeze is a block
-+        // of another branch that a peer delivered.
-+        let delivered = |slot| blockstore.is_full(slot) && blockstore.get_bank_hash(slot).is_none();
-+        match bmm.take_restart(root, delivered) {
++        match bmm.take_restart(root) {
 +            Ok(None) => (),
 +            Ok(Some(restart)) => {
 +                error!(
@@ -11002,10 +10989,10 @@ index 0000000..aa0b90d
 +}
 diff --git a/sol-drivechain-bmm/src/peers.rs b/sol-drivechain-bmm/src/peers.rs
 new file mode 100644
-index 0000000..5c29dcd
+index 0000000..83b113c
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/peers.rs
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,217 @@
 +//! What this validator and its staked peers know about the banks of BMM
 +//! checkpoints. A checkpoint for a bank that this node does not hold counts
 +//! toward a restart only when a staked peer says that it holds that bank.
@@ -11058,7 +11045,7 @@ index 0000000..5c29dcd
 +struct State {
 +    known: HashMap<BankHash, Slot>,
 +    wanted: Vec<BankHash>,
-+    attested: HashMap<BankHash, HashMap<NodeId, Slot>>,
++    attested: HashMap<BankHash, HashSet<NodeId>>,
 +    generation: u64,
 +}
 +
@@ -11101,16 +11088,11 @@ index 0000000..5c29dcd
 +        self.state.lock().unwrap().wanted.clone()
 +    }
 +
-+    /// Keeps that the staked peer `node` holds the bank `bank_hash` at `slot`.
-+    pub fn attest(&self, bank_hash: &BankHash, node: NodeId, slot: Slot) {
++    /// Keeps that the staked peer `node` holds the bank `bank_hash`.
++    pub fn attest(&self, bank_hash: &BankHash, node: NodeId) {
 +        let mut state = self.state.lock().unwrap();
 +        if state.wanted.contains(bank_hash)
-+            && state
-+                .attested
-+                .entry(*bank_hash)
-+                .or_default()
-+                .insert(node, slot)
-+                != Some(slot)
++            && state.attested.entry(*bank_hash).or_default().insert(node)
 +        {
 +            state.generation = state.generation.wrapping_add(1);
 +        }
@@ -11122,7 +11104,7 @@ index 0000000..5c29dcd
 +        if state
 +            .attested
 +            .get_mut(bank_hash)
-+            .is_some_and(|nodes| nodes.remove(node).is_some())
++            .is_some_and(|nodes| nodes.remove(node))
 +        {
 +            state.generation = state.generation.wrapping_add(1);
 +        }
@@ -11135,7 +11117,7 @@ index 0000000..5c29dcd
 +        let mut removed = false;
 +        for nodes in state.attested.values_mut() {
 +            let before = nodes.len();
-+            nodes.retain(|node, _| staked.contains(node));
++            nodes.retain(|node| staked.contains(node));
 +            removed |= nodes.len() != before;
 +        }
 +        if removed {
@@ -11154,23 +11136,10 @@ index 0000000..5c29dcd
 +        let mut nodes: Vec<NodeId> = state
 +            .attested
 +            .get(bank_hash)
-+            .map(|nodes| nodes.keys().copied().collect())
++            .map(|nodes| nodes.iter().copied().collect())
 +            .unwrap_or_default();
 +        nodes.sort_unstable();
 +        nodes
-+    }
-+
-+    /// The slots at which the staked peers say that they hold `bank_hash`.
-+    pub fn attested_slots(&self, bank_hash: &BankHash) -> Vec<Slot> {
-+        let state = self.state.lock().unwrap();
-+        let mut slots: Vec<Slot> = state
-+            .attested
-+            .get(bank_hash)
-+            .map(|nodes| nodes.values().copied().collect())
-+            .unwrap_or_default();
-+        slots.sort_unstable();
-+        slots.dedup();
-+        slots
 +    }
 +}
 +
@@ -11181,12 +11150,12 @@ index 0000000..5c29dcd
 +    #[test]
 +    fn only_a_wanted_bank_takes_an_attestation() {
 +        let peers = Peers::default();
-+        peers.attest(&[1; 32], [9; 32], 5);
++        peers.attest(&[1; 32], [9; 32]);
 +        assert!(peers.attesters(&[1; 32]).is_empty());
 +        peers.set_wanted(vec![[1; 32]]);
 +        let before = peers.generation();
-+        peers.attest(&[1; 32], [9; 32], 5);
-+        peers.attest(&[1; 32], [9; 32], 5);
++        peers.attest(&[1; 32], [9; 32]);
++        peers.attest(&[1; 32], [9; 32]);
 +        assert_eq!(peers.attesters(&[1; 32]), vec![[9; 32]]);
 +        assert_eq!(peers.generation(), before.wrapping_add(1));
 +        peers.set_wanted(vec![[2; 32]]);
@@ -11194,26 +11163,11 @@ index 0000000..5c29dcd
 +    }
 +
 +    #[test]
-+    fn the_attested_slots_hold_each_slot_that_a_peer_names() {
-+        let peers = Peers::default();
-+        peers.set_wanted(vec![[1; 32]]);
-+        peers.attest(&[1; 32], [9; 32], 7);
-+        peers.attest(&[1; 32], [8; 32], 7);
-+        peers.attest(&[1; 32], [7; 32], 6);
-+        assert_eq!(peers.attested_slots(&[1; 32]), vec![6, 7]);
-+        let before = peers.generation();
-+        peers.attest(&[1; 32], [9; 32], 8);
-+        assert_ne!(peers.generation(), before);
-+        peers.withdraw(&[1; 32], &[7; 32]);
-+        assert_eq!(peers.attested_slots(&[1; 32]), vec![7, 8]);
-+    }
-+
-+    #[test]
 +    fn a_peer_that_no_longer_holds_a_bank_stops_counting() {
 +        let peers = Peers::default();
 +        peers.set_wanted(vec![[1; 32]]);
-+        peers.attest(&[1; 32], [9; 32], 5);
-+        peers.attest(&[1; 32], [8; 32], 5);
++        peers.attest(&[1; 32], [9; 32]);
++        peers.attest(&[1; 32], [8; 32]);
 +        let before = peers.generation();
 +        peers.withdraw(&[1; 32], &[9; 32]);
 +        assert_eq!(peers.attesters(&[1; 32]), vec![[8; 32]]);
@@ -11227,8 +11181,8 @@ index 0000000..5c29dcd
 +    fn a_peer_without_stake_stops_counting() {
 +        let peers = Peers::default();
 +        peers.set_wanted(vec![[1; 32]]);
-+        peers.attest(&[1; 32], [9; 32], 5);
-+        peers.attest(&[1; 32], [8; 32], 5);
++        peers.attest(&[1; 32], [9; 32]);
++        peers.attest(&[1; 32], [8; 32]);
 +        let before = peers.generation();
 +        peers.retain_nodes(&HashSet::from([[8; 32]]));
 +        assert_eq!(peers.attesters(&[1; 32]), vec![[8; 32]]);
@@ -11684,7 +11638,7 @@ index 0000000..92b4529
 +}
 diff --git a/sol-drivechain-bmm/src/push.rs b/sol-drivechain-bmm/src/push.rs
 new file mode 100644
-index 0000000..6e87faa
+index 0000000..29064d0
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/push.rs
 @@ -0,0 +1,587 @@
@@ -11831,8 +11785,8 @@ index 0000000..6e87faa
 +        Ok(known) => {
 +            let mut held = 0usize;
 +            for (bank_hash, slot) in wanted.iter().zip(known) {
-+                if let Some(slot) = slot {
-+                    peers().attest(bank_hash, node.to_bytes(), slot);
++                if slot.is_some() {
++                    peers().attest(bank_hash, node.to_bytes());
 +                    held = held.saturating_add(1);
 +                } else {
 +                    peers().withdraw(bank_hash, &node.to_bytes());
