@@ -303,7 +303,8 @@ only makes blocks.
 
 A settle or a credit that the bridge refuses from its config alone runs at
 once, fails, and pays its fee. A "not ready" settle or credit waits in the
-leader queue for at most 30 seconds, with at most 4 txs per fee payer. A
+leader queue for at most 30 seconds, with at most 4 txs per fee payer. Only
+a fee payer that holds the fee gets a place in the queue. A
 question that no new eCash block can answer leaves the queue at once. On
 replay, the questions of one slot wait 10 seconds in all for a late eCash
 block, and then the block is dead. A question for a block more than 2 blocks
