@@ -256,10 +256,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..b7cfa74
+index 0000000..39023f8
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,610 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -468,6 +468,11 @@ index 0000000..b7cfa74
 +                    Rejection::Dropped => info!(
 +                        "BMM: the checkpoint at eCash height {} fails rule 3: block {block} \
 +                         credited deposits of an eCash block that the active chain dropped",
++                        checkpoint.height
++                    ),
++                    Rejection::OutOfRecord => info!(
++                        "BMM: the checkpoint at eCash height {} fails rule 3: block {block} \
++                         is an anchor out of the block record, so this node cannot check its credits",
 +                        checkpoint.height
 +                    ),
 +                }
@@ -5091,10 +5096,10 @@ index 0000000..2af21ea
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..0125a5d
+index 0000000..3414043
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2669 @@
+@@ -0,0 +1,2733 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -5527,6 +5532,9 @@ index 0000000..0125a5d
 +    TooFewCredits(u64),
 +    /// The active eCash chain dropped a block that the bank credited.
 +    Dropped,
++    /// The bank is a saved anchor that left the block record of the root,
++    /// so this node cannot check its credits for a later checkpoint.
++    OutOfRecord,
 +}
 +
 +/// The checkpoints after rules 3 and 4.
@@ -5601,7 +5609,7 @@ index 0000000..0125a5d
 +/// Applies rules 3 and 4 to the checkpoints. `deposits` holds the credits of
 +/// each frozen bank. A checkpoint for a bank below the root counts when it is
 +/// the checkpoint of a saved anchor, or when it passes rule 3 for its block of
-+/// the block record.
++/// the block record. Only a bank that this node does not hold is absent.
 +pub fn screen(
 +    checkpoints: &[Checkpoint],
 +    deposits: &HashMap<BankHash, Deposits>,
@@ -5618,6 +5626,9 @@ index 0000000..0125a5d
 +                screened.counted.push(*checkpoint)
 +            }
 +            None => match below_root.ancestors.get(&checkpoint.bank_hash) {
++                None if below_root.holds(&checkpoint.bank_hash) => screened
++                    .rejected
++                    .push((*checkpoint, Rejection::OutOfRecord)),
 +                None => screened.absent.push(*checkpoint),
 +                Some(ancestor)
 +                    if ancestor.credited_height.saturating_add(ancestor.lag)
@@ -6734,7 +6745,14 @@ index 0000000..0125a5d
 +        ];
 +        let screened = screen_root(&checkpoints, &[], &saved);
 +        assert_eq!(screened.counted, vec![checkpoint(100, 32)]);
-+        assert_eq!(screened.absent, checkpoints[1..]);
++        assert_eq!(
++            screened.rejected,
++            vec![
++                (checkpoints[1], Rejection::OutOfRecord),
++                (checkpoints[2], Rejection::OutOfRecord)
++            ]
++        );
++        assert_eq!(screened.absent, checkpoints[3..]);
 +    }
 +
 +    #[test]
@@ -6829,6 +6847,57 @@ index 0000000..0125a5d
 +            vouched_by_staked(&absent, held_by(vec![node(1)]), &distrusted, 150),
 +            vec![unknown(100)]
 +        );
++    }
++
++    #[test]
++    fn repeated_checkpoints_for_an_anchor_out_of_the_record_never_stop_the_fallback() {
++        let banks = tree(&[(96, 0), (97, 96)]);
++        let deposits = HashMap::from([(hash(96), credited(300)), (hash(97), credited(300))]);
++        let record = [RecordedBlock {
++            slot: 64,
++            bank_hash: hash(64),
++            credited_height: 150,
++            credited_block: block(150),
++            part_block: [0; 32],
++        }];
++        let mut saved = Saved {
++            anchors: vec![anchor(100, 32)],
++            proof: Some(Proof {
++                bank_hashes: vec![hash(32)],
++                nodes: vec![node(1)],
++                deadline_height: 300,
++            }),
++            ..Saved::default()
++        };
++        let below_root = BelowRoot::new(&saved.anchors, &record, Some(100), |height| {
++            Some(block(height))
++        });
++        assert!(settle_proof(
++            &mut saved,
++            |bank_hash| below_root.holds(bank_hash),
++            206
++        ));
++        assert_eq!(saved.proof, None);
++        for tip_height in [206, 212, 218] {
++            let old_bank = Checkpoint {
++                height: tip_height,
++                block_hash: block(tip_height),
++                bank_hash: hash(32),
++            };
++            let screened = screen(&[old_bank], &deposits, &below_root);
++            assert!(screened.absent.is_empty());
++            assert_eq!(screened.rejected, vec![(old_bank, Rejection::OutOfRecord)]);
++            let vouched =
++                vouched_by_staked(&screened.absent, |_| vec![node(1)], &saved, tip_height);
++            assert!(vouched.is_empty());
++            let mut choice = choose(96, &banks, &screened.counted, tip_height, PARAMS);
++            assert!(
++                stop_fallback(&mut choice, &screened.pending, &vouched, tip_height, PARAMS)
++                    .is_empty()
++            );
++            assert!(choice.fallback);
++            assert_eq!(saved.proof, None);
++        }
 +    }
 +
 +    #[test]
