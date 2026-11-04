@@ -51,6 +51,8 @@ pub enum EnforcerError {
     BlockNotFound(BlockHash),
     #[error("the wallet scan of the enforcer took longer than the limit")]
     ScanTimeout,
+    #[error("the bid request took longer than its deadline, and its outcome is unknown")]
+    BidDeadline,
     #[error("the enforcer sent a commitment of {0} bytes, not 32")]
     BadCommitmentLength(usize),
 }
@@ -799,26 +801,27 @@ impl Enforcer {
         tip: (BlockHash, u32),
         h_star: &[u8; 32],
     ) -> Result<Txid> {
-        match self.send_bmm_request(bid_sats, tip, h_star).await {
-            Err(error) if spends_a_gone_coin(&error) => {
-                let Some(mark) = self.scans.try_begin(tip.0) else {
-                    return Err(error);
-                };
-                tracing::warn!(%error, "the enforcer wallet holds a spent coin, so it scans again");
-                let mut scanner = self.clone();
-                let scan = tokio::spawn(async move {
-                    let _mark = mark;
-                    scanner.full_scan().await
-                });
-                let scanned = match tokio::time::timeout(FULL_SCAN_WAIT, scan).await {
-                    Ok(Ok(scanned)) => scanned,
-                    Ok(Err(_)) | Err(_) => Err(EnforcerError::ScanTimeout),
-                };
-                after_scan(error, scanned)?;
-                self.send_bmm_request(bid_sats, tip, h_star).await
-            }
-            result => result,
-        }
+        let deadline = tokio::time::Instant::now() + BID_DEADLINE;
+        let sender = self.clone();
+        let send = || {
+            let mut sender = sender.clone();
+            let h_star = *h_star;
+            async move { sender.send_bmm_request(bid_sats, tip, &h_star).await }
+        };
+        let gate = std::sync::Arc::clone(&self.scans);
+        let scanner = self.clone();
+        let scan = move || async move {
+            let Some(mark) = gate.try_begin(tip.0) else {
+                return Err(EnforcerError::ScanTimeout);
+            };
+            let mut scanner = scanner;
+            let task = tokio::spawn(async move {
+                let _mark = mark;
+                scanner.full_scan().await
+            });
+            task.await.unwrap_or(Err(EnforcerError::ScanTimeout))
+        };
+        bid_with_rescan(deadline, send, scan).await
     }
 
     /// Scans the whole chain for the enforcer wallet, so it drops the coins
@@ -1069,6 +1072,43 @@ pub fn spends_a_gone_coin(error: &EnforcerError) -> bool {
         EnforcerError::Call { source, .. }
             if source.message().contains("bad-txns-inputs-missingorspent")
     )
+}
+
+/// The longest time of one bid: the request, a wallet scan, and the resend.
+pub const BID_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Sends a bid with `send`. After a stale-coin refusal it runs `scan` and
+/// sends once more. A request past `deadline` has an unknown outcome. A scan
+/// past it, or past `FULL_SCAN_WAIT`, keeps the refusal, because no new tx
+/// went out.
+pub async fn bid_with_rescan<S, SF, C, CF>(
+    deadline: tokio::time::Instant,
+    mut send: S,
+    scan: C,
+) -> Result<Txid>
+where
+    S: FnMut() -> SF,
+    SF: std::future::Future<Output = Result<Txid>>,
+    C: FnOnce() -> CF,
+    CF: std::future::Future<Output = Result<()>>,
+{
+    let first = tokio::time::timeout_at(deadline, send())
+        .await
+        .map_err(|_| EnforcerError::BidDeadline)?;
+    match first {
+        Err(error) if spends_a_gone_coin(&error) => {
+            tracing::warn!(%error, "the enforcer wallet holds a spent coin, so it scans again");
+            let wait = deadline.min(tokio::time::Instant::now() + FULL_SCAN_WAIT);
+            let scanned = tokio::time::timeout_at(wait, scan())
+                .await
+                .unwrap_or(Err(EnforcerError::ScanTimeout));
+            after_scan(error, scanned)?;
+            tokio::time::timeout_at(deadline, send())
+                .await
+                .map_err(|_| EnforcerError::BidDeadline)?
+        }
+        result => result,
+    }
 }
 
 /// The outcome of a stale-coin refusal after the wallet scan. A failed scan
@@ -1435,6 +1475,61 @@ mod tests {
             let kept = after_scan(refusal(), Err(scan)).unwrap_err();
             assert!(bid_rejected(&kept), "{kept}");
         }
+    }
+
+    fn a_stale_refusal() -> EnforcerError {
+        EnforcerError::Call {
+            call: "CreateBmmCriticalDataTransaction",
+            source: tonic::Status::unknown("bad-txns-inputs-missingorspent"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stuck_request_is_unknown_and_a_stuck_scan_keeps_the_refusal() {
+        let soon = || tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        let txid = Txid::from_byte_array([3u8; 32]);
+
+        let stuck = bid_with_rescan(soon(), std::future::pending::<Result<Txid>>, || async {
+            Ok(())
+        })
+        .await;
+        assert!(matches!(stuck, Err(EnforcerError::BidDeadline)));
+        assert!(!bid_rejected(&stuck.unwrap_err()));
+
+        let sends = std::sync::atomic::AtomicUsize::new(0);
+        let scan_stuck = bid_with_rescan(
+            soon(),
+            || {
+                sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(a_stale_refusal()) }
+            },
+            std::future::pending::<Result<()>>,
+        )
+        .await
+        .unwrap_err();
+        assert!(bid_rejected(&scan_stuck), "{scan_stuck}");
+        assert_eq!(
+            sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no resend"
+        );
+
+        let mut first = true;
+        let resent = bid_with_rescan(
+            soon(),
+            || {
+                let answer = if first {
+                    Err(a_stale_refusal())
+                } else {
+                    Ok(txid)
+                };
+                first = false;
+                async move { answer }
+            },
+            || async { Ok(()) },
+        )
+        .await;
+        assert_eq!(resent.unwrap(), txid);
     }
 
     #[test]

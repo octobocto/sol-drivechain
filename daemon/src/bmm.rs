@@ -952,12 +952,13 @@ pub enum Bid {
     Busy,
 }
 
-/// The longest time of one bid: the request, a wallet scan, and the resend.
-pub const BID_DEADLINE: Duration = Duration::from_secs(60);
-
-/// The answer of `request`, or `None` after `deadline`.
-pub async fn within<T>(deadline: Duration, request: impl Future<Output = T>) -> Option<T> {
-    tokio::time::timeout(deadline, request).await.ok()
+/// Keeps and publishes the pair of a bid before the bid goes out. A bid with
+/// a lost answer can still win, and its commitment then needs the pair.
+pub async fn keep_pair(memory: &Mutex<Memory>, rpc: &RpcClient, pair: Pair) {
+    memory.lock().await.remember(pair);
+    if let Err(error) = publish_pairs(rpc, &[pair]).await {
+        tracing::warn!(%error, height = pair.height, "the loop cannot publish its pair yet");
+    }
 }
 
 /// True when a checkpoint at eCash height `height` for `block` passes rule 3:
@@ -1120,25 +1121,13 @@ async fn bid(
         tracing::info!(height, "a wallet scan runs, so the bid waits");
         return Ok(Bid::Busy);
     }
-    let Some(answer) = within(
-        BID_DEADLINE,
-        enforcer.create_bmm_request(bid, tip, &pair.commitment()),
-    )
-    .await
-    else {
-        tracing::warn!(
-            height,
-            "the bid took too long, and the tip gets no other bid"
-        );
-        return Ok(Bid::Unknown);
-    };
-    match answer {
+    keep_pair(memory, &live.rpc, pair).await;
+    match enforcer
+        .create_bmm_request(bid, tip, &pair.commitment())
+        .await
+    {
         Ok(txid) => {
             tracing::info!(height, bid, slot, %txid, "the loop bid for an eCash block");
-            memory.lock().await.remember(pair);
-            if let Err(error) = publish_pairs(&live.rpc, &[pair]).await {
-                tracing::warn!(%error, height, "the loop cannot publish its pair yet");
-            }
             Ok(Bid::Sent(pair))
         }
         Err(error) if tip_moved(&error) => {
@@ -1499,11 +1488,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bid_past_its_deadline_has_an_unknown_outcome() {
-        let stuck = within(Duration::from_millis(20), std::future::pending::<()>()).await;
-        assert!(stuck.is_none());
-        assert_eq!(within(Duration::from_secs(5), async { 7 }).await, Some(7));
+    async fn a_pair_is_kept_and_published_before_its_bid() {
+        let memory = Mutex::new(Memory::default());
+        let rpc = RpcClient::new_mock("succeeds".to_owned());
+        let pair = pair_at(500, 9);
+        keep_pair(&memory, &rpc, pair).await;
+        // The bid then has a lost answer, and the pair stays for the publish.
         assert!(!bids_again(&Ok(Bid::Unknown)));
+        let kept = memory.lock().await.pairs_to_publish(400, 505, 6);
+        assert_eq!(kept, vec![pair]);
         assert!(bids_again(&Ok(Bid::Busy)), "a running scan delays the bid");
     }
 
