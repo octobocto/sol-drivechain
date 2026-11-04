@@ -14,7 +14,7 @@ use sol_drivechain_bridge::{
     accounts, commitment_of, instruction, min_fee_sats, AnsweredDeposit, BmmAnswer, Config,
     DepositAnswer, WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, DEPOSIT_ANSWER_ENTRY_LEN,
     DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID, LAMPORTS_PER_SAT, MAX_BUNDLE_RECORDS,
-    MAX_SCRIPT_PUBKEY_LEN, MIN_FEE_SATS,
+    MAX_SCRIPT_PUBKEY_LEN, MIN_FEE_SATS, PAIR_WINDOW,
 };
 use solana_account::Account;
 use solana_instruction::Instruction;
@@ -31,6 +31,9 @@ const A_P2WPKH: [u8; 22] = [
 const SYSTEM_PROGRAM: Pubkey = Pubkey::new_from_array([0u8; 32]);
 const SYSVAR_PROGRAM: Pubkey =
     Pubkey::from_str_const("Sysvar1111111111111111111111111111111111111");
+
+/// The slots that a commitment without a pair blocks the cursor.
+const BMM_SKIP_SLOTS: u64 = 1_000;
 
 /// The eCash height at which the chain starts to settle BMM.
 const BMM_START: u64 = 100;
@@ -97,7 +100,10 @@ impl Chain {
         )
         .unwrap();
 
-        let config_data = genesis_config(oracle.pubkey(), float_lamports, bundle_min_slots);
+        let mut config_data = genesis_config(oracle.pubkey(), float_lamports, bundle_min_slots);
+        // The cursor of the genesis moved at the first slot of the chain.
+        let start_slot = svm.get_sysvar::<anchor_lang::prelude::Clock>().slot;
+        config_data[251..259].copy_from_slice(&start_slot.to_le_bytes());
         let config_lamports = svm.minimum_balance_for_rent_exemption(config_data.len());
         svm.set_account(
             config,
@@ -494,6 +500,20 @@ impl Chain {
         self.svm.set_account(self.treasury, account).unwrap();
     }
 
+    /// Moves the BMM cursor to `height`, as if each height below it settled.
+    fn set_next_height(&mut self, height: u64) {
+        let mut account = self.svm.get_account(&self.config).unwrap();
+        account.data[64..72].copy_from_slice(&height.to_le_bytes());
+        self.svm.set_account(self.config, account).unwrap();
+    }
+
+    /// Sets `credited_height`, as if the credits reached it.
+    fn set_credited_height(&mut self, height: u64) {
+        let mut account = self.svm.get_account(&self.config).unwrap();
+        account.data[96..104].copy_from_slice(&height.to_le_bytes());
+        self.svm.set_account(self.config, account).unwrap();
+    }
+
     fn record_key(&self, index: u64) -> Pubkey {
         Pubkey::find_program_address(&[b"withdrawal", &index.to_le_bytes()], &self.program_id).0
     }
@@ -576,6 +596,8 @@ fn genesis_config(oracle: Pubkey, float_lamports: u64, bundle_min_slots: u64) ->
         bundle_sealed_height: 0,
         bundle_sealed_slot: 0,
         bundle_min_slots,
+        bmm_skip_slots: BMM_SKIP_SLOTS,
+        bmm_next_since_slot: 0,
     };
     let mut data = Vec::new();
     config
@@ -671,7 +693,7 @@ fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
     let oracle = Pubkey::new_from_array([5u8; 32]);
     let data = genesis_config(oracle, 7, 9);
     let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-    assert_eq!(data.len(), 243);
+    assert_eq!(data.len(), 259);
     assert_eq!(&data[..8], Config::DISCRIMINATOR);
     assert_eq!(&data[8..40], oracle.as_ref());
     assert_eq!(at(64), BMM_START);
@@ -687,6 +709,8 @@ fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
     assert_eq!(at(187), VAULT_LAMPORTS);
     assert_eq!(at(195), 7);
     assert_eq!(at(235), 9);
+    assert_eq!(at(243), BMM_SKIP_SLOTS);
+    assert_eq!(at(251), 0);
 }
 
 #[test]
@@ -1641,40 +1665,48 @@ fn a_valid_pair_pays_the_whole_treasury_above_the_reserve_to_the_payee() {
 }
 
 #[test]
-fn a_settle_whose_block_credited_too_few_deposits_fails() {
+fn a_checkpoint_with_too_few_credits_moves_the_cursor_and_pays_nothing() {
     let mut chain = Chain::start();
     let winner = chain.a_stranger().pubkey();
-    let height = DEPOSIT_START + DEPOSIT_LAG + 1;
+    let height = DEPOSIT_START + DEPOSIT_LAG;
+    chain.set_next_height(height);
     chain.pay_fees(3_000_000);
     chain.win_with_credits(height, winner, DEPOSIT_START, true);
-
-    assert!(chain.settle(height, winner).is_err());
-    assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 3_000_000);
-    assert_eq!(chain.config().bmm_next_height, BMM_START);
-
-    chain.win_with_credits(height - 1, winner, DEPOSIT_START, true);
     chain
-        .settle(height - 1, winner)
+        .settle(height, winner)
         .expect("a checkpoint at exactly the credited height + lag pays");
     assert_eq!(chain.config().bmm_paid_total, 3_000_000);
+
+    chain.pay_fees(1_000_000);
+    let before = chain.balance(&winner);
+    chain.win_with_credits(height + 1, winner, DEPOSIT_START, true);
+    chain
+        .settle(height + 1, winner)
+        .expect("an invalid checkpoint moves the cursor");
+    assert_eq!(chain.balance(&winner), before);
+    assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
+    assert_eq!(chain.config().bmm_next_height, height + 2);
 }
 
 #[test]
-fn a_settle_whose_credited_block_left_the_active_chain_fails() {
+fn a_checkpoint_whose_credits_left_the_chain_moves_the_cursor_and_pays_nothing() {
     let mut chain = Chain::start();
     let winner = chain.a_stranger().pubkey();
     chain.pay_fees(3_000_000);
     chain.win_with_credits(BMM_START, winner, DEPOSIT_START, false);
 
-    assert!(chain.settle(BMM_START, winner).is_err());
+    chain
+        .settle(BMM_START, winner)
+        .expect("an invalid checkpoint moves the cursor");
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 3_000_000);
-    assert_eq!(chain.config().bmm_next_height, BMM_START);
+    assert_eq!(chain.config().bmm_next_height, BMM_START + 1);
 }
 
 #[test]
-fn a_height_with_no_commitment_fails() {
+fn a_height_with_no_commitment_moves_the_cursor_and_pays_nothing() {
     let mut chain = Chain::start();
     let anyone = chain.a_stranger().pubkey();
+    let before = chain.balance(&anyone);
     chain.pay_fees(1_000_000);
     chain.answer(BmmAnswer {
         height: BMM_START,
@@ -1686,13 +1718,16 @@ fn a_height_with_no_commitment_fails() {
         credits_active: true,
     });
 
-    assert!(chain.settle(BMM_START, anyone).is_err());
+    chain
+        .settle(BMM_START, anyone)
+        .expect("an empty height settles");
+    assert_eq!(chain.balance(&anyone), before);
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
-    assert_eq!(chain.config().bmm_next_height, BMM_START);
+    assert_eq!(chain.config().bmm_next_height, BMM_START + 1);
 }
 
 #[test]
-fn a_payee_that_is_not_in_the_pair_fails() {
+fn a_payee_that_is_not_in_the_pair_fails_until_the_skip_time() {
     let mut chain = Chain::start();
     let winner = chain.a_stranger().pubkey();
     let thief = chain.a_stranger().pubkey();
@@ -1700,9 +1735,41 @@ fn a_payee_that_is_not_in_the_pair_fails() {
     chain.pay_fees(1_000_000);
     chain.win(BMM_START, winner);
 
+    let since = chain.config().bmm_next_since_slot;
+    chain.svm.warp_to_slot(since + BMM_SKIP_SLOTS - 1);
     assert!(chain.settle(BMM_START, thief).is_err());
-    assert_eq!(chain.balance(&thief), before);
     assert_eq!(chain.config().bmm_next_height, BMM_START);
+
+    chain.svm.warp_to_slot(since + BMM_SKIP_SLOTS);
+    chain
+        .settle(BMM_START, thief)
+        .expect("after the skip time the height moves on");
+    assert_eq!(chain.balance(&thief), before);
+    assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
+    assert_eq!(chain.config().bmm_next_height, BMM_START + 1);
+    assert_eq!(chain.config().bmm_next_since_slot, since + BMM_SKIP_SLOTS);
+}
+
+#[test]
+fn a_cursor_below_the_pair_window_skips_each_height_at_once() {
+    let mut chain = Chain::start();
+    let withheld = chain.a_stranger().pubkey();
+    let anyone = chain.a_stranger().pubkey();
+    chain.pay_fees(1_000_000);
+    chain.set_credited_height(BMM_START + 2 + PAIR_WINDOW);
+    let since = chain.config().bmm_next_since_slot;
+    chain.svm.warp_to_slot(since + 1);
+    for height in [BMM_START, BMM_START + 1] {
+        chain.win(height, withheld);
+        chain
+            .settle(height, anyone)
+            .expect("a height below the pair window moves on at once");
+        assert_eq!(chain.config().bmm_next_height, height + 1);
+    }
+    chain.win(BMM_START + 2, withheld);
+    assert!(chain.settle(BMM_START + 2, anyone).is_err());
+    assert_eq!(chain.config().bmm_next_height, BMM_START + 2);
+    assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
 }
 
 #[test]
@@ -1726,7 +1793,7 @@ fn a_solana_block_that_is_not_in_the_pair_fails() {
 }
 
 #[test]
-fn a_block_that_the_record_does_not_hold_fails() {
+fn a_block_that_the_record_does_not_hold_moves_the_cursor_and_pays_nothing() {
     let mut chain = Chain::start();
     let winner = chain.a_stranger().pubkey();
     chain.pay_fees(1_000_000);
@@ -1740,9 +1807,11 @@ fn a_block_that_the_record_does_not_hold_fails() {
         credits_active: true,
     });
 
-    assert!(chain.settle(BMM_START, winner).is_err());
+    chain
+        .settle(BMM_START, winner)
+        .expect("an invalid checkpoint moves the cursor");
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
-    assert_eq!(chain.config().bmm_next_height, BMM_START);
+    assert_eq!(chain.config().bmm_next_height, BMM_START + 1);
 }
 
 #[test]
@@ -1803,61 +1872,94 @@ fn an_executable_payee_gets_nothing_and_the_height_settles() {
 }
 
 #[test]
-fn a_later_settle_skips_the_earlier_heights_for_ever() {
+fn a_later_height_cannot_settle_before_the_next_one() {
     let mut chain = Chain::start();
-    let skipped = chain.a_stranger().pubkey();
+    let first = chain.a_stranger().pubkey();
     let later = chain.a_stranger().pubkey();
-    chain.win(BMM_START + 3, later);
-    chain
-        .settle(BMM_START + 3, later)
-        .expect("a later height settles");
-    assert_eq!(chain.config().bmm_next_height, BMM_START + 4);
+    chain.pay_fees(1_000_000);
+    chain.win(BMM_START + 1, later);
+    assert!(chain.settle(BMM_START + 1, later).is_err());
+    assert_eq!(chain.config().bmm_next_height, BMM_START);
 
-    chain.win(BMM_START, skipped);
-    assert!(chain.settle(BMM_START, skipped).is_err());
-    chain.win(BMM_START + 3, later);
-    assert!(chain.settle(BMM_START + 3, later).is_err());
-    assert_eq!(chain.config().bmm_next_height, BMM_START + 4);
+    let before = chain.balance(&first);
+    chain.win(BMM_START, first);
+    chain
+        .settle(BMM_START, first)
+        .expect("the next height settles");
+    assert_eq!(chain.balance(&first) - before, 1_000_000);
+    chain.pay_fees(500_000);
+    let before = chain.balance(&later);
+    chain.win(BMM_START + 1, later);
+    chain
+        .settle(BMM_START + 1, later)
+        .expect("the height after it settles in order");
+    assert_eq!(chain.balance(&later) - before, 500_000);
 }
 
 #[test]
-fn the_fees_of_skipped_heights_roll_over_to_the_next_payee() {
+fn a_leader_cannot_put_the_later_settle_first_in_one_block() {
     let mut chain = Chain::start();
     let first = chain.a_stranger().pubkey();
-    let skipped = chain.a_stranger().pubkey();
     let later = chain.a_stranger().pubkey();
-    let first_before = chain.balance(&first);
+    chain.pay_fees(1_000_000);
+    chain.win(BMM_START + 1, later);
+    let early = chain.settle_ix(BMM_START + 1, SOLANA_BLOCK, later);
+    assert!(chain.send_all(&[early]).is_err());
+    chain.win(BMM_START, first);
+    let before = chain.balance(&first);
+    chain
+        .settle(BMM_START, first)
+        .expect("the next height settles");
+    assert_eq!(chain.balance(&first) - before, 1_000_000);
+}
+
+#[test]
+fn the_fees_of_a_height_without_a_pair_roll_over_after_the_skip_time() {
+    let mut chain = Chain::start();
+    let first = chain.a_stranger().pubkey();
+    let withheld = chain.a_stranger().pubkey();
+    let later = chain.a_stranger().pubkey();
     let later_before = chain.balance(&later);
 
     chain.pay_fees(1_000_000);
     chain.win(BMM_START, first);
     chain.settle(BMM_START, first).expect("height one");
+    let since = chain.config().bmm_next_since_slot;
     chain.pay_fees(2_000_000);
-    // Height two has a commitment, but nobody settles it.
+    // Height two has a commitment, and nobody publishes its pair.
+    chain.win(BMM_START + 1, withheld);
+    let anyone = chain.a_stranger().pubkey();
+    chain.svm.warp_to_slot(since + BMM_SKIP_SLOTS - 1);
+    assert!(chain.settle(BMM_START + 1, anyone).is_err());
+    chain.svm.warp_to_slot(since + BMM_SKIP_SLOTS);
+    chain
+        .settle(BMM_START + 1, anyone)
+        .expect("the skip moves the cursor");
     chain.pay_fees(500_000);
     chain.win(BMM_START + 2, later);
     chain.settle(BMM_START + 2, later).expect("height three");
 
-    assert_eq!(chain.balance(&first) - first_before, 1_000_000);
     assert_eq!(chain.balance(&later) - later_before, 2_500_000);
     assert_eq!(chain.config().bmm_paid_total, 3_500_000);
-    chain.win(BMM_START + 1, skipped);
-    assert!(chain.settle(BMM_START + 1, skipped).is_err());
+    chain.win(BMM_START + 1, withheld);
+    assert!(chain.settle(BMM_START + 1, withheld).is_err());
 }
 
 #[test]
 fn the_cursor_takes_heights_in_order() {
     let mut chain = Chain::start();
     let payee = chain.a_stranger().pubkey();
-    for height in [BMM_START, BMM_START + 1, BMM_START + 5] {
+    for height in [BMM_START, BMM_START + 1, BMM_START + 2] {
         chain.win(height, payee);
         chain
             .settle(height, payee)
-            .expect("each higher height settles");
+            .expect("each next height settles");
         assert_eq!(chain.config().bmm_next_height, height + 1);
     }
-    chain.win(BMM_START + 4, payee);
-    assert!(chain.settle(BMM_START + 4, payee).is_err());
+    for height in [BMM_START + 1, BMM_START + 4] {
+        chain.win(height, payee);
+        assert!(chain.settle(height, payee).is_err());
+    }
 }
 
 #[test]

@@ -22,6 +22,16 @@ pub fn min_fee_sats(waiting: u64) -> u64 {
     MIN_FEE_SATS.saturating_add(MIN_FEE_SATS.saturating_mul(waiting) / 100)
 }
 
+/// A validator drops the BMM pairs this many eCash blocks below its tip. It
+/// must match the bridge program and `PAIR_WINDOW` in the Agave patch.
+pub const PAIR_WINDOW: u64 = 4_032;
+
+/// True when the bridge skips a commitment at `height` with no pair at once.
+/// It must match `pair_too_old` of the bridge program.
+pub fn pair_too_old(height: u64, credited_height: u64) -> bool {
+    height.saturating_add(PAIR_WINDOW) < credited_height
+}
+
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";
@@ -182,10 +192,12 @@ pub struct Config {
     pub bundle_sealed_height: u64,
     pub bundle_sealed_slot: u64,
     pub bundle_min_slots: u64,
+    pub bmm_skip_slots: u64,
+    pub bmm_next_since_slot: u64,
 }
 
 impl Config {
-    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 7;
+    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 9;
 
     /// The lowest fee that `withdraw` takes now.
     pub fn min_fee_sats(&self) -> u64 {
@@ -241,6 +253,8 @@ impl Config {
             self.bundle_sealed_height,
             self.bundle_sealed_slot,
             self.bundle_min_slots,
+            self.bmm_skip_slots,
+            self.bmm_next_since_slot,
         ] {
             data.extend_from_slice(&value.to_le_bytes());
         }
@@ -286,6 +300,8 @@ impl Config {
             bundle_sealed_height: reader.u64().ok_or_else(|| cut("bundle_sealed_height"))?,
             bundle_sealed_slot: reader.u64().ok_or_else(|| cut("bundle_sealed_slot"))?,
             bundle_min_slots: reader.u64().ok_or_else(|| cut("bundle_min_slots"))?,
+            bmm_skip_slots: reader.u64().ok_or_else(|| cut("bmm_skip_slots"))?,
+            bmm_next_since_slot: reader.u64().ok_or_else(|| cut("bmm_next_since_slot"))?,
         })
     }
 }
@@ -613,6 +629,8 @@ mod tests {
             bundle_sealed_height: 990,
             bundle_sealed_slot: 77,
             bundle_min_slots: 1_000,
+            bmm_skip_slots: 9_000,
+            bmm_next_since_slot: 600,
         }
     }
 
@@ -883,7 +901,7 @@ mod tests {
     fn the_config_sits_at_the_offsets_that_the_validator_reads() {
         let data = a_config().encode();
         let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        assert_eq!(data.len(), 243);
+        assert_eq!(data.len(), 259);
         assert_eq!(&data[8..40], &[7u8; 32]);
         assert_eq!(at(64), 900);
         assert_eq!(at(80), 6);
@@ -900,6 +918,8 @@ mod tests {
         assert_eq!(at(219), 990);
         assert_eq!(at(227), 77);
         assert_eq!(at(235), 1_000);
+        assert_eq!(at(243), 9_000);
+        assert_eq!(at(251), 600);
     }
 
     #[test]
