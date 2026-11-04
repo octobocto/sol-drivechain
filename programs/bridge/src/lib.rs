@@ -27,6 +27,16 @@ pub fn min_fee_sats(waiting: u64) -> u64 {
 /// so a bundle stays near 260,000 weight units, below the standard 400,000.
 pub const MAX_BUNDLE_RECORDS: u64 = 1_500;
 
+/// A validator drops the BMM pairs this many eCash blocks below its tip
+/// (`PAIR_WINDOW` in the Agave patch).
+pub const PAIR_WINDOW: u64 = 4_032;
+
+/// True when no validator still holds a pair for eCash height `height`. The
+/// eCash tip is at least `credited_height`.
+pub fn pair_too_old(height: u64, credited_height: u64) -> bool {
+    height.saturating_add(PAIR_WINDOW) < credited_height
+}
+
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";
@@ -104,23 +114,22 @@ pub const RESERVED_KEYS: &[Pubkey] = &[
 pub mod bridge {
     use super::*;
 
-    /// Settles the commitment at eCash height `height`, which block
-    /// `block_hash` holds on the active chain. The commitment must be
-    /// SHA-256(`solana_block` ‖ payee), and `solana_block` must be in the
-    /// block record of this fork. The checkpoint must pass rule 3, the same
-    /// check as the fork choice. The payee gets the whole treasury, and the
-    /// cursor moves past `height`, so no lower height can settle later.
+    /// Settles eCash height `height`, which block `block_hash` holds on the
+    /// active chain. Heights settle one at a time, in order. The payee of a
+    /// valid checkpoint gets the whole treasury. A height with no
+    /// commitment, or a checkpoint that its own pair proves invalid, moves
+    /// the cursor with no payout. A commitment that no pair matches moves it
+    /// only after `bmm_skip_slots` without a settle, or at once when its
+    /// height is below the pair window.
     pub fn settle_bmm(
         ctx: Context<SettleBmm>,
         height: u64,
         block_hash: [u8; 32],
         solana_block: [u8; 32],
     ) -> Result<()> {
-        require_gte!(
-            height,
-            ctx.accounts.config.bmm_next_height,
-            BridgeError::HeightAlreadyPassed
-        );
+        let next = ctx.accounts.config.bmm_next_height;
+        require_gte!(height, next, BridgeError::HeightAlreadyPassed);
+        require_eq!(height, next, BridgeError::HeightNotNext);
         let answer = BmmAnswer::read(&ctx.accounts.bmm_answer)?;
         require!(
             answer.height == height
@@ -128,63 +137,48 @@ pub mod bridge {
                 && answer.solana_block == solana_block,
             BridgeError::AnswerForAnotherQuestion
         );
-        let commitment = answer.commitment.ok_or(BridgeError::NoCommitment)?;
         let payee = &ctx.accounts.payee;
-        require!(
-            commitment_of(&solana_block, &payee.key()) == commitment,
-            BridgeError::PairDoesNotMatch
-        );
-        require!(answer.recorded, BridgeError::BlockNotRecorded);
-        require!(
-            answer
-                .credited_height
-                .saturating_add(ctx.accounts.config.deposit_lag)
-                >= height,
-            BridgeError::TooFewCredits
-        );
-        require!(answer.credits_active, BridgeError::CreditsDropped);
-
-        let treasury = &ctx.accounts.treasury;
-        let config = &ctx.accounts.config;
-        let payout = treasury
-            .lamports()
-            .saturating_sub(Rent::get()?.minimum_balance(0));
-        let excluded = [
-            treasury.key(),
-            ctx.accounts.config.key(),
-            vault_pda(config.vault_bump)?,
-        ];
-        if payout > 0 && can_hold(payee, &excluded, payout)? {
-            let treasury_bump = ctx.accounts.config.treasury_bump;
-            let signer_seeds: &[&[&[u8]]] = &[&[TREASURY_SEED, &[treasury_bump]]];
-            transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.system_program.key(),
-                    Transfer {
-                        from: treasury.to_account_info(),
-                        to: payee.to_account_info(),
-                    },
-                    signer_seeds,
-                ),
-                payout,
-            )?;
-            let config = &mut ctx.accounts.config;
-            config.bmm_paid_total = config
-                .bmm_paid_total
-                .checked_add(payout)
-                .ok_or(BridgeError::AmountOverflow)?;
-            msg!(
-                "eCash height {} pays {} lamports to {}",
-                height,
-                payout,
-                payee.key()
-            );
-        } else {
-            msg!("eCash height {} pays nothing to {}", height, payee.key());
+        let slot = Clock::get()?.slot;
+        let pays = match answer.commitment {
+            None => {
+                msg!("eCash height {} holds no commitment", height);
+                false
+            }
+            Some(commitment) if commitment_of(&solana_block, &payee.key()) == commitment => {
+                let valid = answer.recorded
+                    && answer
+                        .credited_height
+                        .saturating_add(ctx.accounts.config.deposit_lag)
+                        >= height
+                    && answer.credits_active;
+                if !valid {
+                    msg!(
+                        "the pair of eCash height {} names an invalid checkpoint",
+                        height
+                    );
+                }
+                valid
+            }
+            Some(_) => {
+                let config = &ctx.accounts.config;
+                if pair_too_old(height, config.credited_height) {
+                    msg!("eCash height {} is below the pair window", height);
+                } else {
+                    let ripe = config
+                        .bmm_next_since_slot
+                        .saturating_add(config.bmm_skip_slots);
+                    require_gte!(slot, ripe, BridgeError::PairDoesNotMatch);
+                    msg!("eCash height {} waited too long for its pair", height);
+                }
+                false
+            }
+        };
+        if pays {
+            pay_treasury(ctx.accounts, height)?;
         }
-
         let config = &mut ctx.accounts.config;
         config.bmm_next_height = height.checked_add(1).ok_or(BridgeError::AmountOverflow)?;
+        config.bmm_next_since_slot = slot;
         Ok(())
     }
 
@@ -467,6 +461,52 @@ pub mod bridge {
         );
         Ok(())
     }
+}
+
+/// Pays the whole treasury above its reserve to the payee of a valid
+/// checkpoint at `height`, if the payee can hold it.
+fn pay_treasury(accounts: &mut SettleBmm, height: u64) -> Result<()> {
+    let payee = &accounts.payee;
+    let treasury = &accounts.treasury;
+    let config = &accounts.config;
+    let payout = treasury
+        .lamports()
+        .saturating_sub(Rent::get()?.minimum_balance(0));
+    let excluded = [
+        treasury.key(),
+        accounts.config.key(),
+        vault_pda(config.vault_bump)?,
+    ];
+    if payout > 0 && can_hold(payee, &excluded, payout)? {
+        let treasury_bump = accounts.config.treasury_bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[TREASURY_SEED, &[treasury_bump]]];
+        transfer(
+            CpiContext::new_with_signer(
+                accounts.system_program.key(),
+                Transfer {
+                    from: treasury.to_account_info(),
+                    to: payee.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            payout,
+        )?;
+        let config = &mut accounts.config;
+        config.bmm_paid_total = config
+            .bmm_paid_total
+            .checked_add(payout)
+            .ok_or(BridgeError::AmountOverflow)?;
+        msg!(
+            "eCash height {} pays {} lamports to {}",
+            height,
+            payout,
+            payee.key()
+        );
+    } else {
+        msg!("eCash height {} pays nothing to {}", height, payee.key());
+    }
+
+    Ok(())
 }
 
 fn vault_pda(bump: u8) -> Result<Pubkey> {
@@ -775,6 +815,11 @@ pub struct Config {
     pub bundle_sealed_slot: u64,
     /// The fewest slots between a seal and its `bundle_paid`.
     pub bundle_min_slots: u64,
+    /// A commitment that no pair matches can settle with no payout after
+    /// this many slots without a settle.
+    pub bmm_skip_slots: u64,
+    /// The slot of the newest settle, or of the genesis.
+    pub bmm_next_since_slot: u64,
 }
 
 #[account]
@@ -808,6 +853,8 @@ pub enum BridgeError {
     AmountOverflow,
     #[msg("The cursor is past this eCash height.")]
     HeightAlreadyPassed,
+    #[msg("The eCash height is not the next height to settle.")]
+    HeightNotNext,
     #[msg("The tx holds no BMM answer.")]
     NoAnswer,
     #[msg("The BMM answer is for another eCash height, eCash block, or Solana block.")]

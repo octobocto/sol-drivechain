@@ -304,6 +304,9 @@ enum Command {
         /// The fewest slots between a bundle seal and its `bundle_paid`.
         #[arg(long)]
         bundle_min_slots: u64,
+        /// The slots that a commitment without a pair blocks the BMM cursor.
+        #[arg(long)]
+        bmm_skip_slots: u64,
         /// The DEX accounts file. A carried account of the same key wins.
         #[arg(long)]
         dex_accounts: Option<PathBuf>,
@@ -1106,6 +1109,7 @@ fn main() -> Result<(), CliError> {
             oracle_lamports,
             float_lamports,
             bundle_min_slots,
+            bmm_skip_slots,
             dex_accounts,
             bootstrap_vote,
             bootstrap_stake,
@@ -1125,6 +1129,7 @@ fn main() -> Result<(), CliError> {
                 oracle_lamports,
                 float_lamports,
                 bundle_min_slots,
+                bmm_skip_slots,
                 lamports_per_byte_year,
                 ecash_start_height,
                 deposit_confirmations,
@@ -1753,6 +1758,8 @@ mod tests {
             bundle_sealed_height: 0,
             bundle_sealed_slot: 0,
             bundle_min_slots: 0,
+            bmm_skip_slots: 0,
+            bmm_next_since_slot: 0,
         }
     }
 

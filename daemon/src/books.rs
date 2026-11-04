@@ -373,6 +373,8 @@ mod tests {
             bundle_sealed_height: 0,
             bundle_sealed_slot: 0,
             bundle_min_slots: 0,
+            bmm_skip_slots: 0,
+            bmm_next_since_slot: 0,
         };
         data.paid_through = paid_through;
         data.bundled_through = bundled_through;

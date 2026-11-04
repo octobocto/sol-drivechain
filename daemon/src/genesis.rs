@@ -31,6 +31,8 @@ pub struct Params {
     pub float_lamports: u64,
     /// The fewest slots between a bundle seal and its `bundle_paid`.
     pub bundle_min_slots: u64,
+    /// The slots that a commitment without a pair blocks the BMM cursor.
+    pub bmm_skip_slots: u64,
     pub lamports_per_byte_year: u64,
     /// The eCash tip when the chain starts. BMM settles from this height,
     /// and a new chain counts the deposits up to it as credited.
@@ -204,6 +206,8 @@ pub fn accounts(
         bundle_sealed_height: 0,
         bundle_sealed_slot: 0,
         bundle_min_slots: params.bundle_min_slots,
+        bmm_skip_slots: params.bmm_skip_slots,
+        bmm_next_since_slot: 0,
     };
     let mut accounts: BTreeMap<Pubkey, Account> = BTreeMap::new();
     let mut put = |pubkey: Pubkey, lamports: u64, owner: Pubkey, data: Vec<u8>| {
@@ -662,6 +666,7 @@ mod tests {
             oracle_lamports: 1_000_000,
             float_lamports: 120_000,
             bundle_min_slots: 4_000,
+            bmm_skip_slots: 9_000,
             lamports_per_byte_year: 4,
             ecash_start_height: 500,
             deposit_confirmations: 6,
@@ -711,7 +716,7 @@ mod tests {
         let accounts = accounts(&params(), None, &[]).unwrap();
         let config = find(&accounts, &bridge::config_pda(&params().program_id).0);
         assert_eq!(config.data.len(), Config::LEN);
-        assert_eq!(config.lamports, (128 + 243) * 4);
+        assert_eq!(config.lamports, (128 + 259) * 4);
         assert_eq!(config.owner, params().program_id);
         let record = find(&accounts, &bridge::BMM_BLOCKS_ID);
         assert_eq!(record.data, vec![0u8; bridge::BLOCK_RECORD_LEN]);
