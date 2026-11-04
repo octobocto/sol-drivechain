@@ -1641,10 +1641,10 @@ index 1432f72..e77c934 100644
      "frozen-abi",
  ] }
 diff --git a/reserved-account-keys/src/lib.rs b/reserved-account-keys/src/lib.rs
-index 0f9cf44..7952475 100644
+index 0f9cf44..d49f39f 100644
 --- a/reserved-account-keys/src/lib.rs
 +++ b/reserved-account-keys/src/lib.rs
-@@ -181,6 +181,12 @@ static RESERVED_ACCOUNTS: std::sync::LazyLock<Vec<ReservedAccount>> =
+@@ -181,6 +181,13 @@ static RESERVED_ACCOUNTS: std::sync::LazyLock<Vec<ReservedAccount>> =
              // other
              ReservedAccount::new_active(native_loader::id()),
              ReservedAccount::new_active(sysvar::id()),
@@ -1652,6 +1652,7 @@ index 0f9cf44..7952475 100644
 +            // no tx may write it.
 +            ReservedAccount::new_active(sol_drivechain_bmm::BMM_ANSWER_ID),
 +            ReservedAccount::new_active(sol_drivechain_bmm::BMM_BLOCKS_ID),
++            ReservedAccount::new_active(sol_drivechain_bmm::BMM_PAID_ID),
 +            ReservedAccount::new_active(sol_drivechain_bmm::BMM_PARAMS_ID),
 +            ReservedAccount::new_active(sol_drivechain_bmm::DEPOSIT_ANSWER_ID),
          ]
@@ -2696,10 +2697,10 @@ index c8399cb..c4dec90 100644
                  && let Some(feature) = feature::state::from_account(&account)
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..dff00d0
+index 0000000..e13dcd0
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,948 @@
+@@ -0,0 +1,1031 @@
 +//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
@@ -2722,11 +2723,12 @@ index 0000000..dff00d0
 +use {
 +    super::Bank,
 +    sol_drivechain_bmm::{
-+        BLOCK_RECORD_LEN, BLOCK_RECORD_STRIDE, BMM_ANSWER_ID, BMM_BLOCKS_ID, BMM_PARAMS_ID,
-+        ChainParams, CreditQuestion, Credits, DEFAULT_CONFIRMATIONS, DEPOSIT_ANSWER_ID, Lookup,
-+        Question, RecordAnswer, RecordedBlock, Wait, answer_data, answers::answers,
-+        bmm_next_height, credit_deposits_question, deposit_answer_data, deposit_confirmations,
-+        find_recorded, fork_choice, held::held, record_block, refused_deposit_answer_data,
++        BLOCK_RECORD_LEN, BLOCK_RECORD_STRIDE, BMM_ANSWER_ID, BMM_BLOCKS_ID, BMM_PAID_ID,
++        BMM_PARAMS_ID, ChainParams, CreditQuestion, Credits, DEFAULT_CONFIRMATIONS,
++        DEPOSIT_ANSWER_ID, Lookup, PaidQuestion, Question, RecordAnswer, RecordedBlock, Wait,
++        answer_data, answers::answers, bmm_next_height, bundle_paid_question,
++        credit_deposits_question, deposit_answer_data, deposit_confirmations, find_recorded,
++        fork_choice, held::held, paid_answer_data, record_block, refused_deposit_answer_data,
 +        settle_bmm_question, view,
 +    },
 +    solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
@@ -2830,8 +2832,8 @@ index 0000000..dff00d0
 +            .and_then(|account| find_recorded(account.data(), bank_hash))
 +    }
 +
-+    /// Answers the first top-level `settle_bmm` or `credit_deposits` of each
-+    /// tx, or fails the tx. A replay of a slot at or below the start root
++    /// Answers the first top-level `settle_bmm`, `credit_deposits`, or
++    /// `bundle_paid` of each tx, or fails the tx. A replay of a slot at or below the start root
 +    /// takes the answer of the first run, because an eCash reorg after that
 +    /// run can drop the block that the tx names.
 +    pub(super) fn check_bmm_settles(
@@ -3040,6 +3042,8 @@ index 0000000..dff00d0
 +            (BridgeQuestion::Credit(question), Some(config)) => {
 +                self.credit_answer(question, &config, check, wait)
 +            }
++            (BridgeQuestion::Paid(question), None) => unpaid(question),
++            (BridgeQuestion::Paid(question), Some(_)) => self.paid_answer(question, check, wait),
 +        };
 +        let Lookup::Ready(Answer { key, data, kept }) = answer else {
 +            return answer.map(|answer| (answer.key, answer.data));
@@ -3057,6 +3061,31 @@ index 0000000..dff00d0
 +            );
 +        }
 +        Lookup::Ready((key, data))
++    }
++
++    /// Status 1 when block M at H, with K blocks on top for a replay and one
++    /// more for a leader, holds a Succeeded event for the M6ID.
++    fn paid_answer(&self, question: &PaidQuestion, check: BmmCheck, wait: Wait) -> Lookup<Answer> {
++        let root_depth = self
++            .bmm_params()
++            .map_or(fork_choice::params().root_depth, |params| params.root_depth);
++        let depth = match check {
++            BmmCheck::Leader | BmmCheck::Simulation => root_depth.saturating_add(1),
++            BmmCheck::Replay => root_depth,
++        };
++        view()
++            .deep_block(
++                question.height,
++                &question.block_hash,
++                depth,
++                question.height,
++                wait,
++            )
++            .map(|block| Answer {
++                key: BMM_PAID_ID,
++                data: paid_answer_data(question, block.paid.contains(&question.m6id)).to_vec(),
++                kept: true,
++            })
 +    }
 +
 +    fn settle_answer(
@@ -3205,10 +3234,19 @@ index 0000000..dff00d0
 +    })
 +}
 +
++fn unpaid(question: &PaidQuestion) -> Lookup<Answer> {
++    Lookup::Ready(Answer {
++        key: BMM_PAID_ID,
++        data: paid_answer_data(question, false).to_vec(),
++        kept: false,
++    })
++}
++
 +#[derive(Clone, Copy, Debug)]
 +enum BridgeQuestion {
 +    Settle(Question),
 +    Credit(CreditQuestion),
++    Paid(PaidQuestion),
 +}
 +
 +impl BridgeQuestion {
@@ -3216,6 +3254,7 @@ index 0000000..dff00d0
 +        settle_bmm_question(program_id, data)
 +            .map(Self::Settle)
 +            .or_else(|| credit_deposits_question(program_id, data).map(Self::Credit))
++            .or_else(|| bundle_paid_question(program_id, data).map(Self::Paid))
 +    }
 +}
 +
@@ -3256,6 +3295,11 @@ index 0000000..dff00d0
 +                            prev_hash: [height.wrapping_sub(1) as u8; 32],
 +                            commitment: None,
 +                            deposits: std::sync::Arc::from([]),
++                            paid: if height == 150 {
++                                std::sync::Arc::from([[0xaa; 32]])
++                            } else {
++                                std::sync::Arc::from([])
++                            },
 +                        },
 +                    )
 +                })
@@ -3494,6 +3538,46 @@ index 0000000..dff00d0
 +            Some(Err(TransactionError::InvalidProgramForExecution))
 +        );
 +        assert!(results.iter().all(not_ready));
++    }
++
++    fn bundle_paid(height: u64, block_hash: [u8; 32], m6id: [u8; 32]) -> Vec<u8> {
++        let mut data = sol_drivechain_bmm::BUNDLE_PAID_DISCRIMINATOR.to_vec();
++        data.extend_from_slice(&9u64.to_le_bytes());
++        data.extend_from_slice(&height.to_le_bytes());
++        data.extend_from_slice(&block_hash);
++        data.extend_from_slice(&m6id);
++        data
++    }
++
++    #[test]
++    fn a_bundle_paid_learns_whether_its_block_paid_the_m6id() {
++        let bank = bank_with_config(100, 40, 2);
++        let paid_of = |data: Vec<u8>, config_writable: bool| {
++            let result = check(&bank, tx(data, config_writable), BmmCheck::Leader).unwrap();
++            let (key, account) = result.runtime_account().unwrap();
++            assert_eq!(*key, BMM_PAID_ID);
++            account.data().to_vec()
++        };
++        let paid = paid_of(bundle_paid(150, [150; 32], [0xaa; 32]), true);
++        assert_eq!(paid[72], 1);
++        assert_eq!(paid[73..81], 150u64.to_le_bytes());
++        let other = paid_of(bundle_paid(150, [150; 32], [0xbb; 32]), true);
++        assert_eq!(other[72..], [0; 9]);
++        let unlocked = paid_of(bundle_paid(150, [150; 32], [0xaa; 32]), false);
++        assert_eq!(unlocked[72..], [0; 9]);
++        assert!(
++            check(
++                &bank,
++                tx(bundle_paid(150, [7; 32], [0xaa; 32]), true),
++                BmmCheck::Leader
++            )
++            .is_err()
++        );
++        assert!(not_ready(&check(
++            &bank,
++            tx(bundle_paid(199, [199; 32], [0xaa; 32]), true),
++            BmmCheck::Simulation
++        )));
 +    }
 +
 +    #[test]
@@ -4373,15 +4457,15 @@ index 0000000..bf37e56
 +}
 diff --git a/sol-drivechain-bmm/src/enforcer.rs b/sol-drivechain-bmm/src/enforcer.rs
 new file mode 100644
-index 0000000..2af21ea
+index 0000000..248a0d1
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/enforcer.rs
-@@ -0,0 +1,761 @@
+@@ -0,0 +1,873 @@
 +//! A small gRPC client for the enforcer `ValidatorService`. It holds only the
 +//! messages that the BMM view reads, so Agave needs no proto build step.
 +
 +use {
-+    crate::{BlockHash, Commitment, Deposit},
++    crate::{BlockHash, Commitment, Deposit, M6id},
 +    tonic::{codegen::http::uri::PathAndQuery, transport::Channel},
 +    tonic_prost::ProstCodec,
 +};
@@ -4421,6 +4505,8 @@ index 0000000..2af21ea
 +    BadBlockHash(String),
 +    #[error("the enforcer gave a deposit address that is not hex: {0}")]
 +    BadDepositAddress(String),
++    #[error("the enforcer gave an M6ID that is not 32 bytes of hex: {0}")]
++    BadM6id(String),
 +}
 +
 +impl EnforcerError {
@@ -4562,12 +4648,36 @@ index 0000000..2af21ea
 +    pub output: Option<DepositOutput>,
 +}
 +
-+/// One event of a `BlockInfo`. The enforcer sends a oneof, and this reads
-+/// only its deposit case.
++/// One event of a `BlockInfo`. The enforcer sends a oneof of a deposit and a
++/// withdrawal bundle event.
 +#[derive(Clone, PartialEq, prost::Message)]
 +pub struct BlockEvent {
 +    #[prost(message, optional, tag = "1")]
 +    pub deposit: Option<DepositMessage>,
++    #[prost(message, optional, tag = "2")]
++    pub withdrawal_bundle: Option<BundleMessage>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct Empty {}
++
++/// The oneof of `WithdrawalBundleEvent.Event`. This reads only which case it is.
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct BundleEventKind {
++    #[prost(message, optional, tag = "1")]
++    pub failed: Option<Empty>,
++    #[prost(message, optional, tag = "2")]
++    pub succeeded: Option<Empty>,
++    #[prost(message, optional, tag = "3")]
++    pub submitted: Option<Empty>,
++}
++
++#[derive(Clone, PartialEq, prost::Message)]
++pub struct BundleMessage {
++    #[prost(message, optional, tag = "1")]
++    pub m6id: Option<HexValue>,
++    #[prost(message, optional, tag = "2")]
++    pub event: Option<BundleEventKind>,
 +}
 +
 +#[derive(Clone, PartialEq, prost::Message)]
@@ -4738,15 +4848,15 @@ index 0000000..2af21ea
 +}
 +
 +impl Enforcer {
-+    /// The deposits of each block after `start` (when set) up to `end`, both
-+    /// in reversed hex, per block hash. The enforcer leaves out a block
-+    /// without an event for the sidechain.
++    /// The deposits and the paid M6IDs of each block after `start` (when set)
++    /// up to `end`, both in reversed hex, per block hash. The enforcer leaves
++    /// out a block without an event for the sidechain.
 +    pub async fn deposits(
 +        &mut self,
 +        sidechain_slot: u8,
 +        start: Option<&str>,
 +        end: &str,
-+    ) -> Result<Vec<(BlockHash, Vec<Deposit>)>, EnforcerError> {
++    ) -> Result<Vec<(BlockHash, Vec<Deposit>, Vec<M6id>)>, EnforcerError> {
 +        const CALL: &str = "GetTwoWayPegData";
 +        let response: GetTwoWayPegDataResponse = self
 +            .unary(
@@ -4770,15 +4880,8 @@ index 0000000..2af21ea
 +                    field: "block_header_info",
 +                })?;
 +                let hash = decode_block_hash(&header(info, CALL)?.hash)?;
-+                let deposits = item
-+                    .block_info
-+                    .map(|info| info.events)
-+                    .unwrap_or_default()
-+                    .into_iter()
-+                    .filter_map(|event| event.deposit)
-+                    .map(deposit)
-+                    .collect::<Result<Vec<_>, _>>()?;
-+                Ok((hash, deposits))
++                let (deposits, paid) = block_events(item.block_info)?;
++                Ok((hash, deposits, paid))
 +            })
 +            .collect()
 +    }
@@ -4801,6 +4904,35 @@ index 0000000..2af21ea
 +            .value,
 +        address,
 +    })
++}
++
++/// The deposits and the M6IDs of the Succeeded bundle events of a block.
++fn block_events(info: Option<BlockInfo>) -> Result<(Vec<Deposit>, Vec<M6id>), EnforcerError> {
++    let mut deposits = Vec::new();
++    let mut paid = Vec::new();
++    for event in info.map(|info| info.events).unwrap_or_default() {
++        if let Some(message) = event.deposit {
++            deposits.push(deposit(message)?);
++        }
++        if let Some(bundle) = event.withdrawal_bundle
++            && bundle.event.is_some_and(|kind| kind.succeeded.is_some())
++        {
++            paid.push(decode_m6id(bundle.m6id)?);
++        }
++    }
++    Ok((deposits, paid))
++}
++
++/// Reads a ConsensusHex M6ID in its own byte order.
++fn decode_m6id(value: Option<HexValue>) -> Result<M6id, EnforcerError> {
++    let text = hex_text(value).ok_or(EnforcerError::MissingField {
++        call: "GetTwoWayPegData",
++        field: "withdrawal_bundle.m6id",
++    })?;
++    hex::decode(&text)
++        .ok()
++        .and_then(|bytes| bytes.try_into().ok())
++        .ok_or(EnforcerError::BadM6id(text))
 +}
 +
 +fn hex_value(text: &str) -> HexValue {
@@ -4884,7 +5016,7 @@ index 0000000..2af21ea
 +            let last = index_of(request.end_block_hash, false)?;
 +            let blocks = self.0[first..=last]
 +                .iter()
-+                .filter(|(_, block)| !block.deposits.is_empty())
++                .filter(|(_, block)| !block.deposits.is_empty() || !block.paid.is_empty())
 +                .map(|(height, block)| PegDataItem {
 +                    block_header_info: Some(BlockHeaderInfo {
 +                        block_hash: Some(hex_value(&reverse_hex(&block.hash))),
@@ -4907,7 +5039,18 @@ index 0000000..2af21ea
 +                                        }),
 +                                    }),
 +                                }),
++                                withdrawal_bundle: None,
 +                            })
++                            .chain(block.paid.iter().map(|m6id| BlockEvent {
++                                deposit: None,
++                                withdrawal_bundle: Some(BundleMessage {
++                                    m6id: Some(hex_value(&hex::encode(m6id))),
++                                    event: Some(BundleEventKind {
++                                        succeeded: Some(Empty {}),
++                                        ..BundleEventKind::default()
++                                    }),
++                                }),
++                            }))
 +                            .collect(),
 +                    }),
 +                })
@@ -4999,15 +5142,37 @@ index 0000000..2af21ea
 +    }
 +
 +    #[test]
-+    fn a_deposit_reads_from_the_wire() {
-+        // Field numbers from cusf/mainchain/v1/validator.proto. Event tag 2 is
-+        // a withdrawal bundle, which this reader skips.
++    fn the_deposits_and_the_paid_bundles_read_from_the_wire() {
++        // Field numbers from cusf/mainchain/v1/validator.proto.
++        #[derive(Clone, PartialEq, prost::Message)]
++        struct WireSucceeded {
++            #[prost(message, optional, tag = "1")]
++            sequence_number: Option<UInt64Value>,
++            #[prost(message, optional, tag = "2")]
++            transaction: Option<HexValue>,
++        }
++        #[derive(Clone, PartialEq, prost::Message)]
++        struct WireKind {
++            #[prost(message, optional, tag = "1")]
++            failed: Option<Empty>,
++            #[prost(message, optional, tag = "2")]
++            succeeded: Option<WireSucceeded>,
++            #[prost(message, optional, tag = "3")]
++            submitted: Option<Empty>,
++        }
++        #[derive(Clone, PartialEq, prost::Message)]
++        struct WireBundle {
++            #[prost(message, optional, tag = "1")]
++            m6id: Option<HexValue>,
++            #[prost(message, optional, tag = "2")]
++            event: Option<WireKind>,
++        }
 +        #[derive(Clone, PartialEq, prost::Message)]
 +        struct WireEvent {
 +            #[prost(message, optional, tag = "1")]
 +            deposit: Option<DepositMessage>,
 +            #[prost(message, optional, tag = "2")]
-+            bundle: Option<StringValue>,
++            bundle: Option<WireBundle>,
 +        }
 +        #[derive(Clone, PartialEq, prost::Message)]
 +        struct WireInfo {
@@ -5016,13 +5181,43 @@ index 0000000..2af21ea
 +            #[prost(message, repeated, tag = "2")]
 +            events: Vec<WireEvent>,
 +        }
++        let bundle = |byte: u8, kind: WireKind| WireEvent {
++            deposit: None,
++            bundle: Some(WireBundle {
++                m6id: Some(hex_value(&hex::encode([byte; 32]))),
++                event: Some(kind),
++            }),
++        };
++        let mut m6id = [0x33; 32];
++        m6id[0] = 0x01;
 +        let wire = WireInfo {
 +            bmm_commitment: Some(hex_value(&"11".repeat(32))),
 +            events: vec![
++                bundle(
++                    0x22,
++                    WireKind {
++                        failed: Some(Empty {}),
++                        ..WireKind::default()
++                    },
++                ),
++                bundle(
++                    0x44,
++                    WireKind {
++                        submitted: Some(Empty {}),
++                        ..WireKind::default()
++                    },
++                ),
 +                WireEvent {
 +                    deposit: None,
-+                    bundle: Some(StringValue {
-+                        value: "m6".to_owned(),
++                    bundle: Some(WireBundle {
++                        m6id: Some(hex_value(&hex::encode(m6id))),
++                        event: Some(WireKind {
++                            succeeded: Some(WireSucceeded {
++                                sequence_number: Some(UInt64Value { value: 3 }),
++                                transaction: Some(hex_value("00ff")),
++                            }),
++                            ..WireKind::default()
++                        }),
 +                    }),
 +                },
 +                WireEvent {
@@ -5038,12 +5233,7 @@ index 0000000..2af21ea
 +            ],
 +        };
 +        let info = BlockInfo::decode(wire.encode_to_vec().as_slice()).unwrap();
-+        let deposits: Vec<Deposit> = info
-+            .events
-+            .into_iter()
-+            .filter_map(|event| event.deposit)
-+            .map(|message| deposit(message).unwrap())
-+            .collect();
++        let (deposits, paid) = block_events(Some(info)).unwrap();
 +        assert_eq!(
 +            deposits,
 +            vec![Deposit {
@@ -5052,6 +5242,11 @@ index 0000000..2af21ea
 +                address: b"ab".to_vec(),
 +            }]
 +        );
++        assert_eq!(paid, vec![m6id]);
++        assert!(matches!(
++            decode_m6id(Some(hex_value("abcd"))),
++            Err(EnforcerError::BadM6id(_))
++        ));
 +    }
 +
 +    #[test]
@@ -5092,6 +5287,7 @@ index 0000000..2af21ea
 +            prev_hash: [byte.wrapping_sub(1); 32],
 +            commitment: None,
 +            deposits: deposits.into(),
++            paid: std::sync::Arc::from([]),
 +        }
 +    }
 +
@@ -5108,7 +5304,7 @@ index 0000000..2af21ea
 +            )
 +            .await
 +            .unwrap();
-+        assert_eq!(read, vec![([1; 32], vec![big])]);
++        assert_eq!(read, vec![([1; 32], vec![big], vec![])]);
 +    }
 +
 +    #[tokio::test]
@@ -5120,7 +5316,7 @@ index 0000000..2af21ea
 +            .deposits(8, None, &fake::reverse_hex(&[1; 32]))
 +            .await
 +            .unwrap();
-+        assert_eq!(read, vec![([1; 32], vec![big])]);
++        assert_eq!(read, vec![([1; 32], vec![big], vec![])]);
 +    }
 +
 +    #[tokio::test]
@@ -8045,10 +8241,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..793c81f
+index 0000000..72cb521
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,1932 @@
+@@ -0,0 +1,2031 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -8095,6 +8291,22 @@ index 0000000..793c81f
 +/// it for each tx, the same way as the instructions sysvar.
 +pub const BMM_ANSWER_ID: Pubkey =
 +    Pubkey::from_str_const("BmmAnswer1111111111111111111111111111111111");
++
++/// The account that holds the answer for one `bundle_paid`. The runtime
++/// builds it for each tx, the same way as the instructions sysvar.
++pub const BMM_PAID_ID: Pubkey =
++    Pubkey::from_str_const("BmmPaid111111111111111111111111111111111111");
++
++/// The length of the `BmmPaid` data: height, block hash, M6ID, status, and
++/// the height of the Succeeded event.
++pub const BMM_PAID_LEN: usize = 8 + 32 + 32 + 1 + 8;
++
++/// The Anchor discriminator of `bundle_paid`:
++/// sha256("global:bundle_paid")[..8].
++pub const BUNDLE_PAID_DISCRIMINATOR: [u8; 8] = [252, 58, 105, 195, 106, 211, 35, 52];
++
++/// The ID of a withdrawal bundle, in the byte order of its ConsensusHex.
++pub type M6id = [u8; 32];
 +
 +/// The account that holds the block record: the last block of each
 +/// `BLOCK_RECORD_STRIDE` slots on the fork, for `BLOCK_RECORD_ENTRIES`
@@ -8463,6 +8675,50 @@ index 0000000..793c81f
 +    data
 +}
 +
++/// What a `bundle_paid` instruction names: the eCash height and block of the
++/// Succeeded event, and the M6ID.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct PaidQuestion {
++    pub height: u64,
++    pub block_hash: BlockHash,
++    pub m6id: M6id,
++}
++
++/// The question of a `bundle_paid(through, height, block_hash, m6id)`
++/// instruction, or `None` for any other instruction.
++pub fn bundle_paid_question(program_id: &Pubkey, data: &[u8]) -> Option<PaidQuestion> {
++    if program_id != &BRIDGE_PROGRAM_ID {
++        return None;
++    }
++    let (discriminator, arguments) = data.split_first_chunk::<8>()?;
++    if discriminator != &BUNDLE_PAID_DISCRIMINATOR {
++        return None;
++    }
++    let (_through, rest) = arguments.split_first_chunk::<8>()?;
++    let (height, rest) = rest.split_first_chunk::<8>()?;
++    let (block_hash, rest) = rest.split_first_chunk::<32>()?;
++    let m6id = rest.first_chunk::<32>()?;
++    Some(PaidQuestion {
++        height: u64::from_le_bytes(*height),
++        block_hash: *block_hash,
++        m6id: *m6id,
++    })
++}
++
++/// The data of the `BmmPaid` account. Status 1 and the paid height H when
++/// block `block_hash` at H holds a Succeeded event for the M6ID, else 0.
++pub fn paid_answer_data(question: &PaidQuestion, paid: bool) -> [u8; BMM_PAID_LEN] {
++    let mut data = [0u8; BMM_PAID_LEN];
++    data[..8].copy_from_slice(&question.height.to_le_bytes());
++    data[8..40].copy_from_slice(&question.block_hash);
++    data[40..72].copy_from_slice(&question.m6id);
++    if paid {
++        data[72] = 1;
++        data[73..81].copy_from_slice(&question.height.to_le_bytes());
++    }
++    data
++}
++
 +/// What a `credit_deposits` instruction names: the eCash height, the eCash
 +/// block, the index of the first deposit, and the deposit count.
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8668,6 +8924,8 @@ index 0000000..793c81f
 +    pub commitment: Option<Commitment>,
 +    /// The deposits to the sidechain, in block order.
 +    pub deposits: Arc<[Deposit]>,
++    /// The M6IDs of the withdrawal bundles with a Succeeded event here.
++    pub paid: Arc<[M6id]>,
 +}
 +
 +/// What the view gives for a question.
@@ -9119,6 +9377,7 @@ index 0000000..793c81f
 +                        prev_hash: hash(low.wrapping_sub(1).wrapping_add(salt)),
 +                        commitment: (height % 2 == 0).then_some([low; 32]),
 +                        deposits: Arc::from([]),
++                        paid: Arc::from([]),
 +                    },
 +                )
 +            })
@@ -9142,11 +9401,45 @@ index 0000000..793c81f
 +    }
 +
 +    #[test]
++    fn a_bundle_paid_instruction_gives_its_question_and_answer() {
++        let mut data = BUNDLE_PAID_DISCRIMINATOR.to_vec();
++        data.extend_from_slice(&7u64.to_le_bytes());
++        data.extend_from_slice(&120u64.to_le_bytes());
++        data.extend_from_slice(&[4; 32]);
++        data.extend_from_slice(&[6; 32]);
++        let question = PaidQuestion {
++            height: 120,
++            block_hash: [4; 32],
++            m6id: [6; 32],
++        };
++        assert_eq!(
++            bundle_paid_question(&BRIDGE_PROGRAM_ID, &data),
++            Some(question)
++        );
++        assert_eq!(bundle_paid_question(&Pubkey::default(), &data), None);
++        assert_eq!(
++            bundle_paid_question(&BRIDGE_PROGRAM_ID, &data[..data.len() - 1]),
++            None
++        );
++        let paid = paid_answer_data(&question, true);
++        assert_eq!(paid[..8], 120u64.to_le_bytes());
++        assert_eq!(paid[8..40], [4; 32]);
++        assert_eq!(paid[40..72], [6; 32]);
++        assert_eq!(paid[72], 1);
++        assert_eq!(paid[73..81], 120u64.to_le_bytes());
++        let unpaid = paid_answer_data(&question, false);
++        assert_eq!(unpaid[..72], paid[..72]);
++        assert_eq!(unpaid[72..], [0; 9]);
++    }
++
++    #[test]
 +    fn the_discriminator_is_eight_bytes_of_sha256() {
 +        let digest = solana_sha256_hasher::hash(b"global:settle_bmm").to_bytes();
 +        assert_eq!(SETTLE_BMM_DISCRIMINATOR, digest[..8]);
 +        let digest = solana_sha256_hasher::hash(b"global:credit_deposits").to_bytes();
 +        assert_eq!(CREDIT_DEPOSITS_DISCRIMINATOR, digest[..8]);
++        let digest = solana_sha256_hasher::hash(b"global:bundle_paid").to_bytes();
++        assert_eq!(BUNDLE_PAID_DISCRIMINATOR, digest[..8]);
 +        let digest = solana_sha256_hasher::hash(b"account:Config").to_bytes();
 +        assert_eq!(CONFIG_DISCRIMINATOR, digest[..8]);
 +    }
@@ -9296,6 +9589,7 @@ index 0000000..793c81f
 +                deposit(5, b"junk"),
 +                deposit(6, key.to_string().as_bytes()),
 +            ]),
++            paid: Arc::from([]),
 +        };
 +        let question = CreditQuestion {
 +            height: 50,
@@ -9503,6 +9797,7 @@ index 0000000..793c81f
 +                        prev_hash: hash((height as u8).wrapping_sub(1)),
 +                        commitment,
 +                        deposits: Arc::from([]),
++                        paid: Arc::from([]),
 +                    },
 +                )
 +            })
@@ -9983,10 +10278,10 @@ index 0000000..793c81f
 +}
 diff --git a/sol-drivechain-bmm/src/pairs.rs b/sol-drivechain-bmm/src/pairs.rs
 new file mode 100644
-index 0000000..6bfac3a
+index 0000000..aa0b90d
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/pairs.rs
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,718 @@
 +//! The published pairs. A bidder sends the Solana block hash and the payee of
 +//! its bid to the validators, outside any transaction. A commitment h* counts
 +//! only when a pair with SHA-256(block hash ‖ payee) = h* is known.
@@ -10365,6 +10660,7 @@ index 0000000..6bfac3a
 +                        prev_hash: [(height as u8).wrapping_sub(1); 32],
 +                        commitment: (height == 105).then(|| pair(5).commitment()),
 +                        deposits: std::sync::Arc::from([]),
++                        paid: std::sync::Arc::from([]),
 +                    },
 +                )
 +            })
@@ -10534,6 +10830,7 @@ index 0000000..6bfac3a
 +                        prev_hash: [(height as u8).wrapping_add(49); 32],
 +                        commitment: None,
 +                        deposits: std::sync::Arc::from([]),
++                        paid: std::sync::Arc::from([]),
 +                    },
 +                )
 +            })
@@ -10961,10 +11258,10 @@ index 0000000..5c29dcd
 +}
 diff --git a/sol-drivechain-bmm/src/poller.rs b/sol-drivechain-bmm/src/poller.rs
 new file mode 100644
-index 0000000..7d2ee05
+index 0000000..92b4529
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/poller.rs
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,420 @@
 +//! Copies the active eCash chain from the local enforcer into the view.
 +
 +use {
@@ -11221,6 +11518,7 @@ index 0000000..7d2ee05
 +                    prev_hash: decode_block_hash(&header.prev_hash)?,
 +                    commitment,
 +                    deposits: Arc::from([]),
++                    paid: Arc::from([]),
 +                },
 +            ));
 +        }
@@ -11241,7 +11539,8 @@ index 0000000..7d2ee05
 +    Ok(blocks)
 +}
 +
-+/// Puts the deposits of each block of `blocks`, from low to high, in place.
++/// Puts the deposits and the paid M6IDs of each block of `blocks`, from low
++/// to high, in place.
 +/// A reply above the size limit splits its span in two, down to one block,
 +/// so a large block cannot stop the reads of the other blocks.
 +async fn read_deposits(
@@ -11275,10 +11574,14 @@ index 0000000..7d2ee05
 +            }
 +            Err(error) => return Err(error),
 +        };
-+        let mut deposits: HashMap<BlockHash, Vec<_>> = read.into_iter().collect();
++        let mut events: HashMap<BlockHash, _> = read
++            .into_iter()
++            .map(|(hash, deposits, paid)| (hash, (deposits, paid)))
++            .collect();
 +        for (_, block) in &mut blocks[first..end] {
-+            if let Some(found) = deposits.remove(&block.hash) {
-+                block.deposits = Arc::from(found);
++            if let Some((deposits, paid)) = events.remove(&block.hash) {
++                block.deposits = Arc::from(deposits);
++                block.paid = Arc::from(paid);
 +            }
 +        }
 +    }
@@ -11301,6 +11604,7 @@ index 0000000..7d2ee05
 +            prev_hash: [prev; 32],
 +            commitment: None,
 +            deposits: Arc::from([]),
++            paid: Arc::from([]),
 +        }
 +    }
 +
@@ -11318,6 +11622,8 @@ index 0000000..7d2ee05
 +        chain[2].1.deposits = Arc::from([deposit(1, heavy)]);
 +        chain[3].1.deposits = Arc::from([deposit(2, heavy)]);
 +        chain[5].1.deposits = Arc::from([deposit(3, 10)]);
++        chain[4].1.paid = Arc::from([[0x55; 32]]);
++        chain[5].1.paid = Arc::from([[0x66; 32], [0x67; 32]]);
 +        let url = fake::serve(chain.clone());
 +        let mut enforcer = Enforcer::connect(&url).await.unwrap();
 +        let mut blocks: Vec<(u64, Block)> = chain
@@ -11327,6 +11633,7 @@ index 0000000..7d2ee05
 +                    *height,
 +                    Block {
 +                        deposits: Arc::from([]),
++                        paid: Arc::from([]),
 +                        ..found.clone()
 +                    },
 +                )
