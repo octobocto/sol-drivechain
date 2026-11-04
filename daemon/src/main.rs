@@ -1303,18 +1303,24 @@ fn main() -> Result<(), CliError> {
                 (None, Some(commitment)) => fixed_hash::<32>(commitment, "commitment")?,
                 (None, None) => return Err(CliError::NoCommitment),
             };
-            let txid = enforcer.create_bmm_request(sats, tip, &h_star).await?;
-            println!("bid {sats} sats for eCash height {height} as {txid}");
             println!("commitment {}", sol_drivechain_daemon::hex::encode(&h_star));
             if let Some(pair) = pair {
                 println!("block {}", Pubkey::new_from_array(pair.block));
                 println!("payee {}", pair.payee);
-                if !withhold {
+            }
+            let publish = |pair: bmm::Pair| {
+                let rpc = rpc.clone();
+                async move {
                     for outcome in bmm::publish_pairs(&rpc, &[pair]).await? {
                         println!("pair {outcome}");
                     }
+                    Ok::<_, CliError>(())
                 }
-            }
+            };
+            let request =
+                async { Ok::<_, CliError>(enforcer.create_bmm_request(sats, tip, &h_star).await?) };
+            let txid = publish_before_bid(pair, withhold, publish, request).await?;
+            println!("bid {sats} sats for eCash height {height} as {txid}");
             Ok(())
         }),
         Command::PublishPair {
@@ -1564,6 +1570,23 @@ fn read_state(path: &PathBuf) -> Result<migrate::State, CliError> {
 
 /// Waits for a recorded block of the followed branch that passes rule 3 for
 /// the next eCash block. Gives the eCash tip of the check and the block.
+async fn publish_before_bid<T, E, P, PF, B>(
+    pair: Option<bmm::Pair>,
+    withhold: bool,
+    publish: P,
+    bid: B,
+) -> Result<T, E>
+where
+    P: FnOnce(bmm::Pair) -> PF,
+    PF: std::future::Future<Output = Result<(), E>>,
+    B: std::future::Future<Output = Result<T, E>>,
+{
+    if let Some(pair) = pair.filter(|_| !withhold) {
+        publish(pair).await?;
+    }
+    bid.await
+}
+
 async fn wait_for_bid_block(
     rpc: &std::sync::Arc<solana_rpc_client::nonblocking::rpc_client::RpcClient>,
     enforcer: &mut Enforcer,
@@ -1604,6 +1627,38 @@ async fn wait_for_bid_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_cli_publishes_its_pair_before_the_bid_and_withhold_keeps_it_back() {
+        let pair = bmm::Pair {
+            height: 7,
+            block: [1; 32],
+            payee: Pubkey::new_unique(),
+        };
+        for withhold in [false, true] {
+            let events = std::sync::Mutex::new(Vec::new());
+            let publish = |pair: bmm::Pair| {
+                events
+                    .lock()
+                    .unwrap()
+                    .push(format!("publish {}", pair.height));
+                async { Ok::<_, ()>(()) }
+            };
+            let bid = async {
+                events.lock().unwrap().push("bid".to_string());
+                Err::<(), ()>(())
+            };
+            assert!(publish_before_bid(Some(pair), withhold, publish, bid)
+                .await
+                .is_err());
+            let expected = if withhold {
+                vec!["bid"]
+            } else {
+                vec!["publish 7", "bid"]
+            };
+            assert_eq!(*events.lock().unwrap(), expected);
+        }
+    }
 
     #[test]
     fn an_empty_hash_reads_as_zeros() {
