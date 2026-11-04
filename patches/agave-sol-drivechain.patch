@@ -2696,10 +2696,10 @@ index c8399cb..c4dec90 100644
                  && let Some(feature) = feature::state::from_account(&account)
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..603c1b3
+index 0000000..dff00d0
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,934 @@
+@@ -0,0 +1,948 @@
 +//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
@@ -2763,6 +2763,9 @@ index 0000000..603c1b3
 +        }
 +    }
 +}
++
++/// A vote account with less than this part of the epoch stake pays its fee.
++const MIN_VOTE_STAKE_PARTS: u64 = 1_000;
 +
 +impl Bank {
 +    /// Writes the parent into the block record when it is the last block of
@@ -2925,7 +2928,8 @@ index 0000000..603c1b3
 +    }
 +
 +    /// True for a simple vote that pays no signature fee: its vote account
-+    /// holds stake in the epoch stakes and its authorized voter signs it.
++    /// holds at least 1/`MIN_VOTE_STAKE_PARTS` of the epoch stake and its
++    /// authorized voter signs it.
 +    pub fn is_staked_vote(&self, tx: &impl TransactionWithMeta) -> bool {
 +        tx.is_simple_vote_transaction() && self.is_staked_vote_message(tx)
 +    }
@@ -2970,7 +2974,7 @@ index 0000000..603c1b3
 +        else {
 +            return false;
 +        };
-+        if *stake == 0 {
++        if stake.saturating_mul(MIN_VOTE_STAKE_PARTS) < self.get_current_epoch_total_stake() {
 +            return false;
 +        }
 +        let Some(voter) = vote_account
@@ -3532,10 +3536,11 @@ index 0000000..603c1b3
 +        };
 +        let staked = ValidatorVoteKeypairs::new_rand();
 +        let unstaked = ValidatorVoteKeypairs::new_rand();
++        let tiny = ValidatorVoteKeypairs::new_rand();
 +        let mut genesis = create_genesis_config_with_vote_accounts(
 +            1_000_000_000_000,
-+            &[&staked, &unstaked],
-+            vec![1_000_000_000, 0],
++            &[&staked, &unstaked, &tiny],
++            vec![1_000_000_000, 0, 900_000],
 +        );
 +        genesis.genesis_config.fee_rate_governor =
 +            solana_fee_calculator::FeeRateGovernor::new(5_000, 0);
@@ -3598,6 +3603,11 @@ index 0000000..603c1b3
 +            Hash::default(),
 +        );
 +        assert_eq!(vote_fee(&bank, transfer), 5_000);
++        let tiny_authority = voter_of(&tiny);
++        assert_eq!(
++            vote_fee(&bank, vote_tx(tiny.vote_keypair.pubkey(), &tiny_authority)),
++            5_000
++        );
 +        let estimate = |vote_key: Pubkey, signer: &Keypair| {
 +            let instruction = vote_instruction::tower_sync(
 +                &vote_key,
@@ -3619,6 +3629,10 @@ index 0000000..603c1b3
 +        assert_eq!(estimate(staked.vote_keypair.pubkey(), &authority), Some(0));
 +        assert_eq!(
 +            estimate(staked.vote_keypair.pubkey(), &stranger),
++            Some(5_000)
++        );
++        assert_eq!(
++            estimate(tiny.vote_keypair.pubkey(), &tiny_authority),
 +            Some(5_000)
 +        );
 +    }
