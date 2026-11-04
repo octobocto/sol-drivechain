@@ -308,10 +308,8 @@ leader queue for at most 30 seconds, with at most 4 txs per fee payer. Only
 a fee payer that holds the fee gets a place in the queue. A
 question that no new eCash block can answer leaves the queue at once. On
 replay, the questions of one slot wait 10 seconds in all for a late eCash
-block, and then the block is dead. A question for a block more than 2 blocks
-past the view is dead only when a read of the enforcer that started after the
-question still does not hold it. A slow read waits within the slot and leader
-waits. While the enforcer does not answer, the
+block, and then the block is dead. The slots of one leader in one epoch wait
+60 seconds in all. While the enforcer does not answer, the
 replay waits and marks no block dead. A leader needs one more block than
 replay, so a healthy node never waits.
 

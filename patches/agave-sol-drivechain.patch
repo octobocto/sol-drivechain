@@ -2684,10 +2684,10 @@ index c8399cb..c4dec90 100644
                  && let Some(feature) = feature::state::from_account(&account)
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..29693b9
+index 0000000..79ec97c
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,1061 @@
+@@ -0,0 +1,1065 @@
 +//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
@@ -3018,7 +3018,11 @@ index 0000000..29693b9
 +            .and_then(|_| self.bmm_start_config());
 +        let wait = match check {
 +            BmmCheck::Leader | BmmCheck::Simulation => Wait::No,
-+            BmmCheck::Replay => Wait::Replay { slot: self.slot() },
++            BmmCheck::Replay => Wait::Replay {
++                slot: self.slot(),
++                leader: self.leader_id().to_bytes(),
++                epoch: self.epoch(),
++            },
 +        };
 +        let answer = match (question, config) {
 +            (BridgeQuestion::Settle(question), None) => refused_settle(question),
@@ -8260,10 +8264,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..1505294
+index 0000000..1958208
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2098 @@
+@@ -0,0 +1,2092 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -8468,6 +8472,10 @@ index 0000000..1505294
 +/// The questions of one replayed slot wait this long in all for a late
 +/// eCash block, while the enforcer answers.
 +pub const REPLAY_WAIT: Duration = Duration::from_secs(10);
++
++/// The replayed slots of one leader in one epoch wait this long in all, so a
++/// staked leader cannot make each of its blocks wait `REPLAY_WAIT`.
++pub const LEADER_REPLAY_WAIT: Duration = Duration::from_secs(60);
 +
 +/// The size of the `BmmAnswer` data: height, block hash, found, commitment,
 +/// Solana block, recorded, credited height, credits active.
@@ -8993,15 +9001,19 @@ index 0000000..1505294
 +pub enum Wait {
 +    /// A leader or a simulation: no wait.
 +    No,
-+    /// Replay of `slot`. All questions of one slot share `REPLAY_WAIT`. While
-+    /// the enforcer does not answer, the wait has no limit, so an outage
-+    /// stops the replay and marks no block dead.
-+    Replay { slot: u64 },
++    /// Replay of `slot` of `leader` in `epoch`. All questions of one slot
++    /// share `REPLAY_WAIT`, and all slots of the leader in the epoch share
++    /// `LEADER_REPLAY_WAIT`. While the enforcer does not answer, the wait has
++    /// no limit, so an outage stops the replay and marks no block dead.
++    Replay {
++        slot: u64,
++        leader: [u8; 32],
++        epoch: u64,
++    },
 +}
 +
 +/// A question may name a block this many eCash blocks above what the view can
 +/// answer now. A replay then waits for the enforcer, and a leader tries again.
-+/// A block further up is `Never`, so a leader cannot make each replay wait.
 +pub const MAX_AHEAD: u64 = 2;
 +
 +/// The view drops blocks this far below the tip, except a backfill that a
@@ -9048,12 +9060,12 @@ index 0000000..1505294
 +    generation: u64,
 +    /// The last time the poller read the enforcer.
 +    synced_at: Option<Instant>,
-+    /// The start of the last read of the enforcer that completed.
-+    read_started: Option<Instant>,
 +    /// The exit flag of the poller. `None` while no poller runs.
 +    exit: Option<Arc<AtomicBool>>,
 +    /// The end of the wait of each replayed slot.
 +    budgets: HashMap<u64, Duration>,
++    /// The wait that each leader has left in an epoch.
++    leader_budgets: HashMap<([u8; 32], u64), Duration>,
 +    /// The last time that a backfill started or added older blocks.
 +    backfill_progress: Option<Instant>,
 +}
@@ -9146,9 +9158,9 @@ index 0000000..1505294
 +        }
 +    }
 +
-+    /// The healthy wait that `slot` has left. A wait while the enforcer is
-+    /// away or a backfill adds blocks uses none of it.
-+    fn budget(&mut self, slot: u64) -> Duration {
++    /// The healthy wait that `slot` and its leader have left. A wait while
++    /// the enforcer is away or a backfill adds blocks uses none of it.
++    fn budget(&mut self, slot: u64, leader: ([u8; 32], u64)) -> Duration {
 +        if self.budgets.len() >= MAX_BUDGETS {
 +            let mut slots: Vec<u64> = self.budgets.keys().copied().collect();
 +            slots.sort_unstable();
@@ -9156,11 +9168,24 @@ index 0000000..1505294
 +                self.budgets.remove(old);
 +            }
 +        }
-+        *self.budgets.entry(slot).or_insert(REPLAY_WAIT)
++        if self.leader_budgets.len() >= MAX_BUDGETS {
++            let newest = self.leader_budgets.keys().map(|(_, epoch)| *epoch).max();
++            self.leader_budgets
++                .retain(|(_, epoch), _| Some(*epoch) == newest);
++        }
++        let slot_left = *self.budgets.entry(slot).or_insert(REPLAY_WAIT);
++        let leader_left = *self
++            .leader_budgets
++            .entry(leader)
++            .or_insert(LEADER_REPLAY_WAIT);
++        slot_left.min(leader_left)
 +    }
 +
-+    fn spend(&mut self, slot: u64, spent: Duration) {
++    fn spend(&mut self, slot: u64, leader: ([u8; 32], u64), spent: Duration) {
 +        if let Some(left) = self.budgets.get_mut(&slot) {
++            *left = left.saturating_sub(spent);
++        }
++        if let Some(left) = self.leader_budgets.get_mut(&leader) {
 +            *left = left.saturating_sub(spent);
 +        }
 +    }
@@ -9232,15 +9257,19 @@ index 0000000..1505294
 +        self.resolve(wait, |state| state.hash_at(height, floor))
 +    }
 +
-+    /// A leader drops a question `Ahead` of the view, and so does a replay
-+    /// while the enforcer answers. A replay waits for `NotYet` within
-+    /// `REPLAY_WAIT` per slot, because its own view can lag.
++    /// A leader drops a question `Ahead` of the view. A replay waits for it
++    /// within `REPLAY_WAIT` per slot and `LEADER_REPLAY_WAIT` per leader and
++    /// epoch, because its own view can lag.
 +    fn resolve<T>(&self, wait: Wait, mut query: impl FnMut(&mut State) -> Found<T>) -> Lookup<T> {
-+        let asked_at = Instant::now();
 +        let mut state = self.state.lock().unwrap();
 +        loop {
 +            let found = query(&mut state);
-+            let Wait::Replay { slot } = wait else {
++            let Wait::Replay {
++                slot,
++                leader,
++                epoch,
++            } = wait
++            else {
 +                return match found {
 +                    Found::Ready(value) => Lookup::Ready(value),
 +                    Found::NotYet | Found::Backfill => Lookup::NotYet,
@@ -9253,13 +9282,6 @@ index 0000000..1505294
 +            match found {
 +                Found::Ready(value) => return Lookup::Ready(value),
 +                Found::Never if !away => return Lookup::Never,
-+                // Only a read of the enforcer that started after the question
-+                // can say that a block is too far ahead.
-+                Found::Ahead
-+                    if !away && state.read_started.is_some_and(|started| started > asked_at) =>
-+                {
-+                    return Lookup::Never;
-+                }
 +                _ if state.exiting() => return Lookup::NotYet,
 +                _ => (),
 +            }
@@ -9267,7 +9289,7 @@ index 0000000..1505294
 +            let step = if paused {
 +                WAIT_STEP
 +            } else {
-+                match state.budget(slot) {
++                match state.budget(slot, (leader, epoch)) {
 +                    left if left.is_zero() => return Lookup::NotYet,
 +                    left => left.min(WAIT_STEP),
 +                }
@@ -9275,7 +9297,7 @@ index 0000000..1505294
 +            let start = Instant::now();
 +            state = self.changed.wait_timeout(state, step).unwrap().0;
 +            if !paused {
-+                state.spend(slot, start.elapsed());
++                state.spend(slot, (leader, epoch), start.elapsed());
 +            }
 +        }
 +    }
@@ -9296,14 +9318,8 @@ index 0000000..1505294
 +
 +    /// The poller read the enforcer.
 +    pub fn mark_synced(&self) {
-+        self.mark_read(Instant::now());
-+    }
-+
-+    /// The poller completed a read of the enforcer that started at `started`.
-+    pub fn mark_read(&self, started: Instant) {
 +        let mut state = self.state.lock().unwrap();
 +        state.synced_at = Some(Instant::now());
-+        state.read_started = Some(started);
 +        self.changed.notify_all();
 +    }
 +
@@ -9407,6 +9423,15 @@ index 0000000..1505294
 +#[cfg(test)]
 +mod tests {
 +    use {super::*, std::sync::Arc};
++
++    /// A replay of `slot` by a leader of its own.
++    fn replay(slot: u64) -> Wait {
++        Wait::Replay {
++            slot,
++            leader: [slot as u8; 32],
++            epoch: 0,
++        }
++    }
 +
 +    fn hash(byte: u8) -> BlockHash {
 +        [byte; 32]
@@ -10021,7 +10046,7 @@ index 0000000..1505294
 +            writer.replace_from(&chain(109, 110, 0));
 +        });
 +        assert_eq!(
-+            view.answer(104, &hash(104), 6, 0, Wait::Replay { slot: 1 }),
++            view.answer(104, &hash(104), 6, 0, replay(1)),
 +            Lookup::Ready(Some([104; 32]))
 +        );
 +        handle.join().unwrap();
@@ -10039,7 +10064,7 @@ index 0000000..1505294
 +            writer.mark_synced();
 +        });
 +        assert_eq!(
-+            view.answer(104, &hash(104 + 50), 6, 0, Wait::Replay { slot: 2 }),
++            view.answer(104, &hash(104 + 50), 6, 0, replay(2)),
 +            Lookup::Ready(Some([104; 32]))
 +        );
 +        handle.join().unwrap();
@@ -10051,7 +10076,7 @@ index 0000000..1505294
 +            .insert(9, Duration::from_millis(100));
 +        let start = Instant::now();
 +        assert_eq!(
-+            view.answer(105, &hash(200), 6, 0, Wait::Replay { slot: 9 }),
++            view.answer(105, &hash(200), 6, 0, replay(9)),
 +            Lookup::NotYet
 +        );
 +        assert!(start.elapsed() < Duration::from_secs(1));
@@ -10064,11 +10089,11 @@ index 0000000..1505294
 +        view.mark_synced();
 +        let start = Instant::now();
 +        assert_eq!(
-+            view.answer(104, &hash(200), 6, 0, Wait::Replay { slot: 14 }),
++            view.answer(104, &hash(200), 6, 0, replay(14)),
 +            Lookup::Never
 +        );
 +        assert_eq!(
-+            view.deep_block(110, &hash(200), 6, 0, Wait::Replay { slot: 14 }),
++            view.deep_block(110, &hash(200), 6, 0, replay(14)),
 +            Lookup::Never
 +        );
 +        assert!(start.elapsed() < Duration::from_secs(1));
@@ -10093,7 +10118,7 @@ index 0000000..1505294
 +            }
 +        });
 +        assert_eq!(
-+            view.answer(90, &hash(90), 6, 90, Wait::Replay { slot: 10 }),
++            view.answer(90, &hash(90), 6, 90, replay(10)),
 +            Lookup::Ready(Some([90; 32]))
 +        );
 +        handle.join().unwrap();
@@ -10118,7 +10143,7 @@ index 0000000..1505294
 +            writer.mark_synced();
 +        });
 +        assert_eq!(
-+            view.answer(104, &hash(104), 6, 0, Wait::Replay { slot: 12 }),
++            view.answer(104, &hash(104), 6, 0, replay(12)),
 +            Lookup::Ready(Some([104; 32]))
 +        );
 +        handle.join().unwrap();
@@ -10144,7 +10169,7 @@ index 0000000..1505294
 +            writer.mark_synced();
 +        });
 +        assert_eq!(
-+            view.answer(104, &hash(104), 6, 0, Wait::Replay { slot: 13 }),
++            view.answer(104, &hash(104), 6, 0, replay(13)),
 +            Lookup::Ready(Some([104; 32]))
 +        );
 +        handle.join().unwrap();
@@ -10165,92 +10190,65 @@ index 0000000..1505294
 +            Instant::now().checked_sub(BACKFILL_STALL * 2);
 +        let start = Instant::now();
 +        assert_eq!(
-+            view.answer(90, &hash(90), 6, 90, Wait::Replay { slot: 11 }),
++            view.answer(90, &hash(90), 6, 90, replay(11)),
 +            Lookup::NotYet
 +        );
 +        assert!(start.elapsed() < Duration::from_secs(1));
 +    }
 +
 +    #[test]
-+    fn a_replay_waits_for_a_block_at_most_max_ahead_past_its_view() {
++    fn a_lagging_replay_waits_for_its_view_within_the_slot_wait() {
 +        let view = Arc::new(BmmView::default());
 +        view.replace_from(&chain(100, 105, 0));
 +        view.mark_synced();
 +        let writer = Arc::clone(&view);
 +        let handle = std::thread::spawn(move || {
 +            std::thread::sleep(Duration::from_millis(100));
-+            writer.replace_from(&chain(106, 107, 0));
++            writer.replace_from(&chain(106, 116, 0));
 +            writer.mark_synced();
 +        });
-+        assert!(matches!(
-+            view.deep_block(101, &hash(101), 6, 0, Wait::Replay { slot: 7 }),
-+            Lookup::Ready(_)
-+        ));
++        assert_eq!(
++            view.answer(110, &hash(110), 6, 0, replay(7)),
++            Lookup::Ready(Some([110; 32]))
++        );
 +        handle.join().unwrap();
-+    }
-+
-+    #[test]
-+    fn a_replay_gives_never_at_once_for_a_block_far_past_a_healthy_view() {
-+        let view = BmmView::default();
-+        view.set_source(Arc::new(AtomicBool::new(false)));
-+        view.replace_from(&chain(100, 105, 0));
-+        view.mark_synced();
-+        let start = Instant::now();
-+        std::thread::scope(|scope| {
-+            scope.spawn(|| {
-+                std::thread::sleep(Duration::from_millis(100));
-+                view.mark_synced();
-+            });
-+            assert_eq!(
-+                view.answer(1_105, &hash(44), 6, 0, Wait::Replay { slot: 8 }),
-+                Lookup::Never
-+            );
-+        });
-+        assert!(start.elapsed() < Duration::from_millis(1500));
++        assert_eq!(view.answer(300, &hash(44), 6, 0, Wait::No), Lookup::Never);
 +        view.state
 +            .lock()
 +            .unwrap()
 +            .budgets
-+            .insert(31, Duration::from_millis(2500));
-+        let asked = Instant::now();
-+        std::thread::scope(|scope| {
-+            scope.spawn(|| {
-+                std::thread::sleep(Duration::from_millis(2200));
-+                view.mark_read(asked - Duration::from_secs(1));
-+            });
-+            assert_eq!(
-+                view.hash_at(1_105, 0, Wait::Replay { slot: 31 }),
-+                Lookup::NotYet
-+            );
-+        });
-+        assert!(asked.elapsed() >= Duration::from_millis(2500));
-+        view.state.lock().unwrap().synced_at = None;
-+        view.state.lock().unwrap().budgets.insert(9, Duration::ZERO);
-+        let exit = Arc::new(AtomicBool::new(true));
-+        view.set_source(exit);
-+        assert_eq!(
-+            view.answer(1_105, &hash(44), 6, 0, Wait::Replay { slot: 9 }),
-+            Lookup::NotYet
-+        );
++            .insert(8, Duration::from_millis(100));
++        let start = Instant::now();
++        assert_eq!(view.answer(300, &hash(44), 6, 0, replay(8)), Lookup::NotYet);
++        assert!(start.elapsed() < Duration::from_secs(1));
 +    }
 +
 +    #[test]
-+    fn a_stale_view_reads_the_enforcer_again_before_it_says_ahead() {
++    fn the_slots_of_one_leader_in_an_epoch_share_one_wait() {
 +        let view = BmmView::default();
-+        view.set_source(Arc::new(AtomicBool::new(false)));
-+        view.replace_from(&chain(100, 105, 0));
++        view.replace_from(&chain(100, 110, 0));
 +        view.mark_synced();
-+        std::thread::scope(|scope| {
-+            scope.spawn(|| {
-+                std::thread::sleep(Duration::from_millis(100));
-+                view.replace_from(&chain(106, 116, 0));
-+                view.mark_synced();
-+            });
-+            assert!(matches!(
-+                view.deep_block(110, &hash(110), 6, 0, Wait::Replay { slot: 30 }),
-+                Lookup::Ready(_)
-+            ));
-+        });
++        let leader = [9; 32];
++        view.state
++            .lock()
++            .unwrap()
++            .leader_budgets
++            .insert((leader, 4), Duration::from_millis(200));
++        let start = Instant::now();
++        for slot in 20..25 {
++            let wait = Wait::Replay {
++                slot,
++                leader,
++                epoch: 4,
++            };
++            assert_eq!(view.answer(105, &hash(105), 6, 0, wait), Lookup::NotYet);
++        }
++        assert!(start.elapsed() < Duration::from_secs(1));
++        let state = view.state.lock().unwrap();
++        assert_eq!(
++            state.leader_budgets.get(&(leader, 4)),
++            Some(&Duration::ZERO)
++        );
 +    }
 +
 +    #[test]
@@ -10266,7 +10264,7 @@ index 0000000..1505294
 +        let start = Instant::now();
 +        for _ in 0..5 {
 +            assert_eq!(
-+                view.answer(105, &hash(105), 6, 0, Wait::Replay { slot: 3 }),
++                view.answer(105, &hash(105), 6, 0, replay(3)),
 +                Lookup::NotYet
 +            );
 +        }
@@ -10287,14 +10285,14 @@ index 0000000..1505294
 +            writer.mark_synced();
 +        });
 +        assert_eq!(
-+            view.answer(104, &hash(104), 6, 0, Wait::Replay { slot: 4 }),
++            view.answer(104, &hash(104), 6, 0, replay(4)),
 +            Lookup::Ready(Some([104; 32]))
 +        );
 +        handle.join().unwrap();
 +        view.state.lock().unwrap().synced_at = None;
 +        exit.store(true, Ordering::Relaxed);
 +        assert_eq!(
-+            view.answer(105, &hash(105), 7, 0, Wait::Replay { slot: 5 }),
++            view.answer(105, &hash(105), 7, 0, replay(5)),
 +            Lookup::NotYet
 +        );
 +    }
@@ -10311,7 +10309,7 @@ index 0000000..1505294
 +            writer.mark_synced();
 +        });
 +        assert_eq!(
-+            view.answer(110, &hash(110), 6, 0, Wait::Replay { slot: 6 }),
++            view.answer(110, &hash(110), 6, 0, replay(6)),
 +            Lookup::Ready(Some([110; 32]))
 +        );
 +        handle.join().unwrap();
@@ -11311,10 +11309,10 @@ index 0000000..83b113c
 +}
 diff --git a/sol-drivechain-bmm/src/poller.rs b/sol-drivechain-bmm/src/poller.rs
 new file mode 100644
-index 0000000..259cb8c
+index 0000000..92b4529
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/poller.rs
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,420 @@
 +//! Copies the active eCash chain from the local enforcer into the view.
 +
 +use {
@@ -11411,10 +11409,9 @@ index 0000000..259cb8c
 +                }
 +            },
 +        };
-+        let started = std::time::Instant::now();
 +        match sync(connected, sidechain_slot, view()).await {
 +            Ok(()) => {
-+                view().mark_read(started);
++                view().mark_synced();
 +                failures = 0;
 +                tokio::time::sleep(POLL_INTERVAL).await;
 +            }
