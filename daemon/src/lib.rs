@@ -11,5 +11,6 @@ pub mod m6;
 pub mod migrate;
 pub mod network;
 pub mod peg;
+pub mod proposals;
 pub mod proto;
 pub mod seed;

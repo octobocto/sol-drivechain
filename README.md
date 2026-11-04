@@ -182,7 +182,10 @@ as eCash pays it.
    closes each paid record with `close_record`, which anyone can send.
 
 No pass trusts an event stream or memory, so a restart, a lost event, an RPC
-error, or an eCash reorg leaves no paid record open. An error in a pass goes
+error, or an eCash reorg leaves no paid record open. The daemon writes each
+bundle that it hands to the enforcer to `<oracle>.bundles.json`. It never
+seals or proposes a range that overlaps one of them that eCash can still pay
+or paid, so a Solana rollback below the root cannot pay a record twice. An error in a pass goes
 to the log, and the next pass tries again.
 
 ## BMM

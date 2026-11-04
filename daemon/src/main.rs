@@ -464,6 +464,14 @@ enum Command {
         oracle: PathBuf,
         #[arg(long, default_value_t = 30)]
         bundle_interval_secs: u64,
+        /// The file of the bundles that the peg handed to the enforcer. It
+        /// defaults to `<oracle>.bundles.json` beside the oracle key.
+        #[arg(long)]
+        bundle_log: Option<PathBuf>,
+        /// Starts a new bundle file while the bridge holds withdrawals. Pass
+        /// it only when no copy of the old file exists.
+        #[arg(long)]
+        new_bundle_log: bool,
     },
 }
 
@@ -1167,6 +1175,8 @@ fn main() -> Result<(), CliError> {
             program_id,
             oracle,
             bundle_interval_secs,
+            bundle_log,
+            new_bundle_log,
         } => {
             let program_id = parse_pubkey(&program_id)?;
             let keypair = read_keypair_file(&oracle).map_err(|_| CliError::NoOracleKey {
@@ -1179,6 +1189,8 @@ fn main() -> Result<(), CliError> {
                 sidechain_id: slot,
                 program_id,
                 bundle_interval: Duration::from_secs(bundle_interval_secs.max(1)),
+                bundle_log: bundle_log.unwrap_or_else(|| oracle.with_extension("bundles.json")),
+                new_bundle_log,
             };
             runtime.block_on(peg::run(settings, keypair))?;
             Ok(())

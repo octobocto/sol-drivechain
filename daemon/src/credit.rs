@@ -23,6 +23,10 @@ use crate::{
 /// account to the tx.
 pub const MAX_PART: usize = 16;
 
+/// The compute limit of one credit. A full part takes far less, so a height
+/// never stops at the default limit of 200,000 units.
+pub const CREDIT_COMPUTE_UNITS: u32 = 1_400_000;
+
 const IDLE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
@@ -157,7 +161,10 @@ async fn credit_next(
             source,
         })?;
     let transaction = Transaction::new_signed_with_payer(
-        &[instruction],
+        &[
+            bridge::compute_unit_limit_ix(CREDIT_COMPUTE_UNITS),
+            instruction,
+        ],
         Some(&payer.pubkey()),
         &[payer],
         blockhash,

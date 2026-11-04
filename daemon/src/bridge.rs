@@ -403,6 +403,22 @@ pub fn withdraw_ix(
     }
 }
 
+/// The Compute Budget program.
+pub const COMPUTE_BUDGET_ID: Pubkey =
+    Pubkey::from_str_const("ComputeBudget111111111111111111111111111111");
+
+/// Sets the compute limit of the tx to `units`. A limit with no unit price
+/// adds no fee.
+pub fn compute_unit_limit_ix(units: u32) -> Instruction {
+    let mut data = vec![2u8];
+    data.extend_from_slice(&units.to_le_bytes());
+    Instruction {
+        program_id: COMPUTE_BUDGET_ID,
+        accounts: Vec::new(),
+        data,
+    }
+}
+
 /// A System Program transfer of `lamports` from `from` to `to`.
 pub fn transfer_ix(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
     let mut data = 2u32.to_le_bytes().to_vec();
@@ -963,6 +979,17 @@ mod tests {
         assert_eq!(ix.accounts[2].pubkey, owner);
         assert!(ix.accounts[2].is_writable);
         assert!(ix.accounts.iter().all(|meta| !meta.is_signer));
+    }
+
+    #[test]
+    fn the_compute_limit_is_the_borsh_form_of_set_compute_unit_limit() {
+        let ix = compute_unit_limit_ix(1_400_000);
+        assert_eq!(
+            ix.program_id.to_string(),
+            "ComputeBudget111111111111111111111111111111"
+        );
+        assert_eq!(ix.data, [2, 0xc0, 0x5c, 0x15, 0x00]);
+        assert!(ix.accounts.is_empty());
     }
 
     #[test]
