@@ -29,9 +29,9 @@
 #    code 75, and the next start loads an older snapshot. A checkpoint for a
 #    bank that this node does not hold counts only when staked peers with
 #    more than a third of the stake say that they hold that bank. Such a
-#    checkpoint never holds the root, and it causes a restart only after a
-#    peer delivered its full block. When it stops the fallback, its peers
-#    must bring the bank within 12 eCash blocks, or this node distrusts them.
+#    checkpoint never holds the root. When it stops the fallback or causes a
+#    restart, its peers must bring the bank within 12 eCash blocks, or this
+#    node distrusts them.
 #    The RPC `finalized` commitment is the newest root that BMM moved.
 # 8. A commitment h* counts only when a pair (bank hash, payee) with
 #    SHA-256(bank hash ‖ payee) = h* is known. The RPC method `bmmPublishPairs`

@@ -298,7 +298,7 @@ only makes blocks.
 | Block record | The runtime writes the last block of each 32 slots and its credits into `BmmB1ocks…`. |
 | Pairs | `bmmPublishPairs`, `bmmGetPairs`, and `bmmKnownBanks` on the RPC, the `bmm-pairs` file, and the push to and the pull from the staked peers. A peer signs each `bmmKnownBanks` reply with its node key over the asked banks, the slots, a nonce of the asker, and the time. |
 | Kept answers | The `bmm-answers` file keeps the answer of each settle and credit that the node ran. |
-| Fork choice | Checkpoints select the branch and move the root. A checkpoint for a bank that this node does not hold counts only when staked peers with more than a third of the stake hold that bank. It causes a restart only after a peer delivered the full block. The RPC `finalized` commitment is the newest root that BMM moved. |
+| Fork choice | Checkpoints select the branch and move the root. A checkpoint for a bank that this node does not hold counts only when staked peers with more than a third of the stake hold that bank. The RPC `finalized` commitment is the newest root that BMM moved. |
 | Values | The genesis account `BmmParams…` holds the sidechain slot, N, K, and L. No tx can write it. |
 | Flags | `--bmm-enforcer-url` on the validator. `--bmm-sidechain-slot`, `--bmm-confirmations`, `--bmm-root-depth`, and `--bmm-fallback-blocks` on `solana-genesis`. |
 
