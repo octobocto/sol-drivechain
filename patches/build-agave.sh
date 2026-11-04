@@ -30,6 +30,7 @@
 #    bank that this node does not hold counts only when a staked peer says
 #    that it holds that bank. Such a checkpoint never holds the root. When it stops the fallback, its peers
 #    must bring the bank within 12 eCash blocks, or this node distrusts them.
+#    While that proof is open, the stake votes move no root.
 #    The RPC `finalized` commitment is the newest root that BMM moved.
 # 8. A commitment h* counts only when a pair (bank hash, payee) with
 #    SHA-256(bank hash ‖ payee) = h* is known. The RPC method `bmmPublishPairs`

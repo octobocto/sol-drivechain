@@ -256,10 +256,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..39023f8
+index 0000000..cd3603f
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,610 @@
+@@ -0,0 +1,611 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -542,6 +542,7 @@ index 0000000..39023f8
 +            tip_height,
 +            fork_choice::params(),
 +        );
++        fork_choice::hold_fallback_for_proof(&mut choice, &self.saved);
 +        // A checkpoint whose bank trusted staked peers hold can still arrive
 +        // here, so it stops the fallback as a pending one does.
 +        let stopping = fork_choice::stop_fallback(
@@ -5096,10 +5097,10 @@ index 0000000..2af21ea
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..3414043
+index 0000000..2d728fd
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2733 @@
+@@ -0,0 +1,2767 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -5391,6 +5392,15 @@ index 0000000..3414043
 +        new_pruned,
 +        fallback,
 +        tied: tied.len(),
++    }
++}
++
++/// Stops the fallback while a proof is open. After a restart, the banks that
++/// its peers named must arrive, or the deadline must pass, before the stake
++/// votes move the root again.
++pub fn hold_fallback_for_proof(choice: &mut Choice, saved: &Saved) {
++    if saved.proof.is_some() {
++        choice.fallback = false;
 +    }
 +}
 +
@@ -6898,6 +6908,31 @@ index 0000000..3414043
 +            assert!(choice.fallback);
 +            assert_eq!(saved.proof, None);
 +        }
++    }
++
++    #[test]
++    fn an_open_proof_holds_the_fallback_until_its_deadline() {
++        let checkpoints = [checkpoint(100, 11)];
++        let mut saved = Saved {
++            proof: Some(Proof {
++                bank_hashes: vec![[0xee; 32]],
++                nodes: vec![node(1)],
++                deadline_height: 120,
++            }),
++            ..Saved::default()
++        };
++        for tip_height in [110, 119] {
++            let mut choice = choose(10, &split(), &checkpoints, tip_height, PARAMS);
++            assert!(choice.fallback);
++            assert!(!settle_proof(&mut saved, |_| false, tip_height));
++            hold_fallback_for_proof(&mut choice, &saved);
++            assert!(!choice.fallback, "the stake roots at tip {tip_height}");
++        }
++        let mut choice = choose(10, &split(), &checkpoints, 120, PARAMS);
++        assert!(settle_proof(&mut saved, |_| false, 120));
++        hold_fallback_for_proof(&mut choice, &saved);
++        assert!(choice.fallback);
++        assert_eq!(saved.distrusted.len(), 1);
 +    }
 +
 +    #[test]
