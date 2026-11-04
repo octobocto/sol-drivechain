@@ -214,6 +214,10 @@ enum Command {
         program_id: String,
         #[arg(long)]
         out: PathBuf,
+        /// Leaves this many lamports of ownerless accounts behind. It must
+        /// equal the count that the export finds.
+        #[arg(long)]
+        accept_ownerless_lamports: Option<u64>,
     },
     /// Prints the lamports of one account in a state file, or 0.
     StateLamports {
@@ -303,6 +307,12 @@ enum Command {
         /// The DEX accounts file. A carried account of the same key wins.
         #[arg(long)]
         dex_accounts: Option<PathBuf>,
+        /// The bootstrap vote account. No carried account may hold its key.
+        #[arg(long)]
+        bootstrap_vote: Option<String>,
+        /// The bootstrap stake account. No carried account may hold its key.
+        #[arg(long)]
+        bootstrap_stake: Option<String>,
         /// The rent of the genesis. Each account gets its rent-exempt minimum.
         #[arg(long)]
         lamports_per_byte_year: u64,
@@ -950,12 +960,15 @@ fn main() -> Result<(), CliError> {
             solana_rpc_url,
             program_id,
             out,
+            accept_ownerless_lamports,
         } => {
             let program_id = parse_pubkey(&program_id)?;
             let state = runtime.block_on(async {
                 let rpc =
                     solana_rpc_client::nonblocking::rpc_client::RpcClient::new(solana_rpc_url);
-                Ok::<_, CliError>(migrate::export(&rpc, &program_id).await?)
+                Ok::<_, CliError>(
+                    migrate::export(&rpc, &program_id, accept_ownerless_lamports).await?,
+                )
             })?;
             let body =
                 serde_json::to_string_pretty(&state).map_err(|source| CliError::BadState {
@@ -994,6 +1007,10 @@ fn main() -> Result<(), CliError> {
                 "copied lamports   {copied}, and {} in programs and sysvars that the genesis \
                  makes again, of a supply of {}",
                 state.fixed_lamports, state.supply_lamports
+            );
+            println!(
+                "ownerless lamports {}, which no program can spend",
+                state.ownerless_lamports
             );
             println!("the state is in {}", out.display());
             Ok(())
@@ -1090,6 +1107,8 @@ fn main() -> Result<(), CliError> {
             float_lamports,
             bundle_min_slots,
             dex_accounts,
+            bootstrap_vote,
+            bootstrap_stake,
             lamports_per_byte_year,
             ecash_start_height,
             deposit_confirmations,
@@ -1110,6 +1129,10 @@ fn main() -> Result<(), CliError> {
                 ecash_start_height,
                 deposit_confirmations,
                 deposit_lag,
+                bootstrap_keys: [
+                    bootstrap_vote.as_deref().map(parse_pubkey).transpose()?,
+                    bootstrap_stake.as_deref().map(parse_pubkey).transpose()?,
+                ],
             };
             let state = state.as_ref().map(read_state).transpose()?;
             let extra = match &dex_accounts {

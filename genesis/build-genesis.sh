@@ -189,6 +189,8 @@ fi
 "$DAEMON" genesis --program-id "$PROGRAM_ID" --vault-sol "$VAULT_SOL" \
   --oracle "$("$SOLANA_KEYGEN" pubkey "$KEYS/oracle.json")" --oracle-lamports "$ORACLE_LAMPORTS" \
   --float-lamports "$FLOAT_LAMPORTS" --bundle-min-slots "$BUNDLE_MIN_SLOTS" \
+  --bootstrap-vote "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-vote.json")" \
+  --bootstrap-stake "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-stake.json")" \
   --lamports-per-byte-year "$LAMPORTS_PER_BYTE_YEAR" \
   --ecash-start-height "$ECASH_START_HEIGHT" \
   --deposit-confirmations "$DEPOSIT_CONFIRMATIONS" --deposit-lag "$DEPOSIT_LAG" \

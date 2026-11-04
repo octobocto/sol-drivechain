@@ -40,6 +40,9 @@ pub struct Params {
     /// A BMM checkpoint at eCash height H counts only when its bank credited
     /// every deposit through H minus this lag.
     pub deposit_lag: u64,
+    /// The bootstrap vote and stake keys. `solana-genesis` writes fresh
+    /// accounts there, so no carried account may hold one.
+    pub bootstrap_keys: [Option<Pubkey>; 2],
 }
 
 /// One account of the primordial accounts file.
@@ -49,6 +52,7 @@ pub struct Account {
     pub lamports: u64,
     pub owner: Pubkey,
     pub data: Vec<u8>,
+    pub executable: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +78,12 @@ pub enum GenesisError {
     BadRecordData(String),
     #[error("line {0} of the DEX accounts file is not in the form that the genesis reads")]
     BadAccountsFile(usize),
+    #[error("`{0}` is in the balances and in the accounts of the state file")]
+    KeyTwice(Pubkey),
+    #[error(
+        "the state carries `{0}`, a key where `solana-genesis` writes a fresh bootstrap account"
+    )]
+    BootstrapKeyCarried(Pubkey),
     #[error("the float overflows a u64")]
     FloatOverflow,
     #[error(
@@ -88,21 +98,6 @@ pub enum GenesisError {
          moves them out before the migration"
     )]
     DexLamportsHeld { pubkey: Pubkey, lamports: u64 },
-    #[error(
-        "the CP-Swap pool `{0}` holds protocol or fund fees. Collect them on the old chain before \
-         the migration"
-    )]
-    PoolFeesHeld(Pubkey),
-    #[error(
-        "the CP-Swap pool `{0}` holds creator fees, and its old config keeps a part of them. \
-         Collect the creator fees on the old chain before the migration"
-    )]
-    PoolCreatorFeesHeld(Pubkey),
-    #[error(
-        "the CP-Swap account `{0}` of the old chain is no pool. It can hold an admin right, so the \
-         migration stops"
-    )]
-    DexAuthority(Pubkey),
 }
 
 /// The token program. A token account of 165 bytes can close, so its
@@ -116,65 +111,8 @@ const TOKEN_MINT_AND_OWNER: std::ops::Range<usize> = 0..64;
 const TOKEN_AMOUNT: std::ops::Range<usize> = 64..72;
 const TOKEN_NATIVE_FLAG: std::ops::Range<usize> = 109..113;
 const TOKEN_NATIVE_RESERVE: std::ops::Range<usize> = 113..121;
-/// The protocol and the fund fees of token 0 and token 1 in a CP-Swap pool.
-const POOL_FEES: std::ops::Range<usize> = 341..373;
-/// The config of a CP-Swap pool, and its creator fees of token 0 and token 1.
-const POOL_CONFIG: std::ops::Range<usize> = 8..40;
-const POOL_CREATOR_FEES: std::ops::Range<usize> = 397..413;
-/// The part of the creator fees that a CP-Swap config keeps for the protocol.
-const CONFIG_CREATOR_SHARE: std::ops::Range<usize> = 116..124;
-
-const CPMM_ID: Pubkey = Pubkey::from_str_const("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
-
 fn u64_at(data: &[u8], at: std::ops::Range<usize>) -> Option<u64> {
     Some(u64::from_le_bytes(data.get(at)?.try_into().ok()?))
-}
-
-/// True when a CP-Swap pool holds protocol or fund fees. The fresh config
-/// gives their collection to a key that nobody holds.
-fn pool_holds_fees(data: &[u8]) -> bool {
-    data.get(..8) == Some(&bridge::discriminator("account", "PoolState")[..])
-        && data
-            .get(POOL_FEES)
-            .is_none_or(|fees| fees.iter().any(|byte| *byte != 0))
-}
-
-/// The pool of a CP-Swap account that holds creator fees whose split the
-/// fresh config changes: the carried config of the pool keeps a part of them,
-/// or the old chain holds no such config.
-fn pool_with_shared_creator_fees(
-    pubkey: &Pubkey,
-    pool: &Account,
-    accounts: &BTreeMap<Pubkey, Account>,
-) -> Option<Pubkey> {
-    let pool_kind = bridge::discriminator("account", "PoolState");
-    if pool.owner != CPMM_ID || pool.data.get(..8) != Some(&pool_kind[..]) {
-        return None;
-    }
-    let fees = pool.data.get(POOL_CREATOR_FEES);
-    if fees.is_some_and(|fees| fees.iter().all(|byte| *byte == 0)) {
-        return None;
-    }
-    let shared = pool
-        .data
-        .get(POOL_CONFIG)
-        .and_then(|key| Pubkey::try_from(key).ok())
-        .and_then(|key| accounts.get(&key))
-        .filter(|config| {
-            config.owner == CPMM_ID
-                && config.data.get(..8) == Some(&bridge::discriminator("account", "AmmConfig")[..])
-        })
-        .and_then(|config| u64_at(&config.data, CONFIG_CREATOR_SHARE))
-        .is_none_or(|share| share != 0);
-    shared.then_some(*pubkey)
-}
-
-/// True when a CP-Swap account holds only pool state. Any other CP-Swap
-/// account (a config, a permission, a fee share) can give a key a right.
-fn cpmm_pool_data(data: &[u8]) -> bool {
-    ["PoolState", "ObservationState"]
-        .iter()
-        .any(|name| data.get(..8) == Some(&bridge::discriminator("account", name)[..]))
 }
 
 /// The fresh DEX account with the lamports of the carried one at its key.
@@ -215,6 +153,7 @@ fn fresh_over(fresh: &Account, carried: &Account) -> Result<Account, GenesisErro
         lamports: carried.lamports,
         owner: fresh.owner,
         data,
+        executable: false,
     })
 }
 
@@ -275,6 +214,7 @@ pub fn accounts(
                 lamports,
                 owner,
                 data,
+                executable: false,
             },
         );
     };
@@ -354,29 +294,40 @@ pub fn accounts(
                 .pubkey
                 .parse()
                 .map_err(|_| GenesisError::BadPubkey(account.pubkey.clone()))?;
+            if state.balances.contains_key(&account.pubkey) {
+                return Err(GenesisError::KeyTwice(pubkey));
+            }
             let owner: Pubkey = account
                 .owner
                 .parse()
                 .map_err(|_| GenesisError::BadPubkey(account.owner.clone()))?;
-            let data = base64::engine::general_purpose::STANDARD
+            let mut data = base64::engine::general_purpose::STANDARD
                 .decode(&account.data)
                 .map_err(|_| GenesisError::BadRecordData(account.pubkey.clone()))?;
-            if owner == CPMM_ID && pool_holds_fees(&data) {
-                return Err(GenesisError::PoolFeesHeld(pubkey));
-            }
-            if owner == CPMM_ID
-                && !cpmm_pool_data(&data)
-                && !extra.iter().any(|fresh| fresh.pubkey == pubkey)
-            {
-                return Err(GenesisError::DexAuthority(pubkey));
-            }
-            put(pubkey, account.lamports, owner, data);
+            rebase_to_slot_zero(&owner, &mut data, state.epoch);
+            accounts.insert(
+                pubkey,
+                Account {
+                    pubkey,
+                    lamports: account.lamports,
+                    owner,
+                    data,
+                    executable: account.executable,
+                },
+            );
         }
-        if let Some(pool) = accounts
-            .iter()
-            .find_map(|(pubkey, account)| pool_with_shared_creator_fees(pubkey, account, &accounts))
-        {
-            return Err(GenesisError::PoolCreatorFeesHeld(pool));
+    }
+
+    if let Some(state) = state {
+        for key in params.bootstrap_keys.iter().flatten() {
+            if state.balances.contains_key(&key.to_string())
+                || state
+                    .accounts
+                    .iter()
+                    .any(|account| account.pubkey == key.to_string())
+            {
+                return Err(GenesisError::BootstrapKeyCarried(*key));
+            }
         }
     }
 
@@ -403,9 +354,233 @@ pub fn accounts(
             lamports: rent(data.len())?,
             owner: *program_id,
             data,
+            executable: false,
         },
     );
     Ok(accounts.into_values().collect())
+}
+
+const UPGRADEABLE_LOADER_ID: Pubkey =
+    Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111");
+const LOADER_V4_ID: Pubkey = Pubkey::from_str_const("LoaderV411111111111111111111111111111111111");
+const LOOKUP_TABLE_ID: Pubkey =
+    Pubkey::from_str_const("AddressLookupTab1e1111111111111111111111111");
+const STAKE_ID: Pubkey = Pubkey::from_str_const("Stake11111111111111111111111111111111111111");
+
+const VOTE_ID: Pubkey = Pubkey::from_str_const("Vote111111111111111111111111111111111111111");
+const TOKEN_2022_ID: Pubkey = Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+/// Moves the epochs of the `TransferFeeConfig` extension of a Token-2022 mint
+/// back by `source_epoch`. An old fee stays in force, and a pending one keeps
+/// the epochs that it has left. No other extension holds an epoch or a slot.
+/// Only a mint whose base and extension list decode to the end changes.
+fn rebase_transfer_fees(data: &mut [u8], source_epoch: u64) {
+    const MINT_LEN: usize = 82;
+    const MULTISIG_LEN: usize = 355;
+    const ACCOUNT_TYPE: usize = 165;
+    const MINT: u8 = 1;
+    const TRANSFER_FEE_CONFIG: u16 = 1;
+    const TRANSFER_FEE_CONFIG_LEN: usize = 108;
+    // The epoch of the older fee, then of the newer fee, in the extension.
+    const EPOCHS: [usize; 2] = [72, 90];
+    if data.len() == MULTISIG_LEN
+        || data.get(ACCOUNT_TYPE) != Some(&MINT)
+        || data[MINT_LEN..ACCOUNT_TYPE].iter().any(|byte| *byte != 0)
+    {
+        return;
+    }
+    let mut fee_config = None;
+    let mut at = ACCOUNT_TYPE + 1;
+    while at < data.len() {
+        // A mint of the multisig length ends with a two-byte zero tag.
+        if data.len() - at == 2 {
+            if data[at..] != [0, 0] {
+                return;
+            }
+            break;
+        }
+        let Some(head) = data.get(at..at + 4) else {
+            return;
+        };
+        let kind = u16::from_le_bytes([head[0], head[1]]);
+        let len = usize::from(u16::from_le_bytes([head[2], head[3]]));
+        let value = at + 4;
+        if kind == 0 {
+            // Unused space ends the list, and it holds only zero bytes.
+            if data[at..].iter().any(|byte| *byte != 0) {
+                return;
+            }
+            break;
+        }
+        if value + len > data.len() {
+            return;
+        }
+        if kind == TRANSFER_FEE_CONFIG {
+            if len != TRANSFER_FEE_CONFIG_LEN || fee_config.is_some() {
+                return;
+            }
+            fee_config = Some(value);
+        }
+        at = value + len;
+    }
+    let Some(value) = fee_config else {
+        return;
+    };
+    for offset in EPOCHS {
+        let field = &mut data[value + offset..value + offset + 8];
+        let epoch = u64::from_le_bytes(field.try_into().unwrap_or_default());
+        field.copy_from_slice(&epoch.saturating_sub(source_epoch).to_le_bytes());
+    }
+}
+
+/// Moves each slot and epoch field of a carried account to the start of the
+/// new chain, which begins at slot 0 and epoch 0. `source_epoch` is the epoch
+/// of the old chain at the halt. Without this, a program counts as not
+/// deployed, and a lookup table, a stake, or a vote waits for the old slot.
+pub fn rebase_to_slot_zero(owner: &Pubkey, data: &mut [u8], source_epoch: u64) {
+    fn set(data: &mut [u8], at: std::ops::Range<usize>, keep_max: bool) {
+        if let Some(field) = data.get_mut(at) {
+            if !(keep_max && field.iter().all(|byte| *byte == 0xff)) {
+                field.copy_from_slice(&0u64.to_le_bytes());
+            }
+        }
+    }
+    let tag = data
+        .get(..4)
+        .and_then(|tag| tag.try_into().ok())
+        .map(u32::from_le_bytes);
+    match (*owner, tag) {
+        // ProgramData: the slot of its deployment.
+        (UPGRADEABLE_LOADER_ID, Some(3)) => set(data, 4..12, false),
+        // The slot of the deployment.
+        (LOADER_V4_ID, _) => set(data, 0..8, false),
+        // The deactivation slot, and the slot of the last extension.
+        (LOOKUP_TABLE_ID, Some(1)) => {
+            set(data, 4..12, true);
+            set(data, 12..20, false);
+        }
+        (STAKE_ID, Some(tag @ (1 | 2))) => {
+            // The lockup epoch keeps the epochs that it has left.
+            if let Some(field) = data.get_mut(84..92) {
+                let epoch = u64::from_le_bytes(field.try_into().unwrap_or_default());
+                field.copy_from_slice(&epoch.saturating_sub(source_epoch).to_le_bytes());
+            }
+            // The activation and the deactivation epoch of a delegation.
+            if tag == 2 {
+                set(data, 164..172, true);
+                set(data, 172..180, true);
+            }
+        }
+        (TOKEN_2022_ID, _) => rebase_transfer_fees(data, source_epoch),
+        (VOTE_ID, Some(_)) => {
+            if let Some(fresh) = reset_vote(data, source_epoch) {
+                data.copy_from_slice(&fresh);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The vote account with no vote, no root, no credits, and no timestamp. The
+/// voter of `source_epoch` holds epoch 0, and each later voter keeps its
+/// distance in epochs. The node, the withdrawer, the collectors, and the
+/// commission stay. `None` for a layout that the function does not read.
+pub fn reset_vote(data: &[u8], source_epoch: u64) -> Option<Vec<u8>> {
+    struct Reader<'a> {
+        data: &'a [u8],
+        at: usize,
+    }
+    impl Reader<'_> {
+        fn take(&mut self, len: usize) -> Option<&[u8]> {
+            let end = self.at.checked_add(len)?;
+            let out = self.data.get(self.at..end)?;
+            self.at = end;
+            Some(out)
+        }
+        fn u64(&mut self) -> Option<u64> {
+            Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+        }
+        fn u8(&mut self) -> Option<u8> {
+            Some(*self.take(1)?.first()?)
+        }
+    }
+    let tag = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+    let mut reader = Reader { data, at: 4 };
+    let (vote_len, prior) = match tag {
+        // 1.14.11: the node, the withdrawer, the commission, plain lockouts.
+        1 => {
+            reader.take(65)?;
+            (12, true)
+        }
+        // 3: the same fields, landed votes.
+        2 => {
+            reader.take(65)?;
+            (13, true)
+        }
+        // 4: the node, the withdrawer, two collectors, two commissions, the
+        // pending rewards, and the BLS key.
+        3 => {
+            reader.take(32 * 4 + 2 + 2 + 8)?;
+            if reader.u8()? == 1 {
+                reader.take(48)?;
+            }
+            (13, false)
+        }
+        _ => return None,
+    };
+    let kept = reader.at;
+    let votes = usize::try_from(reader.u64()?).ok()?;
+    reader.take(votes.checked_mul(vote_len)?)?;
+    if reader.u8()? == 1 {
+        reader.u64()?;
+    }
+    let count = reader.u64()?;
+    let mut voters = Vec::new();
+    for _ in 0..count {
+        let epoch = reader.u64()?;
+        voters.push((epoch, reader.take(32)?.to_vec()));
+    }
+    let voters = rebase_voters(&voters, source_epoch)?;
+
+    let mut fresh = data.get(..kept)?.to_vec();
+    fresh.extend_from_slice(&0u64.to_le_bytes());
+    fresh.push(0);
+    fresh.extend_from_slice(&(voters.len() as u64).to_le_bytes());
+    for (epoch, voter) in &voters {
+        fresh.extend_from_slice(&epoch.to_le_bytes());
+        fresh.extend_from_slice(voter);
+    }
+    if prior {
+        fresh.extend_from_slice(&[0u8; 32 * 48]);
+        fresh.extend_from_slice(&31u64.to_le_bytes());
+        fresh.push(1);
+    }
+    fresh.extend_from_slice(&0u64.to_le_bytes());
+    fresh.extend_from_slice(&[0u8; 16]);
+    if fresh.len() > data.len() {
+        return None;
+    }
+    fresh.resize(data.len(), 0);
+    Some(fresh)
+}
+
+/// The authorized voters on the new chain: the voter that holds
+/// `source_epoch` moves to epoch 0, and each later voter moves back by
+/// `source_epoch`. `voters` holds the old map in epoch order.
+fn rebase_voters(voters: &[(u64, Vec<u8>)], source_epoch: u64) -> Option<Vec<(u64, Vec<u8>)>> {
+    let current = voters
+        .iter()
+        .rev()
+        .find(|(epoch, _)| *epoch <= source_epoch)
+        .or_else(|| voters.first())?;
+    let mut rebased = vec![(0, current.1.clone())];
+    rebased.extend(
+        voters
+            .iter()
+            .filter(|(epoch, _)| *epoch > source_epoch)
+            .map(|(epoch, voter)| (epoch - source_epoch, voter.clone())),
+    );
+    Some(rebased)
 }
 
 /// Reads a `--primordial-accounts-file` body of the form that [`yaml`] and
@@ -437,14 +612,17 @@ pub fn parse_yaml(text: &str) -> Result<Vec<Account>, GenesisError> {
             .and_then(|data| data.strip_suffix('"'))
             .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
             .ok_or_else(bad)?;
-        if field("executable")? != "false" {
-            return Err(bad());
-        }
+        let executable = match field("executable")?.as_str() {
+            "false" => false,
+            "true" => true,
+            _ => return Err(bad()),
+        };
         accounts.push(Account {
             pubkey,
             lamports,
             owner,
             data,
+            executable,
         });
     }
     Ok(accounts)
@@ -456,11 +634,12 @@ pub fn yaml(accounts: &[Account]) -> String {
         .iter()
         .map(|account| {
             format!(
-                "{}:\n  balance: {}\n  owner: {}\n  data: \"{}\"\n  executable: false\n",
+                "{}:\n  balance: {}\n  owner: {}\n  data: \"{}\"\n  executable: {}\n",
                 account.pubkey,
                 account.lamports,
                 account.owner,
-                base64::engine::general_purpose::STANDARD.encode(&account.data)
+                base64::engine::general_purpose::STANDARD.encode(&account.data),
+                account.executable
             )
         })
         .collect()
@@ -469,6 +648,8 @@ pub fn yaml(accounts: &[Account]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CPMM_ID: Pubkey = Pubkey::from_str_const("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
     use crate::migrate::{CarriedAccount, Cursor};
 
     const SUPPLY: u64 = 21_000_000 * 1_000_000_000;
@@ -485,6 +666,7 @@ mod tests {
             ecash_start_height: 500,
             deposit_confirmations: 6,
             deposit_lag: 100,
+            bootstrap_keys: [Some(Pubkey::new_from_array([40u8; 32])), None],
         }
     }
 
@@ -582,9 +764,12 @@ mod tests {
                 lamports: 1_400,
                 owner: program_id.to_string(),
                 data: base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]),
+                executable: false,
             }],
             supply_lamports: SUPPLY + 1_000,
             fixed_lamports: 500,
+            ownerless_lamports: 0,
+            epoch: 0,
         }
     }
 
@@ -663,6 +848,7 @@ mod tests {
             lamports,
             owner: TOKEN_PROGRAM_ID,
             data: vec![0u8; len],
+            executable: false,
         }
     }
 
@@ -705,6 +891,7 @@ mod tests {
             lamports: account.lamports,
             owner: account.owner.to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&account.data),
+            executable: false,
         });
     }
 
@@ -812,89 +999,25 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_with_protocol_or_fund_fees_stops_the_migration() {
-        for at in [341, 349, 357, 365] {
-            let mut data = vec![0u8; 637];
-            data[..8].copy_from_slice(&bridge::discriminator("account", "PoolState"));
-            data[at] = 1;
-            let mut state = a_state();
-            carry(
-                &mut state,
-                &Account {
-                    pubkey: Pubkey::new_from_array([30u8; 32]),
-                    lamports: 5_000,
-                    owner: CPMM_ID,
-                    data,
-                },
-            );
-            assert!(matches!(
-                accounts(&params(), Some(&state), &[]),
-                Err(GenesisError::PoolFeesHeld(_))
-            ));
-        }
-    }
-
-    fn a_pool_with_creator_fees(config: Pubkey) -> Account {
+    fn a_pool_that_holds_fees_carries_byte_for_byte() {
         let mut data = vec![0u8; 637];
         data[..8].copy_from_slice(&bridge::discriminator("account", "PoolState"));
-        data[POOL_CONFIG].copy_from_slice(config.as_ref());
-        data[POOL_CREATOR_FEES.start] = 9;
-        Account {
+        // The protocol and fund fees of both tokens, then the creator fees.
+        for at in [341, 349, 357, 365, 397, 405] {
+            data[at] = 7;
+        }
+        let pool = Account {
             pubkey: Pubkey::new_from_array([30u8; 32]),
             lamports: 5_000,
             owner: CPMM_ID,
             data,
-        }
-    }
-
-    fn with_creator_share(share: u64) -> Result<Vec<Account>, GenesisError> {
+            executable: false,
+        };
         let dex = the_dex_accounts();
-        let fresh = dex.iter().find(|account| account.owner == CPMM_ID).unwrap();
-        let mut old = base64::engine::general_purpose::STANDARD
-            .decode(MAINNET_AMM_CONFIG)
-            .unwrap();
-        old[CONFIG_CREATOR_SHARE].copy_from_slice(&share.to_le_bytes());
         let mut state = a_state();
-        carry(
-            &mut state,
-            &Account {
-                data: old,
-                ..fresh.clone()
-            },
-        );
-        carry(&mut state, &a_pool_with_creator_fees(fresh.pubkey));
-        accounts(&params(), Some(&state), &dex)
-    }
-
-    #[test]
-    fn creator_fees_that_the_old_config_shares_stop_the_migration() {
-        let mainnet = base64::engine::general_purpose::STANDARD
-            .decode(MAINNET_AMM_CONFIG)
-            .unwrap();
-        assert_eq!(u64_at(&mainnet, CONFIG_CREATOR_SHARE), Some(50_000));
-        assert!(matches!(
-            with_creator_share(50_000),
-            Err(GenesisError::PoolCreatorFeesHeld(_))
-        ));
-        let accounts = with_creator_share(0).unwrap();
-        let pool = a_pool_with_creator_fees(Pubkey::default());
-        assert_eq!(
-            find(&accounts, &pool.pubkey).data[POOL_CREATOR_FEES.start],
-            9
-        );
-    }
-
-    #[test]
-    fn creator_fees_of_a_pool_without_its_config_stop_the_migration() {
-        let mut state = a_state();
-        carry(
-            &mut state,
-            &a_pool_with_creator_fees(Pubkey::new_from_array([31u8; 32])),
-        );
-        assert!(matches!(
-            accounts(&params(), Some(&state), &[]),
-            Err(GenesisError::PoolCreatorFeesHeld(_))
-        ));
+        carry(&mut state, &pool);
+        let accounts = accounts(&params(), Some(&state), &dex).unwrap();
+        assert_eq!(find(&accounts, &pool.pubkey), pool);
     }
 
     #[test]
@@ -917,39 +1040,25 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_carries_and_another_cpmm_account_stops_the_migration() {
-        let pool = Account {
-            pubkey: Pubkey::new_from_array([30u8; 32]),
-            lamports: 5_000,
-            owner: CPMM_ID,
-            data: bridge::discriminator("account", "PoolState")
-                .into_iter()
-                .chain([0u8; 629])
-                .collect(),
-        };
-        let mut state = a_state();
-        carry(&mut state, &pool);
-        let accounts = accounts(&params(), Some(&state), &[]).unwrap();
-        assert_eq!(find(&accounts, &pool.pubkey), pool);
-
+    fn each_cpmm_account_carries_byte_for_byte() {
         for name in [
-            "AmmConfig",
+            "PoolState",
+            "ObservationState",
             "Permission",
             "CreatorFeeShare",
             "SupportMintAssociated",
         ] {
+            let account = Account {
+                pubkey: Pubkey::new_from_array([30u8; 32]),
+                lamports: 5_000,
+                owner: CPMM_ID,
+                data: bridge::discriminator("account", name).to_vec(),
+                executable: false,
+            };
             let mut state = a_state();
-            carry(
-                &mut state,
-                &Account {
-                    data: bridge::discriminator("account", name).to_vec(),
-                    ..pool.clone()
-                },
-            );
-            assert!(matches!(
-                super::accounts(&params(), Some(&state), &[]),
-                Err(GenesisError::DexAuthority(_))
-            ));
+            carry(&mut state, &account);
+            let accounts = accounts(&params(), Some(&state), &[]).unwrap();
+            assert_eq!(find(&accounts, &account.pubkey), account);
         }
     }
 
@@ -962,6 +1071,7 @@ mod tests {
                 lamports: 21,
                 owner: bridge::SYSVAR_OWNER_ID,
                 data: Vec::new(),
+                executable: false,
             },
         ];
         assert_eq!(parse_yaml(&yaml(&written)).unwrap(), written);
@@ -969,9 +1079,11 @@ mod tests {
             parse_yaml("abc:\n  balance: 1\n"),
             Err(GenesisError::BadAccountsFile(1))
         ));
-        let mut executable = yaml(&written[..1]);
-        executable = executable.replace("executable: false", "executable: true");
-        assert!(parse_yaml(&executable).is_err());
+        let mut program = written[..1].to_vec();
+        program[0].executable = true;
+        assert_eq!(parse_yaml(&yaml(&program)).unwrap(), program);
+        let odd = yaml(&written[..1]).replace("executable: false", "executable: maybe");
+        assert!(parse_yaml(&odd).is_err());
     }
 
     #[test]
@@ -992,11 +1104,307 @@ mod tests {
             lamports: 21,
             owner: bridge::SYSVAR_OWNER_ID,
             data: vec![0, 0, 0],
+            executable: false,
         }]);
         assert!(yaml.starts_with(&format!("{}:\n", Pubkey::new_from_array([2u8; 32]))));
         assert!(yaml.contains("  balance: 21\n"));
         assert!(yaml.contains("  owner: Sysvar1111111111111111111111111111111111111\n"));
         assert!(yaml.contains("  data: \"AAAA\"\n"));
         assert!(yaml.contains("  executable: false\n"));
+    }
+
+    #[test]
+    fn a_key_in_the_balances_and_the_accounts_stops_the_genesis() {
+        let mut state = a_state();
+        let key = Pubkey::new_from_array([9u8; 32]);
+        carry(
+            &mut state,
+            &Account {
+                pubkey: key,
+                lamports: 1,
+                owner: bridge::SYSTEM_PROGRAM_ID,
+                data: vec![1],
+                executable: false,
+            },
+        );
+        assert!(matches!(
+            accounts(&params(), Some(&state), &[]),
+            Err(GenesisError::KeyTwice(found)) if found == key
+        ));
+    }
+
+    #[test]
+    fn a_carried_bootstrap_key_stops_the_genesis() {
+        let bootstrap = Pubkey::new_from_array([40u8; 32]);
+        let mut state = a_state();
+        carry(
+            &mut state,
+            &Account {
+                pubkey: bootstrap,
+                lamports: 5_000,
+                owner: STAKE_ID,
+                data: vec![0u8; 200],
+                executable: false,
+            },
+        );
+        assert!(matches!(
+            accounts(&params(), Some(&state), &[]),
+            Err(GenesisError::BootstrapKeyCarried(found)) if found == bootstrap
+        ));
+        let mut state = a_state();
+        state.balances.insert(bootstrap.to_string(), 7);
+        assert!(matches!(
+            accounts(&params(), Some(&state), &[]),
+            Err(GenesisError::BootstrapKeyCarried(_))
+        ));
+    }
+
+    #[test]
+    fn slot_fields_move_to_the_start_of_the_new_chain() {
+        let mut program_data = vec![3, 0, 0, 0];
+        program_data.extend_from_slice(&777u64.to_le_bytes());
+        program_data.extend_from_slice(&[1; 33]);
+        rebase_to_slot_zero(&UPGRADEABLE_LOADER_ID, &mut program_data, 0);
+        assert_eq!(program_data[4..12], [0; 8]);
+        assert_eq!(program_data[12..], [1; 33]);
+
+        let mut buffer = vec![1, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9];
+        rebase_to_slot_zero(&UPGRADEABLE_LOADER_ID, &mut buffer, 0);
+        assert_eq!(buffer[4..12], [9; 8]);
+
+        let mut v4 = 555u64.to_le_bytes().to_vec();
+        v4.extend_from_slice(&[2; 40]);
+        rebase_to_slot_zero(&LOADER_V4_ID, &mut v4, 0);
+        assert_eq!(v4[..8], [0; 8]);
+
+        let mut table = vec![1, 0, 0, 0];
+        table.extend_from_slice(&u64::MAX.to_le_bytes());
+        table.extend_from_slice(&900u64.to_le_bytes());
+        table.extend_from_slice(&[3; 20]);
+        rebase_to_slot_zero(&LOOKUP_TABLE_ID, &mut table, 0);
+        assert_eq!(table[4..12], u64::MAX.to_le_bytes());
+        assert_eq!(table[12..20], [0; 8]);
+        table[4..12].copy_from_slice(&800u64.to_le_bytes());
+        rebase_to_slot_zero(&LOOKUP_TABLE_ID, &mut table, 0);
+        assert_eq!(table[4..12], [0; 8]);
+
+        let mut stake = vec![0u8; 200];
+        stake[..4].copy_from_slice(&2u32.to_le_bytes());
+        stake[164..172].copy_from_slice(&40u64.to_le_bytes());
+        stake[172..180].copy_from_slice(&u64::MAX.to_le_bytes());
+        rebase_to_slot_zero(&STAKE_ID, &mut stake, 0);
+        assert_eq!(stake[164..172], [0; 8]);
+        assert_eq!(stake[172..180], u64::MAX.to_le_bytes());
+
+        let mut token = vec![5u8; 165];
+        rebase_to_slot_zero(&TOKEN_PROGRAM_ID, &mut token, 0);
+        assert_eq!(token, vec![5u8; 165]);
+    }
+
+    #[test]
+    fn a_carried_program_data_account_starts_at_slot_zero() {
+        let mut data = vec![3, 0, 0, 0];
+        data.extend_from_slice(&777u64.to_le_bytes());
+        let program_data = Account {
+            pubkey: Pubkey::new_from_array([41u8; 32]),
+            lamports: 9_000,
+            owner: UPGRADEABLE_LOADER_ID,
+            data,
+            executable: false,
+        };
+        let mut state = a_state();
+        carry(&mut state, &program_data);
+        let accounts = accounts(&params(), Some(&state), &[]).unwrap();
+        assert_eq!(find(&accounts, &program_data.pubkey).data[4..12], [0; 8]);
+    }
+
+    fn a_vote_v4(voters: &[(u64, [u8; 32])], votes: usize) -> Vec<u8> {
+        let mut data = 3u32.to_le_bytes().to_vec();
+        for byte in [1u8, 2, 3, 4] {
+            data.extend_from_slice(&[byte; 32]);
+        }
+        data.extend_from_slice(&500u16.to_le_bytes());
+        data.extend_from_slice(&700u16.to_le_bytes());
+        data.extend_from_slice(&9u64.to_le_bytes());
+        data.push(0);
+        data.extend_from_slice(&(votes as u64).to_le_bytes());
+        for slot in 0..votes {
+            data.push(1);
+            data.extend_from_slice(&(1_000 + slot as u64).to_le_bytes());
+            data.extend_from_slice(&3u32.to_le_bytes());
+        }
+        data.push(1);
+        data.extend_from_slice(&990u64.to_le_bytes());
+        data.extend_from_slice(&(voters.len() as u64).to_le_bytes());
+        for (epoch, voter) in voters {
+            data.extend_from_slice(&epoch.to_le_bytes());
+            data.extend_from_slice(voter);
+        }
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&[7u8; 24]);
+        data.extend_from_slice(&[8u8; 16]);
+        data.resize(3762, 0);
+        data
+    }
+
+    #[test]
+    fn a_carried_vote_keeps_its_keys_and_drops_its_history() {
+        let old = a_vote_v4(&[(40, [5u8; 32]), (41, [6u8; 32])], 31);
+        let mut data = old.clone();
+        rebase_to_slot_zero(&VOTE_ID, &mut data, 41);
+        assert_eq!(data.len(), 3762);
+        let prefix = 4 + 32 * 4 + 2 + 2 + 8 + 1;
+        assert_eq!(data[..prefix], old[..prefix]);
+        let mut want = old[..prefix].to_vec();
+        want.extend_from_slice(&0u64.to_le_bytes());
+        want.push(0);
+        want.extend_from_slice(&1u64.to_le_bytes());
+        want.extend_from_slice(&0u64.to_le_bytes());
+        want.extend_from_slice(&[6u8; 32]);
+        want.extend_from_slice(&0u64.to_le_bytes());
+        want.extend_from_slice(&[0u8; 16]);
+        want.resize(3762, 0);
+        assert_eq!(data, want);
+        assert_eq!(reset_vote(&[0, 0, 0, 0], 0), None);
+    }
+
+    #[test]
+    fn a_v3_vote_gets_empty_prior_voters() {
+        let mut data = 2u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[1u8; 32]);
+        data.extend_from_slice(&[2u8; 32]);
+        data.push(10);
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.push(0);
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(&[6u8; 32]);
+        data.resize(3762, 0xaa);
+        let fresh = reset_vote(&data, 7).unwrap();
+        assert_eq!(fresh[..69], data[..69]);
+        let prior = 69 + 8 + 1 + 8 + 8 + 32;
+        assert_eq!(fresh[77], 0);
+        assert_eq!(fresh[78..86], 1u64.to_le_bytes());
+        assert_eq!(fresh[94..126], [6u8; 32]);
+        assert_eq!(
+            fresh[prior + 32 * 48..prior + 32 * 48 + 9],
+            [31, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+    }
+
+    #[test]
+    fn the_lockup_keeps_the_epochs_that_it_has_left() {
+        for tag in [1u32, 2] {
+            let mut stake = vec![0u8; 200];
+            stake[..4].copy_from_slice(&tag.to_le_bytes());
+            stake[76..84].copy_from_slice(&1_700_000_000i64.to_le_bytes());
+            stake[84..92].copy_from_slice(&50u64.to_le_bytes());
+            rebase_to_slot_zero(&STAKE_ID, &mut stake, 40);
+            assert_eq!(stake[84..92], 10u64.to_le_bytes());
+            assert_eq!(stake[76..84], 1_700_000_000i64.to_le_bytes());
+            stake[84..92].copy_from_slice(&30u64.to_le_bytes());
+            rebase_to_slot_zero(&STAKE_ID, &mut stake, 40);
+            assert_eq!(stake[84..92], [0; 8]);
+        }
+    }
+
+    #[test]
+    fn the_voter_of_the_halt_epoch_holds_epoch_zero() {
+        let current = [5u8; 32];
+        let future = [6u8; 32];
+        let old = a_vote_v4(&[(40, current), (42, future)], 3);
+        let mut data = old.clone();
+        rebase_to_slot_zero(&VOTE_ID, &mut data, 41);
+        let at = 4 + 32 * 4 + 2 + 2 + 8 + 1 + 8 + 1;
+        assert_eq!(data[at..at + 8], 2u64.to_le_bytes());
+        assert_eq!(data[at + 8..at + 16], 0u64.to_le_bytes());
+        assert_eq!(data[at + 16..at + 48], current);
+        assert_eq!(data[at + 48..at + 56], 1u64.to_le_bytes());
+        assert_eq!(data[at + 56..at + 88], future);
+        let before = rebase_voters(&[(43, current.to_vec())], 41).unwrap();
+        assert_eq!(before, vec![(0, current.to_vec()), (2, current.to_vec())]);
+    }
+
+    fn a_fee_mint(older: u64, newer: u64) -> Vec<u8> {
+        let mut data = vec![0u8; 165];
+        data.push(1);
+        // A mint close authority before the fee config.
+        data.extend_from_slice(&3u16.to_le_bytes());
+        data.extend_from_slice(&32u16.to_le_bytes());
+        data.extend_from_slice(&[9u8; 32]);
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&108u16.to_le_bytes());
+        data.extend_from_slice(&[1u8; 64]);
+        data.extend_from_slice(&77u64.to_le_bytes());
+        for epoch in [older, newer] {
+            data.extend_from_slice(&epoch.to_le_bytes());
+            data.extend_from_slice(&500u64.to_le_bytes());
+            data.extend_from_slice(&25u16.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn transfer_fee_epochs_keep_their_distance_to_the_halt() {
+        let mut data = a_fee_mint(40, 50);
+        let before = data.clone();
+        rebase_to_slot_zero(&TOKEN_2022_ID, &mut data, 45);
+        let value = 166 + 4 + 32 + 4;
+        assert_eq!(data[value + 72..value + 80], 0u64.to_le_bytes());
+        assert_eq!(data[value + 90..value + 98], 5u64.to_le_bytes());
+        assert_eq!(data[..value + 72], before[..value + 72]);
+        assert_eq!(data[value + 80..value + 90], before[value + 80..value + 90]);
+        // A list that does not decode to the end leaves the mint as it is.
+        let mut torn = a_fee_mint(40, 50);
+        torn.extend_from_slice(&[7u8, 0, 9]);
+        let kept = torn.clone();
+        rebase_to_slot_zero(&TOKEN_2022_ID, &mut torn, 45);
+        assert_eq!(torn, kept);
+        // A multisig holds signer keys at byte 165, and it keeps them.
+        let mut multisig = vec![3u8; 355];
+        multisig[165..170].copy_from_slice(&[1, 1, 0, 108, 0]);
+        let kept = multisig.clone();
+        rebase_to_slot_zero(&TOKEN_2022_ID, &mut multisig, 45);
+        assert_eq!(multisig, kept);
+        // A token account of Token-2022 keeps its bytes.
+        let mut account = a_fee_mint(40, 50);
+        account[165] = 2;
+        let kept = account.clone();
+        rebase_to_slot_zero(&TOKEN_2022_ID, &mut account, 45);
+        assert_eq!(account, kept);
+    }
+
+    #[test]
+    fn a_mint_with_the_two_byte_end_tag_gets_its_epochs_rebased() {
+        let mut data = vec![0u8; 165];
+        data.push(1);
+        // TransferFeeConfig.
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&108u16.to_le_bytes());
+        let fee = data.len();
+        data.extend_from_slice(&[1u8; 64]);
+        data.extend_from_slice(&77u64.to_le_bytes());
+        for epoch in [40u64, 50] {
+            data.extend_from_slice(&epoch.to_le_bytes());
+            data.extend_from_slice(&500u64.to_le_bytes());
+            data.extend_from_slice(&25u16.to_le_bytes());
+        }
+        // MintCloseAuthority, PermanentDelegate, and DefaultAccountState.
+        for (kind, len) in [(3u16, 32u16), (12, 32), (6, 1)] {
+            data.extend_from_slice(&kind.to_le_bytes());
+            data.extend_from_slice(&len.to_le_bytes());
+            data.extend(std::iter::repeat_n(9u8, usize::from(len)));
+        }
+        assert_eq!(data.len(), 355);
+        data.extend_from_slice(&[0, 0]);
+        rebase_to_slot_zero(&TOKEN_2022_ID, &mut data, 40);
+        assert_eq!(data[fee + 72..fee + 80], 0u64.to_le_bytes());
+        assert_eq!(data[fee + 90..fee + 98], 10u64.to_le_bytes());
+        // Two nonzero bytes at the end are no end tag.
+        let mut torn = data.clone();
+        torn[355..].copy_from_slice(&[1, 0]);
+        torn[fee + 90..fee + 98].copy_from_slice(&50u64.to_le_bytes());
+        rebase_to_slot_zero(&TOKEN_2022_ID, &mut torn, 40);
+        assert_eq!(torn[fee + 90..fee + 98], 50u64.to_le_bytes());
     }
 }
