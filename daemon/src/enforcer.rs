@@ -1043,20 +1043,16 @@ pub fn spends_a_gone_coin(error: &EnforcerError) -> bool {
     )
 }
 
-/// True when the node or the wallet refused the bid tx for sure, so no tx
-/// went out and a new bid cannot pay twice.
+/// True when the bid tx spends a coin that the active chain does not hold.
+/// Every node on that chain refuses it, so a new bid cannot pay twice. A
+/// policy refusal can differ between nodes, so it does not count.
 pub fn bid_rejected(error: &EnforcerError) -> bool {
     match error {
         EnforcerError::Call { source, .. } => {
             let text = source.message();
-            [
-                "bad-txns",
-                "ServerError(-25)",
-                "ServerError(-26)",
-                "txn-mempool-conflict",
-            ]
-            .iter()
-            .any(|mark| text.contains(mark))
+            ["bad-txns-inputs-missingorspent", "missing-inputs"]
+                .iter()
+                .any(|mark| text.contains(mark))
         }
         _ => false,
     }
@@ -1365,8 +1361,14 @@ mod tests {
         assert!(bid_rejected(&refused(
             "ErrorObject { code: ServerError(-25), message: \"bad-txns-inputs-missingorspent\" }"
         )));
-        assert!(bid_rejected(&refused(
+        assert!(!bid_rejected(&refused(
             "ServerError(-26) min relay fee not met"
+        )));
+        assert!(!bid_rejected(&refused(
+            "ServerError(-26) txn-mempool-conflict"
+        )));
+        assert!(!bid_rejected(&refused(
+            "ServerError(-25) bad-txns-in-belowout"
         )));
         assert!(!bid_rejected(&refused("connection reset")));
         assert!(!bid_rejected(&EnforcerError::Call {
