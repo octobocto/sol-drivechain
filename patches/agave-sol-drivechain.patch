@@ -2684,10 +2684,10 @@ index c8399cb..c4dec90 100644
                  && let Some(feature) = feature::state::from_account(&account)
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..e13dcd0
+index 0000000..29693b9
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,1031 @@
+@@ -0,0 +1,1061 @@
 +//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
@@ -2715,8 +2715,8 @@ index 0000000..e13dcd0
 +        DEPOSIT_ANSWER_ID, Lookup, PaidQuestion, Question, RecordAnswer, RecordedBlock, Wait,
 +        answer_data, answers::answers, bmm_next_height, bundle_paid_question,
 +        credit_deposits_question, deposit_answer_data, deposit_confirmations, find_recorded,
-+        fork_choice, held::held, paid_answer_data, record_block, refused_deposit_answer_data,
-+        settle_bmm_question, view,
++        fork_choice, held::held, live_bundle_sealed_height, paid_answer_data, record_block,
++        refused_deposit_answer_data, settle_bmm_question, view,
 +    },
 +    solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
 +    solana_hash::Hash,
@@ -3030,7 +3030,9 @@ index 0000000..e13dcd0
 +                self.credit_answer(question, &config, check, wait)
 +            }
 +            (BridgeQuestion::Paid(question), None) => unpaid(question),
-+            (BridgeQuestion::Paid(question), Some(_)) => self.paid_answer(question, check, wait),
++            (BridgeQuestion::Paid(question), Some(config)) => {
++                self.paid_answer(question, &config, check, wait)
++            }
 +        };
 +        let Lookup::Ready(Answer { key, data, kept }) = answer else {
 +            return answer.map(|answer| (answer.key, answer.data));
@@ -3052,7 +3054,21 @@ index 0000000..e13dcd0
 +
 +    /// Status 1 when block M at H, with K blocks on top for a replay and one
 +    /// more for a leader, holds a Succeeded event for the M6ID.
-+    fn paid_answer(&self, question: &PaidQuestion, check: BmmCheck, wait: Wait) -> Lookup<Answer> {
++    /// A question for a height at or below the seal of the live bundle, or
++    /// without a live bundle, gets status 0 at once and asks the view nothing.
++    fn paid_answer(
++        &self,
++        question: &PaidQuestion,
++        config: &[u8],
++        check: BmmCheck,
++        wait: Wait,
++    ) -> Lookup<Answer> {
++        let Some(sealed_height) = live_bundle_sealed_height(config) else {
++            return unpaid(question);
++        };
++        if question.height <= sealed_height {
++            return unpaid(question);
++        }
 +        let root_depth = self
 +            .bmm_params()
 +            .map_or(fork_choice::params().root_depth, |params| params.root_depth);
@@ -3065,7 +3081,7 @@ index 0000000..e13dcd0
 +                question.height,
 +                &question.block_hash,
 +                depth,
-+                question.height,
++                sealed_height.saturating_add(1),
 +                wait,
 +            )
 +            .map(|block| Answer {
@@ -3259,8 +3275,11 @@ index 0000000..e13dcd0
 +    };
 +
 +    fn config_data(next_height: u64, credited_height: u64, index: u64) -> Vec<u8> {
-+        let mut data = vec![0u8; 187];
++        let mut data = vec![0u8; 243];
 +        data[..8].copy_from_slice(&sol_drivechain_bmm::CONFIG_DISCRIMINATOR);
++        // A live bundle of record 0, sealed at eCash height 140.
++        data[211..219].copy_from_slice(&1u64.to_le_bytes());
++        data[219..227].copy_from_slice(&140u64.to_le_bytes());
 +        data[64..72].copy_from_slice(&next_height.to_le_bytes());
 +        data[80..88].copy_from_slice(&6u64.to_le_bytes());
 +        data[88..96].copy_from_slice(&100u64.to_le_bytes());
@@ -3565,6 +3584,17 @@ index 0000000..e13dcd0
 +            tx(bundle_paid(199, [199; 32], [0xaa; 32]), true),
 +            BmmCheck::Simulation
 +        )));
++        let wanted = sol_drivechain_bmm::view().wanted_low();
++        for height in [0, 140] {
++            let early = paid_of(bundle_paid(height, [height as u8; 32], [0xaa; 32]), true);
++            assert_eq!(early[72..], [0; 9]);
++        }
++        assert_eq!(sol_drivechain_bmm::view().wanted_low(), wanted);
++        let mut no_bundle = config_data(100, 40, 2);
++        no_bundle[211..219].copy_from_slice(&0u64.to_le_bytes());
++        let sealed = sol_drivechain_bmm::live_bundle_sealed_height;
++        assert_eq!(sealed(&no_bundle), None);
++        assert_eq!(sealed(&config_data(100, 40, 2)), Some(140));
 +    }
 +
 +    #[test]
@@ -8228,10 +8258,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..72cb521
+index 0000000..d1a8504
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2031 @@
+@@ -0,0 +1,2044 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -8360,6 +8390,9 @@ index 0000000..72cb521
 +const CONFIG_CREDIT_INDEX: usize = 136;
 +const CONFIG_CREDIT_PART_BLOCK: usize = 144;
 +const CONFIG_CREDIT_PART_BLOCK_END: usize = 176;
++const CONFIG_PAID_THROUGH: usize = 203;
++const CONFIG_BUNDLED_THROUGH: usize = 211;
++const CONFIG_BUNDLE_SEALED_HEIGHT: usize = 219;
 +
 +/// The Anchor discriminator of `credit_deposits`:
 +/// sha256("global:credit_deposits")[..8].
@@ -8555,6 +8588,16 @@ index 0000000..72cb521
 +/// D, the eCash confirmations before a credit, from the bridge config data.
 +pub fn deposit_confirmations(config_data: &[u8]) -> Option<u64> {
 +    config_u64(config_data, CONFIG_DEPOSIT_CONFIRMATIONS)
++}
++
++/// The credited eCash height when the live bundle was sealed, or `None`
++/// without a live bundle. Its M6 pays out at a higher eCash height.
++pub fn live_bundle_sealed_height(config_data: &[u8]) -> Option<u64> {
++    let paid_through = config_u64(config_data, CONFIG_PAID_THROUGH)?;
++    let bundled_through = config_u64(config_data, CONFIG_BUNDLED_THROUGH)?;
++    (bundled_through > paid_through)
++        .then(|| config_u64(config_data, CONFIG_BUNDLE_SEALED_HEIGHT))
++        .flatten()
 +}
 +
 +/// The lowest eCash height that a settle may still name, from the bridge
