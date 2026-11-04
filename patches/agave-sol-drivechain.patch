@@ -8260,10 +8260,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..0f6e704
+index 0000000..1505294
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2087 @@
+@@ -0,0 +1,2098 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -9015,10 +9015,6 @@ index 0000000..0f6e704
 +/// A backfill that adds no block for this long stops to hold a replay.
 +const BACKFILL_STALL: Duration = Duration::from_secs(5);
 +
-+/// A replay waits this long for a fresh read of the enforcer before it says
-+/// that a block is too far ahead.
-+const AHEAD_POLL_WAIT: Duration = Duration::from_secs(2);
-+
 +/// One step of a wait, so an exit or a recovered enforcer is seen soon.
 +const WAIT_STEP: Duration = Duration::from_secs(1);
 +
@@ -9052,6 +9048,8 @@ index 0000000..0f6e704
 +    generation: u64,
 +    /// The last time the poller read the enforcer.
 +    synced_at: Option<Instant>,
++    /// The start of the last read of the enforcer that completed.
++    read_started: Option<Instant>,
 +    /// The exit flag of the poller. `None` while no poller runs.
 +    exit: Option<Arc<AtomicBool>>,
 +    /// The end of the wait of each replayed slot.
@@ -9255,14 +9253,10 @@ index 0000000..0f6e704
 +            match found {
 +                Found::Ready(value) => return Lookup::Ready(value),
 +                Found::Never if !away => return Lookup::Never,
-+                // Only a view that read the enforcer after the question can
-+                // say that a block is too far ahead.
++                // Only a read of the enforcer that started after the question
++                // can say that a block is too far ahead.
 +                Found::Ahead
-+                    if !away
-+                        && (state
-+                            .synced_at
-+                            .is_some_and(|synced_at| synced_at > asked_at)
-+                            || asked_at.elapsed() >= AHEAD_POLL_WAIT) =>
++                    if !away && state.read_started.is_some_and(|started| started > asked_at) =>
 +                {
 +                    return Lookup::Never;
 +                }
@@ -9302,8 +9296,14 @@ index 0000000..0f6e704
 +
 +    /// The poller read the enforcer.
 +    pub fn mark_synced(&self) {
++        self.mark_read(Instant::now());
++    }
++
++    /// The poller completed a read of the enforcer that started at `started`.
++    pub fn mark_read(&self, started: Instant) {
 +        let mut state = self.state.lock().unwrap();
 +        state.synced_at = Some(Instant::now());
++        state.read_started = Some(started);
 +        self.changed.notify_all();
 +    }
 +
@@ -10207,12 +10207,23 @@ index 0000000..0f6e704
 +            );
 +        });
 +        assert!(start.elapsed() < Duration::from_millis(1500));
-+        let stale = Instant::now();
-+        assert_eq!(
-+            view.hash_at(1_105, 0, Wait::Replay { slot: 8 }),
-+            Lookup::Never
-+        );
-+        assert!(stale.elapsed() >= AHEAD_POLL_WAIT);
++        view.state
++            .lock()
++            .unwrap()
++            .budgets
++            .insert(31, Duration::from_millis(2500));
++        let asked = Instant::now();
++        std::thread::scope(|scope| {
++            scope.spawn(|| {
++                std::thread::sleep(Duration::from_millis(2200));
++                view.mark_read(asked - Duration::from_secs(1));
++            });
++            assert_eq!(
++                view.hash_at(1_105, 0, Wait::Replay { slot: 31 }),
++                Lookup::NotYet
++            );
++        });
++        assert!(asked.elapsed() >= Duration::from_millis(2500));
 +        view.state.lock().unwrap().synced_at = None;
 +        view.state.lock().unwrap().budgets.insert(9, Duration::ZERO);
 +        let exit = Arc::new(AtomicBool::new(true));
@@ -11300,10 +11311,10 @@ index 0000000..83b113c
 +}
 diff --git a/sol-drivechain-bmm/src/poller.rs b/sol-drivechain-bmm/src/poller.rs
 new file mode 100644
-index 0000000..92b4529
+index 0000000..259cb8c
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/poller.rs
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,421 @@
 +//! Copies the active eCash chain from the local enforcer into the view.
 +
 +use {
@@ -11400,9 +11411,10 @@ index 0000000..92b4529
 +                }
 +            },
 +        };
++        let started = std::time::Instant::now();
 +        match sync(connected, sidechain_slot, view()).await {
 +            Ok(()) => {
-+                view().mark_synced();
++                view().mark_read(started);
 +                failures = 0;
 +                tokio::time::sleep(POLL_INTERVAL).await;
 +            }
