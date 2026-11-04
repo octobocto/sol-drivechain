@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     bridge::{self, Config, RecordedBlock},
-    enforcer::{Enforcer, EnforcerError},
+    enforcer::{ActiveHeaders, Enforcer, EnforcerError},
     network::PegNetwork,
 };
 
@@ -377,6 +377,7 @@ pub struct Live {
     pub enforcer: Enforcer,
     pub program_id: Pubkey,
     fees: Mutex<FeeMeter>,
+    cursor_headers: Mutex<ActiveHeaders>,
 }
 
 impl Live {
@@ -386,6 +387,7 @@ impl Live {
             enforcer,
             program_id,
             fees: Mutex::new(FeeMeter::default()),
+            cursor_headers: Mutex::new(ActiveHeaders::default()),
         }
     }
 }
@@ -859,18 +861,8 @@ async fn rounds(
     rules: &BidRules,
 ) -> Result<(), BmmError> {
     let mut last_bid_tip: Option<BlockHash> = None;
-    let mut reads = SettleReads::default();
     loop {
-        let result = round(
-            settings,
-            identity,
-            live,
-            memory,
-            rules,
-            &mut last_bid_tip,
-            &mut reads,
-        )
-        .await;
+        let result = round(settings, identity, live, memory, rules, &mut last_bid_tip).await;
         if let Err(error) = result {
             if round_error_is_fatal(&error) {
                 return Err(error);
@@ -888,7 +880,6 @@ async fn round(
     memory: &Mutex<Memory>,
     rules: &BidRules,
     last_bid_tip: &mut Option<BlockHash>,
-    reads: &mut SettleReads,
 ) -> Result<(), BmmError> {
     let rpc = &live.rpc;
     let mut enforcer = live.enforcer.clone();
@@ -934,7 +925,7 @@ async fn round(
         .lock()
         .await
         .forget_fees_below(tip_height.saturating_sub(settings.confirmations + 1));
-    settle(live, settings, identity, tip, &config, reads).await
+    settle(live, settings, identity, tip).await
 }
 
 /// What one round of the loop did about the bid for the next eCash block.
@@ -1148,135 +1139,211 @@ pub fn tip_moved(error: &crate::enforcer::EnforcerError) -> bool {
     }
 }
 
-/// The most new enforcer reads of one settle round.
-pub const SETTLE_READS: usize = 16;
+/// The most heights that one settle round moves the cursor past.
+pub const SETTLE_STEPS: usize = 16;
 
-/// The active eCash blocks that the settle loop read below one tip.
-#[derive(Debug, Default)]
-pub struct SettleReads {
-    tip: Option<(BlockHash, u32)>,
-    blocks: HashMap<u64, Option<ActiveBlock>>,
+/// The most header pages that one settle round reads from the enforcer.
+pub const SETTLE_WALK_PAGES: usize = 8;
+
+/// What the loop sends for the next height to settle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettleStep {
+    /// The height is not deep enough, or its pair is unknown and the skip
+    /// time has not passed.
+    Wait,
+    /// A settle with this Solana block and payee. An empty height or a skip
+    /// takes any pair, and it pays nothing.
+    Send {
+        block_hash: BlockHash,
+        solana_block: [u8; 32],
+        payee: Pubkey,
+    },
 }
 
-/// The heights of `pairs` that a settle at eCash tip `tip_height` can take,
-/// oldest first.
-pub fn settle_heights(
-    pairs: &[Pair],
-    next_height: u64,
+/// The step for the next height `next`. The bridge settles heights only in
+/// order, so the loop settles each height, an empty one too.
+pub fn next_settle(
+    next: u64,
     tip_height: u64,
     confirmations: u64,
-) -> Vec<u64> {
-    let floor = next_height.max(tip_height.saturating_sub(MAX_WALK));
-    let mut heights: Vec<u64> = pairs
-        .iter()
-        .map(|pair| pair.height)
-        .filter(|&height| height >= floor && settle_is_ready(height, tip_height, confirmations))
-        .collect();
-    heights.sort_unstable();
-    heights.dedup();
-    heights
-}
-
-/// The settles that the pairs allow below `tip`, oldest first: each height
-/// whose active block commits to one of the pairs. It asks the chain for at
-/// most `max_reads` blocks that `reads` does not hold yet.
-pub async fn settle_targets<C: Chain>(
-    chain: &C,
-    tip: (BlockHash, u32),
+    block: Option<ActiveBlock>,
     pairs: &[Pair],
-    heights: &[u64],
-    reads: &mut SettleReads,
-    max_reads: usize,
-) -> Result<Vec<(BlockHash, Pair)>, BmmError> {
-    if let Some(old) = reads.tip.filter(|old| *old != tip) {
-        // A tip that extends the old one keeps every read below it. After a
-        // reorg the loop reads again.
-        let extends = old.1 < tip.1
-            && chain
-                .active_block(tip, u64::from(old.1))
-                .await?
-                .is_some_and(|(hash, _)| hash == old.0);
-        if !extends {
-            reads.blocks.clear();
-        }
+    skip_ready: bool,
+    sender: Pubkey,
+) -> SettleStep {
+    if !settle_is_ready(next, tip_height, confirmations) {
+        return SettleStep::Wait;
     }
-    reads.tip = Some(tip);
-    let mut fresh = 0;
-    let mut targets = Vec::new();
-    for &height in heights {
-        let found = match reads.blocks.get(&height) {
-            Some(found) => *found,
-            None if fresh == max_reads => break,
-            None => {
-                fresh += 1;
-                let found = chain.active_block(tip, height).await?;
-                reads.blocks.insert(height, found);
-                found
-            }
-        };
-        if let Some((block_hash, Some(commitment))) = found {
-            if let Some(pair) = pair_for(pairs, height, &commitment) {
-                targets.push((block_hash, pair));
-            }
-        }
+    let Some((block_hash, commitment)) = block else {
+        return SettleStep::Wait;
+    };
+    let any = SettleStep::Send {
+        block_hash,
+        solana_block: [0u8; 32],
+        payee: sender,
+    };
+    match commitment {
+        None => any,
+        Some(commitment) => match pair_for(pairs, next, &commitment) {
+            Some(pair) => SettleStep::Send {
+                block_hash,
+                solana_block: pair.block,
+                payee: pair.payee,
+            },
+            None if skip_ready => any,
+            None => SettleStep::Wait,
+        },
     }
-    Ok(targets)
 }
 
-/// Settles each commitment with a known pair from the cursor up, in eCash
-/// height order. A commitment without a pair stays unsettled, and a later
-/// settle moves the cursor past it.
+/// The settles from the cursor `next` up, at most `SETTLE_STEPS`, as each
+/// one moves the cursor by one. `skip_ready` holds for `next` alone, because
+/// each settle starts the skip time again. A height below the pair window
+/// needs no skip time. It stops at the first wait.
+#[allow(clippy::too_many_arguments)]
+pub async fn plan_settles<F, Fut>(
+    next: u64,
+    tip_height: u64,
+    confirmations: u64,
+    pairs: &[Pair],
+    skip_ready: bool,
+    credited_height: u64,
+    sender: Pubkey,
+    mut block_at: F,
+) -> Result<Vec<(u64, SettleStep)>, BmmError>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<Option<ActiveBlock>, BmmError>>,
+{
+    let mut plan = Vec::new();
+    for height in next..next.saturating_add(SETTLE_STEPS as u64) {
+        if !settle_is_ready(height, tip_height, confirmations) {
+            break;
+        }
+        let block = block_at(height).await?;
+        let step = next_settle(
+            height,
+            tip_height,
+            confirmations,
+            block,
+            pairs,
+            (skip_ready && height == next) || bridge::pair_too_old(height, credited_height),
+            sender,
+        );
+        if step == SettleStep::Wait {
+            break;
+        }
+        plan.push((height, step));
+    }
+    Ok(plan)
+}
+
+/// Settles the heights from the cursor up, one at a time, in eCash height
+/// order. The headers from the tip down to the cursor stay between rounds,
+/// and a round reads at most `SETTLE_WALK_PAGES` pages of them.
 async fn settle(
     live: &Live,
     settings: &Settings,
     identity: &Keypair,
     tip: (BlockHash, u32),
-    config: &Config,
-    reads: &mut SettleReads,
 ) -> Result<(), BmmError> {
     let rpc = &live.rpc;
     let tip_height = u64::from(tip.1);
+    let config = read_config(rpc, &settings.program_id).await?;
     if !settle_is_ready(config.bmm_next_height, tip_height, settings.confirmations) {
         return Ok(());
     }
     let pairs = fetch_pairs(rpc, config.bmm_next_height).await?;
-    let heights = settle_heights(
-        &pairs,
+    let slot = rpc
+        .get_slot_with_commitment(CommitmentConfig::processed())
+        .await
+        .map_err(|source| BmmError::Rpc {
+            call: "getSlot",
+            source,
+        })?;
+    let skip_ready = slot
+        >= config
+            .bmm_next_since_slot
+            .saturating_add(config.bmm_skip_slots);
+    let mut headers = live.cursor_headers.lock().await;
+    headers
+        .follow(
+            &mut live.enforcer.clone(),
+            tip,
+            height_u32(config.bmm_next_height)?,
+            SETTLE_WALK_PAGES,
+        )
+        .await?;
+    let plan = plan_settles(
         config.bmm_next_height,
         tip_height,
         settings.confirmations,
-    );
-    let targets = settle_targets(live, tip, &pairs, &heights, reads, SETTLE_READS).await?;
-    for (block_hash, pair) in targets {
-        let height = pair.height;
-        let before = read_config(rpc, &settings.program_id).await?.bmm_paid_total;
+        &pairs,
+        skip_ready,
+        config.credited_height,
+        identity.pubkey(),
+        |height| {
+            let header = u32::try_from(height)
+                .ok()
+                .and_then(|height| headers.get(height));
+            let mut enforcer = live.enforcer.clone();
+            async move {
+                match header {
+                    Some(header) => Ok(Some((
+                        header.hash,
+                        enforcer.commitment_at(header.hash).await?,
+                    ))),
+                    None => Ok(None),
+                }
+            }
+        },
+    )
+    .await?;
+    drop(headers);
+    let mut paid_before = config.bmm_paid_total;
+    for (height, step) in plan {
+        let SettleStep::Send {
+            block_hash,
+            solana_block,
+            payee,
+        } = step
+        else {
+            return Ok(());
+        };
         let instruction = bridge::settle_bmm_ix(
             &settings.program_id,
             height,
             &block_hash.to_byte_array(),
-            &pair.block,
-            &pair.payee,
+            &solana_block,
+            &payee,
         );
         match send(rpc, identity, instruction, "settle_bmm").await {
             Ok(()) => {
-                let paid = read_config(rpc, &settings.program_id)
-                    .await?
-                    .bmm_paid_total
-                    .saturating_sub(before);
-                if pair.payee == identity.pubkey() {
+                let paid_total = read_config(rpc, &settings.program_id).await?.bmm_paid_total;
+                let paid = paid_total.saturating_sub(paid_before);
+                paid_before = paid_total;
+                if solana_block == [0u8; 32] {
+                    tracing::info!(
+                        height,
+                        "the loop moved the cursor past a height with no win"
+                    );
+                } else if payee == identity.pubkey() {
                     tracing::info!(height, paid, "the loop settled its own win");
                 } else {
-                    tracing::info!(height, paid, payee = %pair.payee, "the loop settled a height");
+                    tracing::info!(height, paid, %payee, "the loop settled a height");
                 }
             }
             Err(BmmError::Rpc { source, .. }) if is_not_ready(&source) => {
+                // A height below the view of the validator waits for its
+                // backfill, and the next round sends it again.
                 tracing::debug!(height, "the leader does not see the block deep enough yet");
                 return Ok(());
             }
             Err(error) => {
-                // The Solana block is not on this branch, or another settler
-                // moved the cursor first.
+                // Another settler moved the cursor first, or the block left
+                // this branch. The next round reads again.
                 tracing::info!(height, %error, "the settle did not land");
+                return Ok(());
             }
         }
     }
@@ -2039,20 +2106,173 @@ mod tests {
     }
 
     #[test]
-    fn a_settle_takes_ready_heights_inside_the_walk_once() {
-        let pairs = [
-            pair_at(4_000, 1),
-            pair_at(4_000, 2),
-            pair_at(3_500, 1),
-            pair_at(4_993, 1),
-            pair_at(4_994, 1),
-            pair_at(2_000, 1),
-        ];
+    fn the_loop_settles_each_height_in_order() {
+        let sender = Pubkey::new_from_array([8u8; 32]);
+        let won = pair_at(100, 9);
+        let hash = BlockHash::from_byte_array([1u8; 32]);
         assert_eq!(
-            settle_heights(&pairs, 2_000, 5_000, 6),
-            [3_500, 4_000, 4_993]
+            next_settle(
+                100,
+                106,
+                6,
+                Some((hash, Some(won.commitment()))),
+                &[won],
+                false,
+                sender
+            ),
+            SettleStep::Wait,
+            "not deep enough"
         );
-        assert_eq!(settle_heights(&pairs, 3_600, 5_000, 6), [4_000, 4_993]);
+        assert_eq!(
+            next_settle(
+                100,
+                107,
+                6,
+                Some((hash, Some(won.commitment()))),
+                &[won],
+                false,
+                sender
+            ),
+            SettleStep::Send {
+                block_hash: hash,
+                solana_block: won.block,
+                payee: won.payee
+            }
+        );
+        assert_eq!(
+            next_settle(100, 107, 6, Some((hash, None)), &[], false, sender),
+            SettleStep::Send {
+                block_hash: hash,
+                solana_block: [0u8; 32],
+                payee: sender
+            },
+            "an empty height settles"
+        );
+        assert_eq!(
+            next_settle(100, 107, 6, None, &[won], false, sender),
+            SettleStep::Wait
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_far_below_the_tip_catches_up_to_the_tip() {
+        let sender = Pubkey::new_from_array([8u8; 32]);
+        let tip_height = 9_000u64;
+        let won = pair_at(4_000, 9);
+        let mut next = tip_height - 3 * MAX_WALK;
+        let mut rounds = 0;
+        loop {
+            let plan = plan_settles(
+                next,
+                tip_height,
+                6,
+                &[won],
+                false,
+                0,
+                sender,
+                |height| async move {
+                    let hash = BlockHash::from_byte_array([height as u8; 32]);
+                    let commitment = (height == 4_000).then(|| won.commitment());
+                    Ok(Some((hash, commitment)))
+                },
+            )
+            .await
+            .unwrap();
+            if plan.is_empty() {
+                break;
+            }
+            assert!(plan.len() <= SETTLE_STEPS);
+            for (height, _) in &plan {
+                assert_eq!(*height, next);
+                next += 1;
+            }
+            rounds += 1;
+        }
+        assert_eq!(
+            next,
+            tip_height - 6,
+            "every height up to the deepest ready one settled"
+        );
+        assert!(rounds >= (3 * MAX_WALK as usize) / SETTLE_STEPS);
+    }
+
+    #[tokio::test]
+    async fn a_plan_stops_at_a_commitment_without_a_pair() {
+        let sender = Pubkey::new_from_array([8u8; 32]);
+        let plan = plan_settles(100, 200, 6, &[], true, 0, sender, |height| async move {
+            let hash = BlockHash::from_byte_array([height as u8; 32]);
+            Ok(Some((hash, (height >= 100).then_some([5u8; 32]))))
+        })
+        .await
+        .unwrap();
+        assert_eq!(plan.len(), 1, "the skip holds for the cursor alone");
+        assert_eq!(plan[0].0, 100);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_below_the_pair_window_skips_each_height_without_the_skip_time() {
+        let sender = Pubkey::new_from_array([8u8; 32]);
+        let credited_height = 10_000u64;
+        let tip_height = credited_height + 6;
+        let mut next = credited_height - 2 * bridge::PAIR_WINDOW;
+        let mut rounds = 0;
+        loop {
+            let plan = plan_settles(
+                next,
+                tip_height,
+                6,
+                &[],
+                false,
+                credited_height,
+                sender,
+                |height| async move {
+                    let hash = BlockHash::from_byte_array([height as u8; 32]);
+                    Ok(Some((hash, Some([5u8; 32]))))
+                },
+            )
+            .await
+            .unwrap();
+            if plan.is_empty() {
+                break;
+            }
+            for (height, step) in &plan {
+                assert_eq!(*height, next);
+                assert!(
+                    matches!(step, SettleStep::Send { solana_block, .. } if *solana_block == [0u8; 32])
+                );
+                next += 1;
+            }
+            rounds += 1;
+        }
+        assert_eq!(
+            next,
+            credited_height - bridge::PAIR_WINDOW,
+            "a recent commitment waits"
+        );
+        assert_eq!(
+            rounds,
+            (bridge::PAIR_WINDOW as usize).div_ceil(SETTLE_STEPS)
+        );
+    }
+
+    #[test]
+    fn a_commitment_without_a_pair_waits_for_the_skip_time() {
+        let sender = Pubkey::new_from_array([8u8; 32]);
+        let hash = BlockHash::from_byte_array([1u8; 32]);
+        let garbage = Some((hash, Some([5u8; 32])));
+        let other = pair_at(100, 9);
+        assert_eq!(
+            next_settle(100, 200, 6, garbage, &[other], false, sender),
+            SettleStep::Wait
+        );
+        assert_eq!(
+            next_settle(100, 200, 6, garbage, &[other], true, sender),
+            SettleStep::Send {
+                block_hash: hash,
+                solana_block: [0u8; 32],
+                payee: sender
+            }
+        );
     }
 
     #[test]
@@ -2072,111 +2292,5 @@ mod tests {
             ),
         ]);
         assert_eq!(pairs, [good]);
-    }
-
-    struct FakeChain {
-        commitments: HashMap<u64, [u8; 32]>,
-        reads: std::sync::Mutex<usize>,
-    }
-
-    impl Chain for FakeChain {
-        async fn tip(&self) -> Result<(BlockHash, u32), BmmError> {
-            unreachable!()
-        }
-        async fn slot_is_active(&self) -> Result<bool, BmmError> {
-            unreachable!()
-        }
-        async fn config(&self) -> Result<Config, BmmError> {
-            unreachable!()
-        }
-        async fn earned_fees(&self) -> Result<Earned, BmmError> {
-            unreachable!()
-        }
-        async fn recorded_blocks(&self) -> Result<Vec<RecordedBlock>, BmmError> {
-            unreachable!()
-        }
-        async fn block_hash_at(
-            &self,
-            _tip: (BlockHash, u32),
-            _height: u64,
-        ) -> Result<Option<[u8; 32]>, BmmError> {
-            unreachable!()
-        }
-        async fn active_block(
-            &self,
-            _tip: (BlockHash, u32),
-            height: u64,
-        ) -> Result<Option<ActiveBlock>, BmmError> {
-            *self.reads.lock().unwrap() += 1;
-            Ok(Some((
-                BlockHash::from_byte_array([height as u8; 32]),
-                self.commitments.get(&height).copied(),
-            )))
-        }
-        async fn publish(&self, _pairs: &[Pair]) -> Result<Vec<String>, BmmError> {
-            unreachable!()
-        }
-    }
-
-    #[tokio::test]
-    async fn junk_pairs_cost_a_bounded_number_of_reads_per_round() {
-        let won = pair_at(130, 9);
-        let mut pairs: Vec<Pair> = (100..130).map(|height| pair_at(height, 1)).collect();
-        pairs.push(won);
-        let chain = FakeChain {
-            commitments: HashMap::from([(130, won.commitment())]),
-            reads: std::sync::Mutex::new(0),
-        };
-        let tip = (BlockHash::from_byte_array([1u8; 32]), 200);
-        let heights = settle_heights(&pairs, 100, 200, 6);
-        let mut reads = SettleReads::default();
-        let mut found = Vec::new();
-        for _ in 0..3 {
-            found = settle_targets(&chain, tip, &pairs, &heights, &mut reads, 16)
-                .await
-                .unwrap();
-        }
-        assert_eq!(*chain.reads.lock().unwrap(), 31, "each height is read once");
-        assert_eq!(found, [(BlockHash::from_byte_array([130; 32]), won)]);
-
-        let first = settle_targets(&chain, tip, &pairs, &heights, &mut reads, 0)
-            .await
-            .unwrap();
-        assert_eq!(first, found, "the reads of the tip stay");
-        let next = (BlockHash::from_byte_array([2u8; 32]), 201);
-        let fresh = settle_targets(&chain, next, &pairs, &heights, &mut reads, 4)
-            .await
-            .unwrap();
-        assert!(fresh.is_empty(), "a reorg reads again");
-        assert_eq!(*chain.reads.lock().unwrap(), 36);
-    }
-
-    #[tokio::test]
-    async fn a_tip_that_extends_the_old_one_keeps_the_reads() {
-        let won = pair_at(130, 9);
-        let mut pairs: Vec<Pair> = (100..130).map(|height| pair_at(height, 1)).collect();
-        pairs.push(won);
-        let chain = FakeChain {
-            commitments: HashMap::from([(130, won.commitment())]),
-            reads: std::sync::Mutex::new(0),
-        };
-        let mut reads = SettleReads::default();
-        let mut found = Vec::new();
-        for tip_height in 200u32..203 {
-            let tip = (
-                BlockHash::from_byte_array([tip_height as u8; 32]),
-                tip_height,
-            );
-            let heights = settle_heights(&pairs, 100, u64::from(tip_height), 6);
-            found = settle_targets(&chain, tip, &pairs, &heights, &mut reads, 16)
-                .await
-                .unwrap();
-        }
-        assert_eq!(found, [(BlockHash::from_byte_array([130; 32]), won)]);
-        assert_eq!(
-            *chain.reads.lock().unwrap(),
-            31 + 2,
-            "one check per new tip"
-        );
     }
 }
