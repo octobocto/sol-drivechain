@@ -38,8 +38,12 @@ STATE="${STATE:-$(dirname "$LEDGER")/migration-state.json}"
 PROGRAM_ID="$(cat "$KEYS/bridge-program.pubkey")"
 
 echo "== the state of the halted chain"
+OWNERLESS_ARGS=()
+if [ -n "${ACCEPT_OWNERLESS_LAMPORTS:-}" ]; then
+  OWNERLESS_ARGS=(--accept-ownerless-lamports "$ACCEPT_OWNERLESS_LAMPORTS")
+fi
 "$DAEMON" migrate-state --solana-rpc-url "$OLD_RPC" --program-id "$PROGRAM_ID" \
-  --out "$STATE"
+  --out "$STATE" ${OWNERLESS_ARGS[@]+"${OWNERLESS_ARGS[@]}"}
 
 # Prints one value of the old bridge config. A halted node confirms nothing.
 old_config() {

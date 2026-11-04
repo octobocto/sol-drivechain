@@ -710,16 +710,17 @@ needs a new genesis. `scripts/migrate-genesis.sh` carries the money over:
 - the balance of each system account without data: every wallet, the vault,
   the treasury, the oracle, the faucet, and the validator identity,
 - the lamports of each stake and vote account, as plain lamports to its
-  withdrawer,
-- each withdrawal record, nonce account, token account, and CP-Swap pool,
-  byte for byte, so eCash still pays each open withdrawal,
+  withdrawer. When the withdrawer holds data or the account names none, the
+  account carries as it is,
+- each other account of each program, byte for byte: the withdrawal records,
+  the nonce accounts, the token and CP-Swap accounts, the lookup tables, and
+  the programs of the upgradeable loader. eCash still pays each open
+  withdrawal,
 - the lamports of the CP-Swap config, the wrapped SOL mint, and the pool fee
   account. Their data comes from `genesis/dex_accounts.py`, so no key and no
-  fee rate of the old chain carries over. These stop the migration: a pool
-  fee account of a real owner that holds tokens or lamports above its
-  reserve, a pool that
-  holds protocol or fund fees, a pool that holds creator fees while its old
-  config keeps a part of them, and a CP-Swap account that is no pool,
+  fee rate of the old chain carries over. A pool keeps its fees byte for
+  byte. A pool fee account of a real owner that holds tokens or lamports
+  above its reserve stops the migration,
 - the cursor, the float, the bundle, and the counters of the bridge config.
 - D and the lag of the bridge config. A value set by hand that differs from
   the old chain stops the script.
@@ -729,9 +730,9 @@ occurs, so no coin gets credited two times. BMM on the new chain settles from
 the eCash tip at the migration. The export takes only a config of the current
 layout, and it refuses any other.
 
-The export adds up the lamports that it reads, and it stops when they are not
-the whole supply, or when an account of another program holds lamports. The
-new bootstrap stake and vote accounts take their lamports out of the old
+The export reads the accounts of every program that a loader holds, so no
+user can stop it. An account whose owner is no program keeps lamports that
+nobody can spend. The export then stops and prints their count. The operator goes on with `ACCEPT_OWNERLESS_LAMPORTS=<count>`, which must name the exact count. The new bootstrap stake and vote accounts take their lamports out of the old
 identity, the faucet keeps its old balance, and the oracle gets nothing new,
 so a migration adds no float.
 
