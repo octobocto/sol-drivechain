@@ -35,6 +35,10 @@ pub struct Settings {
     pub sidechain_id: u8,
     pub program_id: Pubkey,
     pub bundle_interval: Duration,
+    /// The file of the bundles that the daemon handed to its enforcer.
+    pub bundle_log: std::path::PathBuf,
+    /// Starts a new bundle file while the bridge holds withdrawals.
+    pub new_bundle_log: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +61,20 @@ pub enum PegError {
     MissingRecord(u64),
     #[error("eCash height {0} does not fit a u32")]
     HeightTooLarge(u64),
+    #[error(transparent)]
+    Proposals(#[from] crate::proposals::ProposalsError),
+    #[error(
+        "records {start} to {end} overlap bundle {m6id}, which the enforcer keeps and eCash can \
+         still pay or paid. The peg seals and proposes nothing until an operator acts"
+    )]
+    Overlap { m6id: String, start: u64, end: u64 },
+    #[error(
+        "records from {start} can repeat a paid bundle below record {dropped_through}, so the peg \
+         seals and proposes nothing until an operator acts"
+    )]
+    BelowDropped { start: u64, dropped_through: u64 },
+    #[error("the proposal file holds `{0}`, which is no M6ID")]
+    BadM6id(String),
 }
 
 /// The record that `account` holds at `index`, if it is one: the program
@@ -343,9 +361,17 @@ pub async fn run(settings: Settings, oracle: Keypair) -> Result<(), PegError> {
         settings.solana_rpc_url.clone(),
         CommitmentConfig::processed(),
     );
+    let mut proposals = crate::proposals::Proposals::load(settings.bundle_log.clone())?;
+    let config = read_config(&rpc, &settings.program_id, CommitmentConfig::processed()).await?;
+    crate::proposals::check_journal(&proposals, config.withdrawal_count, settings.new_bundle_log)?;
+    proposals.persist()?;
+    tracing::info!(
+        kept = proposals.list().len(),
+        "the peg reads the bundles that it handed to the enforcer"
+    );
     let mut credit_enforcer = enforcer.clone();
     tokio::select! {
-        never = peg_loop(&mut enforcer, &rpc, &settings, &oracle) => match never {},
+        never = peg_loop(&mut enforcer, &rpc, &settings, &oracle, proposals) => match never {},
         result = credit::run(
             &mut credit_enforcer,
             settings.solana_rpc_url.clone(),
@@ -356,10 +382,10 @@ pub async fn run(settings: Settings, oracle: Keypair) -> Result<(), PegError> {
     }
 }
 
-/// The memory of the loop. It only spares repeat reads, and a restart loses
-/// nothing that matters.
-#[derive(Default)]
+/// The memory of the loop. The proposals live in a file, and the rest only
+/// spares repeat reads.
 struct Memory {
+    proposals: crate::proposals::Proposals,
     /// Every record below this index is closed at the BMM root.
     closed_through: u64,
     /// The eCash history of the live bundle that the last pass read.
@@ -371,9 +397,14 @@ async fn peg_loop(
     rpc: &RpcClient,
     settings: &Settings,
     oracle: &Keypair,
+    proposals: crate::proposals::Proposals,
 ) -> std::convert::Infallible {
     let mut ticker = tokio::time::interval(settings.bundle_interval);
-    let mut memory = Memory::default();
+    let mut memory = Memory {
+        proposals,
+        closed_through: 0,
+        scan: None,
+    };
     loop {
         ticker.tick().await;
         match pass(enforcer, rpc, settings, oracle, &mut memory).await {
@@ -477,6 +508,7 @@ async fn pass(
         tip_height: 0,
         finalized_slot,
     };
+    memory.proposals.drop_paid(finalized.paid_through)?;
     let mut bundle = None;
     if let (Some(_), Some(live)) = (processed.live_bundle(), finalized.live_bundle()) {
         let records =
@@ -501,6 +533,11 @@ async fn pass(
     match decide(&view) {
         Action::Wait => {}
         Action::Seal => {
+            let start = processed.paid_through;
+            let end = start
+                .saturating_add(bridge::MAX_BUNDLE_RECORDS)
+                .min(processed.withdrawal_count);
+            check_overlap(enforcer, &memory.proposals, start..end, None).await?;
             send(
                 rpc,
                 oracle,
@@ -514,7 +551,25 @@ async fn pass(
         }
         Action::Propose => {
             if let Some((blinded, m6id, live)) = bundle {
+                let id = m6id.to_string();
+                check_overlap(enforcer, &memory.proposals, live.clone(), Some(&id)).await?;
+                let proposal = crate::proposals::Proposal {
+                    start: live.start,
+                    end: live.end,
+                    m6id: id,
+                    sealed_height: finalized.bundle_sealed_height,
+                    // The enforcer queues the bundle at its own tip, which can
+                    // pass this one. Until the tip after the call is known, no
+                    // failure frees the range.
+                    proposed_at: u32::MAX,
+                };
+                memory.proposals.add(proposal.clone())?;
                 enforcer.propose_withdrawal_bundle(&blinded).await?;
+                let after = enforcer.tip().await?;
+                memory.proposals.add(crate::proposals::Proposal {
+                    proposed_at: view.tip_height.max(after.1),
+                    ..proposal
+                })?;
                 tracing::debug!(
                     %m6id,
                     first = live.start,
@@ -538,6 +593,45 @@ async fn pass(
     }
     // Anyone can close a paid record, so a close can fail after the read.
     close_paid(rpc, program_id, oracle, &processed, &finalized, memory).await
+}
+
+/// Fails when `range` overlaps a bundle of another M6ID that the enforcer
+/// keeps and eCash can still pay or paid. Two such bundles could pay one
+/// record twice after a rollback of Solana below its root.
+async fn check_overlap(
+    enforcer: &mut Enforcer,
+    proposals: &crate::proposals::Proposals,
+    range: Range<u64>,
+    m6id: Option<&str>,
+) -> Result<(), PegError> {
+    if range.start < proposals.dropped_through() {
+        return Err(PegError::BelowDropped {
+            start: range.start,
+            dropped_through: proposals.dropped_through(),
+        });
+    }
+    let overlaps: Vec<_> = proposals.overlapping(&range, m6id).collect();
+    if overlaps.is_empty() {
+        return Ok(());
+    }
+    let tip = enforcer.tip().await?;
+    let mut statuses = Vec::with_capacity(overlaps.len());
+    for proposal in overlaps {
+        let id: Txid = proposal
+            .m6id
+            .parse()
+            .map_err(|_| PegError::BadM6id(proposal.m6id.clone()))?;
+        let status = bundle_status_at(enforcer, tip, proposal.sealed_height, id).await?;
+        statuses.push((proposal, status));
+    }
+    match crate::proposals::blocking(&statuses, tip.1) {
+        Some(proposal) => Err(PegError::Overlap {
+            m6id: proposal.m6id.clone(),
+            start: range.start,
+            end: range.end,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Closes the paid records, so each owner gets the rent back. The cursor
@@ -649,7 +743,7 @@ mod tests {
             burned_lamports: (payout_sats + 1_000) * 10,
             payout_sats,
             fee_sats: 1_000,
-            script_pubkey: vec![0x00, 0x14, script],
+            script_pubkey: [&[0x00, 0x14][..], &[script; 20]].concat(),
             bump: 255,
         }
     }
@@ -847,7 +941,13 @@ mod tests {
             sidechain_id: 8,
             program_id,
             bundle_interval: Duration::from_secs(1),
+            bundle_log: std::env::temp_dir().join(format!(
+                "sol-drivechain-peg-{}-close.json",
+                std::process::id()
+            )),
+            new_bundle_log: false,
         };
+        let _ = std::fs::remove_file(&settings.bundle_log);
         let mut enforcer = Enforcer::connect(settings.enforcer_url.clone(), 8)
             .await
             .unwrap();
@@ -856,7 +956,11 @@ mod tests {
             &rpc,
             &settings,
             &Keypair::new(),
-            &mut Memory::default(),
+            &mut Memory {
+                proposals: crate::proposals::Proposals::load(settings.bundle_log.clone()).unwrap(),
+                closed_through: 0,
+                scan: None,
+            },
         )
         .await
         .unwrap_err();
