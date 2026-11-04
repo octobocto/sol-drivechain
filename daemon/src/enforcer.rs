@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use bitcoin::{BlockHash, Transaction, Txid};
 use tonic::transport::Channel;
 
@@ -698,7 +700,12 @@ impl Enforcer {
         height: u32,
     ) -> Result<(BlockHash, Option<[u8; 32]>)> {
         let block_hash = header_at(self, tip, height).await?.hash;
+        Ok((block_hash, self.commitment_at(block_hash).await?))
+    }
 
+    /// Reads the BMM commitment that the coinbase of `block_hash` holds for
+    /// this sidechain.
+    pub async fn commitment_at(&mut self, block_hash: BlockHash) -> Result<Option<[u8; 32]>> {
         let response = self
             .validator
             .get_bmm_h_star_commitment(GetBmmHStarCommitmentRequest {
@@ -733,7 +740,7 @@ impl Enforcer {
             }
             None => return Err(EnforcerError::MissingField("result")),
         };
-        Ok((block_hash, commitment))
+        Ok(commitment)
     }
 
     /// Sends a BIP301 BMM request. It pays `bid_sats` to the miner of the
@@ -940,6 +947,104 @@ pub(crate) async fn header_at(
             .ok_or(EnforcerError::NoBlockAtHeight(height))?;
         cursor = (oldest.prev, oldest.height - 1);
     }
+}
+
+/// The active headers from a tip down to a floor. They stay between reads,
+/// so a new tip reads only the headers above the kept ones.
+#[derive(Debug, Default)]
+pub struct ActiveHeaders {
+    /// A chain without a gap: each header names the one below as its parent.
+    by_height: BTreeMap<u32, Header>,
+}
+
+impl ActiveHeaders {
+    /// The kept header at `height`.
+    pub fn get(&self, height: u32) -> Option<Header> {
+        self.by_height.get(&height).copied()
+    }
+
+    /// Reads the active chain from `tip` down to `floor` in at most `pages`
+    /// calls. A deeper floor takes more calls later, and the kept headers
+    /// below a match with the new chain take no call.
+    pub(crate) async fn follow(
+        &mut self,
+        chain: &mut impl ChainPages,
+        tip: (BlockHash, u32),
+        floor: u32,
+        pages: usize,
+    ) -> Result<()> {
+        self.by_height
+            .retain(|height, _| (floor..=tip.1).contains(height));
+        let mut reads = 0;
+        let mut fresh = Vec::new();
+        let mut cursor = (floor <= tip.1).then_some(tip);
+        loop {
+            let Some(at) = cursor else {
+                self.by_height.clear();
+                break;
+            };
+            if self.get(at.1).is_some_and(|kept| kept.hash == at.0) {
+                self.by_height.retain(|height, _| *height <= at.1);
+                break;
+            }
+            if reads == pages {
+                self.by_height.clear();
+                break;
+            }
+            let gap = self
+                .by_height
+                .last_key_value()
+                .filter(|(top, _)| **top < at.1)
+                .map_or(PAGE_BLOCKS, |(top, _)| at.1 - top - 1);
+            let page = read_page(chain, at, floor, gap).await?;
+            reads += 1;
+            cursor = below(&page, floor);
+            fresh.extend(page);
+        }
+        self.by_height
+            .extend(fresh.into_iter().map(|header| (header.height, header)));
+        while reads < pages {
+            let Some(at) = self
+                .by_height
+                .first_key_value()
+                .and_then(|(_, lowest)| below(std::slice::from_ref(lowest), floor))
+            else {
+                break;
+            };
+            let page = read_page(chain, at, floor, PAGE_BLOCKS).await?;
+            reads += 1;
+            self.by_height
+                .extend(page.into_iter().map(|header| (header.height, header)));
+        }
+        Ok(())
+    }
+}
+
+/// The headers from `at` down, at most `span` below it and none below
+/// `floor`, newest first and without a gap.
+async fn read_page(
+    chain: &mut impl ChainPages,
+    at: (BlockHash, u32),
+    floor: u32,
+    span: u32,
+) -> Result<Vec<Header>> {
+    let span = span.min(at.1 - floor).min(PAGE_BLOCKS);
+    let page = chain.headers(at.0, span).await?;
+    let linked = page.first().is_some_and(|top| (top.hash, top.height) == at)
+        && page
+            .windows(2)
+            .all(|pair| pair[1].hash == pair[0].prev && pair[1].height + 1 == pair[0].height);
+    if !linked {
+        return Err(EnforcerError::NoBlockAtHeight(at.1));
+    }
+    Ok(page)
+}
+
+/// The next header to read below the oldest one of `page`, or `None` at
+/// `floor`.
+fn below(page: &[Header], floor: u32) -> Option<(BlockHash, u32)> {
+    let oldest = page.last()?;
+    (oldest.height > floor).then(|| (oldest.prev, oldest.height - 1))
 }
 
 /// The peg events of each active block above `start_height` up to `tip`,
@@ -1189,12 +1294,41 @@ mod tests {
         len: u32,
         widest: u32,
         calls: usize,
+        /// The active chain takes another branch from this height up.
+        fork_at: u32,
     }
 
     fn hash_of(height: u32) -> BlockHash {
-        let mut bytes = [0xccu8; 32];
+        branch_hash(height, 0xcc)
+    }
+
+    fn branch_hash(height: u32, branch: u8) -> BlockHash {
+        let mut bytes = [branch; 32];
         bytes[..4].copy_from_slice(&height.to_le_bytes());
         BlockHash::from_byte_array(bytes)
+    }
+
+    impl FakeChain {
+        fn new(len: u32) -> Self {
+            Self {
+                len,
+                widest: 0,
+                calls: 0,
+                fork_at: u32::MAX,
+            }
+        }
+
+        fn active(&self, height: u32) -> BlockHash {
+            if height >= self.fork_at {
+                branch_hash(height, 0xdd)
+            } else {
+                hash_of(height)
+            }
+        }
+
+        fn tip(&self, height: u32) -> (BlockHash, u32) {
+            (self.active(height), height)
+        }
     }
 
     fn height_of(hash: BlockHash) -> u32 {
@@ -1211,8 +1345,8 @@ mod tests {
                 .rev()
                 .map(|height| Header {
                     height,
-                    hash: hash_of(height),
-                    prev: hash_of(height.wrapping_sub(1)),
+                    hash: self.active(height),
+                    prev: self.active(height.wrapping_sub(1)),
                 })
                 .collect())
         }
@@ -1243,11 +1377,7 @@ mod tests {
 
     #[test]
     fn a_long_walk_reads_the_chain_in_pages() {
-        let mut chain = FakeChain {
-            len: 25_001,
-            widest: 0,
-            calls: 0,
-        };
+        let mut chain = FakeChain::new(25_001);
         let tip = (hash_of(25_000), 25_000);
         let header = block_on(header_at(&mut chain, tip, 7)).unwrap();
         assert_eq!((header.height, header.hash), (7, hash_of(7)));
@@ -1257,11 +1387,7 @@ mod tests {
 
     #[test]
     fn peg_data_of_a_long_range_comes_in_pages_and_misses_no_block() {
-        let mut chain = FakeChain {
-            len: 25_001,
-            widest: 0,
-            calls: 0,
-        };
+        let mut chain = FakeChain::new(25_001);
         let tip = (hash_of(25_000), 25_000);
         let events = block_on(peg_data_from(&mut chain, tip, 150)).unwrap();
         let heights: Vec<u32> = events
@@ -1278,11 +1404,7 @@ mod tests {
 
     #[test]
     fn peg_data_from_the_tip_is_empty_and_a_height_above_the_tip_fails() {
-        let mut chain = FakeChain {
-            len: 10,
-            widest: 0,
-            calls: 0,
-        };
+        let mut chain = FakeChain::new(10);
         let tip = (hash_of(9), 9);
         assert!(block_on(peg_data_from(&mut chain, tip, 9))
             .unwrap()
@@ -1291,6 +1413,73 @@ mod tests {
             block_on(header_at(&mut chain, tip, 10)),
             Err(EnforcerError::NoBlockAtHeight(10))
         ));
+    }
+
+    /// Moves a settle cursor `depth` blocks below the tip up to the tip, 16
+    /// heights per round, while a new eCash block comes every fourth round.
+    /// It gives the enforcer calls of the walk.
+    fn catch_up_calls(depth: u32) -> usize {
+        let mut chain = FakeChain::new(2 * depth + 10_000);
+        let mut headers = ActiveHeaders::default();
+        let mut tip_height = depth + 1_000;
+        let mut cursor = tip_height - depth;
+        let mut round = 0;
+        while cursor + 16 <= tip_height {
+            let tip = chain.tip(tip_height);
+            block_on(headers.follow(&mut chain, tip, cursor, 8)).unwrap();
+            round += 1;
+            if headers.get(cursor).is_some() {
+                for height in cursor..cursor + 16 {
+                    assert_eq!(
+                        headers.get(height).map(|header| header.hash),
+                        Some(chain.active(height))
+                    );
+                }
+                cursor += 16;
+            }
+            if round % 4 == 0 {
+                tip_height += 1;
+            }
+        }
+        assert!(chain.widest <= PAGE_BLOCKS);
+        chain.calls
+    }
+
+    #[test]
+    fn a_far_cursor_reads_each_header_page_once() {
+        let calls = catch_up_calls(6_048);
+        assert!(calls <= 6_048 / 16 / 4 + 2 * 7, "{calls} calls");
+        let twice = catch_up_calls(12_096);
+        assert!(twice <= 2 * calls + 8, "{twice} calls");
+    }
+
+    #[test]
+    fn a_reorg_reads_the_new_branch_and_keeps_the_old_headers_below_it() {
+        let mut chain = FakeChain::new(3_001);
+        let mut headers = ActiveHeaders::default();
+        let tip = chain.tip(3_000);
+        block_on(headers.follow(&mut chain, tip, 0, 8)).unwrap();
+        let first = chain.calls;
+        chain.fork_at = 2_990;
+        let tip = chain.tip(2_999);
+        block_on(headers.follow(&mut chain, tip, 0, 8)).unwrap();
+        assert_eq!(chain.calls, first + 1);
+        assert_eq!(headers.get(2_995).unwrap().hash, chain.active(2_995));
+        assert_eq!(headers.get(2_980).unwrap().hash, hash_of(2_980));
+        assert_eq!(headers.get(3_000), None);
+    }
+
+    #[test]
+    fn a_deep_walk_goes_on_in_the_next_read() {
+        let mut chain = FakeChain::new(12_001);
+        let mut headers = ActiveHeaders::default();
+        let tip = chain.tip(12_000);
+        block_on(headers.follow(&mut chain, tip, 5, 8)).unwrap();
+        assert_eq!(chain.calls, 8);
+        assert_eq!(headers.get(5), None);
+        block_on(headers.follow(&mut chain, tip, 5, 8)).unwrap();
+        assert_eq!(headers.get(5).unwrap().hash, hash_of(5));
+        assert_eq!(headers.get(12_000).unwrap().hash, tip.0);
     }
 
     use super::*;

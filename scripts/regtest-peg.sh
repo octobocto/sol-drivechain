@@ -133,6 +133,7 @@ BMM_START="$(btc getblockcount)"
 NETWORK=regtest LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$BMM_START" \
   DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 \
   ORACLE_LAMPORTS=2000000 BOOTSTRAP_LAMPORTS=2000000 \
+  BMM_SKIP_SLOTS=25 \
   SIDECHAIN_SLOT="$SLOT" BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" \
   bash "$REPO/genesis/build-genesis.sh" > "$ROOT/genesis.log"
 # A copy of the fresh ledger lets a second validator replay from the genesis,
@@ -404,7 +405,7 @@ echo "the second validator replays at slot $SECOND_SLOT_BEFORE"
 # pair of each bid. A win settles N + 1 blocks later, so the whole round takes
 # about ten blocks.
 PAID=no
-for _ in $(seq 1 40); do
+for _ in $(seq 1 120); do
   kill -0 "$BMM_PID" 2>/dev/null || { tail -30 "$ROOT/bmm.log" >&2; fail "the BMM loop stopped"; }
   sleep 3
   earn_fees
@@ -553,7 +554,10 @@ echo "PASS: the leader holds back a settle until the block is N + 1 deep"
 
 step "BMM: a settle for a stale block never lands"
 # A block that a reorg drops is not on the active chain, so its settle fails
-# whatever its depth.
+# whatever its depth. The loop settles each height in order, so it stops here,
+# or it moves the cursor past the height first.
+kill "$BMM_PID"
+wait "$BMM_PID" 2>/dev/null || true
 STALE_HEIGHT=$(( $(bridge_value "bmm next height") ))
 STALE_HASH="$(btc getblockhash "$STALE_HEIGHT")"
 echo "eCash height $STALE_HEIGHT holds block $STALE_HASH"
@@ -579,6 +583,7 @@ grep -qi "restricted" "$ROOT/settle-stale.log" || {
   fail "the validator gave another error than a restricted program"
 }
 echo "PASS: a settle for a block outside the active chain never lands"
+start_bid_loop
 
 step "BMM: the loop settles a commitment of the new chain past that height"
 SETTLED=no
@@ -665,6 +670,18 @@ echo "PASS: the supply stayed at ${SUPPLY_END% *} lamports from slot ${SUPPLY_ST
 
 # ---------------------------------------------------------------------------
 step "migration: an open withdrawal, then the chain stops"
+# The peg closes the paid record once the BMM root holds its payment.
+records() {
+  rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\",\"dataSlice\":{\"offset\":0,\"length\":0}}]" \
+    | python3 -c 'import json,sys; print(sum(1 for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 259))'
+}
+for _ in $(seq 1 60); do
+  [ "$(records)" = 0 ] && break
+  earn_fees
+  "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
+  sleep 3
+done
+[ "$(records)" = 0 ] || fail "the peg did not close the paid withdrawal record"
 kill "$BMM_PID" "$PEG_PID" "$VALIDATOR2_PID" 2>/dev/null || true
 wait "$BMM_PID" "$PEG_PID" "$VALIDATOR2_PID" 2>/dev/null || true
 OPEN_ADDRESS="$(new_address)"
@@ -674,7 +691,7 @@ OPEN_ADDRESS="$(new_address)"
 books_close
 OPEN_INDEX=$(( $(bridge_value "withdrawals") - 1 ))
 OPEN_RECORD="$(rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]" \
-  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 243]')"
+  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 259]')"
 [ "$(printf '%s\n' "$OPEN_RECORD" | grep -c .)" = 1 ] || fail "the chain holds these withdrawal records: $OPEN_RECORD"
 # A halted node casts no vote, so its `confirmed` stays behind. The cursor
 # reads `processed`, as the migration does.
@@ -723,7 +740,7 @@ grep -q "takes the answer of its first run" "$ROOT/validator-halted.log" \
 echo "PASS: the halted node replayed from the genesis through the settles of the dropped eCash blocks"
 OLD_RPC="$SOLANA_URL" LEDGER="$ROOT/ledger-new" KEYS="$ROOT/keys" STATE="$ROOT/state.json" \
   ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" NETWORK=regtest DAEMON="$D" \
-  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 \
+  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 BMM_SKIP_SLOTS=25 \
   bash "$REPO/scripts/migrate-genesis.sh" | tee "$ROOT/migrate.log"
 kill "$HALTED_PID"
 wait "$HALTED_PID" 2>/dev/null || true
@@ -760,7 +777,7 @@ printf '%s\n' "$CURSOR_BEFORE"
 [ "$(lamports_of "$DOWN_PUBKEY")" = "$DOWN_BEFORE" ] || fail "the second balance did not carry over"
 echo "PASS: the balances carried over: $USER_BEFORE and $DOWN_BEFORE lamports"
 NEW_RECORD="$(rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]" \
-  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 243]')"
+  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 259]')"
 [ "$NEW_RECORD" = "$OPEN_RECORD" ] || fail "the open withdrawal record did not carry over"
 echo "PASS: open withdrawal $OPEN_INDEX carried over byte for byte"
 books_close

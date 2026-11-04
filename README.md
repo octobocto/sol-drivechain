@@ -265,9 +265,27 @@ Code -32001 means that the daemon cannot give a template yet: the slot is
 not active, no block passes rule 3, or the enforcer does not answer. Code
 -32002 means that Solana settled the height already.
 
-`bmm_next_height` is a cursor. A settle at H moves it to H + 1, so no height
-below H can settle later. A commitment that nobody settles keeps its fees in
-the treasury, and the next settle takes them.
+`bmm_next_height` is a cursor, and the heights settle one at a time, in
+order. A settle of any other height fails, so no winner of H + 1, and no
+leader, can settle H + 1 before H and take its fees. The settle of a height
+moves the cursor to H + 1:
+
+- A valid checkpoint pays its payee the whole treasury.
+- A height with no commitment pays nothing.
+- A pair that proves its own checkpoint invalid pays nothing: its block is
+  not in the block record, or it fails rule 3.
+- A commitment that no pair matches holds the cursor for `bmm_skip_slots`,
+  about one hour (`BMM_SKIP_SLOTS` in `build-genesis.sh`). After that, any
+  settle of the height moves past it and pays nothing.
+- A commitment that no pair matches, more than 4032 blocks below
+  `credited_height`, moves the cursor at once and pays nothing. The
+  validators drop the pairs of that height.
+
+The fees that a height does not pay stay in the treasury, and the next
+payee takes them. The `bmm` loop settles every height, the empty ones too. The
+loop keeps the eCash headers from the tip down to the cursor between rounds,
+so a cursor far below the tip reads each header one time. A height below the view
+of a validator waits for the backfill of the view.
 
 The block record (`BmmB1ocks1111111111111111111111111111111111`) is an
 account that the runtime writes. It holds the last block of each 32 slots on
