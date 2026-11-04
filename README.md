@@ -289,7 +289,7 @@ only makes blocks.
 | Part | What it does |
 |---|---|
 | Treasury | Every fee goes to the treasury, not to the leader. |
-| Vote fee | A simple vote pays no signature fee only when its vote account holds stake in the epoch stakes and its authorized voter signs it. Every other tx pays. Alpenglow stays off, so votes are txs. |
+| Vote fee | A simple vote pays no signature fee only when its vote account holds at least 0.1% of the epoch stake and its authorized voter signs it. Every other tx pays. Alpenglow stays off, so votes are txs. |
 | `sol-drivechain-bmm` | A view of the active eCash chain, filled from the local enforcer. |
 | Settle check | For each tx with a top-level `settle_bmm(H, M, S)`, the bank asks the view. It passes only when M is the active block at H. A leader needs N + 1 blocks on top, and replay needs N. |
 | Credit check | For each tx with a top-level `credit_deposits(H, M, ...)`, the bank asks the view for the deposits of M, after D confirmations. |
