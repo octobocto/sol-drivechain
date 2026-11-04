@@ -259,29 +259,47 @@ pub struct Enforcer {
     scans: std::sync::Arc<ScanGate>,
 }
 
-/// The longest wait for one wallet scan. The enforcer can go on with it after
-/// that, and the bid of that round fails.
-pub const FULL_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// The longest wait of a bid for one wallet scan. The scan goes on after
+/// that, and the gate holds its mark until it ends.
+pub const FULL_SCAN_WAIT: std::time::Duration = std::time::Duration::from_secs(40);
 
 /// Lets one wallet scan run at a time, and at most one for each eCash tip.
 #[derive(Default)]
 pub struct ScanGate {
-    last_tip: tokio::sync::Mutex<Option<BlockHash>>,
+    in_flight: std::sync::atomic::AtomicBool,
+    last_tip: std::sync::Mutex<Option<BlockHash>>,
+}
+
+/// The mark of a running scan. Its drop clears the mark.
+pub struct ScanMark(std::sync::Arc<ScanGate>);
+
+impl Drop for ScanMark {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl ScanGate {
     /// The right to scan for `tip`, or `None` while a scan runs or after a
     /// scan for the same tip.
-    pub fn try_begin(
-        &self,
-        tip: BlockHash,
-    ) -> Option<tokio::sync::MutexGuard<'_, Option<BlockHash>>> {
-        let mut last = self.last_tip.try_lock().ok()?;
-        if *last == Some(tip) {
+    pub fn try_begin(self: &std::sync::Arc<Self>, tip: BlockHash) -> Option<ScanMark> {
+        let mut last = self.last_tip.lock().ok()?;
+        if *last == Some(tip)
+            || self
+                .in_flight
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             return None;
         }
         *last = Some(tip);
-        Some(last)
+        Some(ScanMark(std::sync::Arc::clone(self)))
+    }
+
+    /// True while a scan runs.
+    pub fn in_flight(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -298,6 +316,11 @@ impl Enforcer {
             sidechain_id,
             scans: std::sync::Arc::default(),
         })
+    }
+
+    /// True while a wallet scan of this client runs.
+    pub fn scan_in_flight(&self) -> bool {
+        self.scans.in_flight()
     }
 
     pub fn sidechain_id(&self) -> u32 {
@@ -778,14 +801,19 @@ impl Enforcer {
     ) -> Result<Txid> {
         match self.send_bmm_request(bid_sats, tip, h_star).await {
             Err(error) if spends_a_gone_coin(&error) => {
-                let scans = std::sync::Arc::clone(&self.scans);
-                let Some(_scan) = scans.try_begin(tip.0) else {
+                let Some(mark) = self.scans.try_begin(tip.0) else {
                     return Err(error);
                 };
                 tracing::warn!(%error, "the enforcer wallet holds a spent coin, so it scans again");
-                let scanned = tokio::time::timeout(FULL_SCAN_TIMEOUT, self.full_scan())
-                    .await
-                    .unwrap_or(Err(EnforcerError::ScanTimeout));
+                let mut scanner = self.clone();
+                let scan = tokio::spawn(async move {
+                    let _mark = mark;
+                    scanner.full_scan().await
+                });
+                let scanned = match tokio::time::timeout(FULL_SCAN_WAIT, scan).await {
+                    Ok(Ok(scanned)) => scanned,
+                    Ok(Err(_)) | Err(_) => Err(EnforcerError::ScanTimeout),
+                };
                 after_scan(error, scanned)?;
                 self.send_bmm_request(bid_sats, tip, h_star).await
             }
@@ -1409,18 +1437,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn one_scan_runs_at_a_time_and_once_for_each_tip() {
-        let gate = ScanGate::default();
+    #[test]
+    fn one_scan_runs_at_a_time_and_once_for_each_tip() {
+        let gate = std::sync::Arc::new(ScanGate::default());
         let tip = BlockHash::from_byte_array([1u8; 32]);
         let first = gate.try_begin(tip);
         assert!(first.is_some());
+        assert!(gate.in_flight());
         assert!(
             gate.try_begin(BlockHash::from_byte_array([2u8; 32]))
                 .is_none(),
             "a scan runs"
         );
         drop(first);
+        assert!(!gate.in_flight(), "the end of the scan clears the mark");
         assert!(gate.try_begin(tip).is_none(), "the tip was scanned");
         assert!(gate
             .try_begin(BlockHash::from_byte_array([2u8; 32]))

@@ -948,6 +948,16 @@ pub enum Bid {
     Rejected,
     /// The bid tx may have gone out, and its answer was lost.
     Unknown,
+    /// A wallet scan runs, so the bid waits for a later round.
+    Busy,
+}
+
+/// The longest time of one bid: the request, a wallet scan, and the resend.
+pub const BID_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The answer of `request`, or `None` after `deadline`.
+pub async fn within<T>(deadline: Duration, request: impl Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(deadline, request).await.ok()
 }
 
 /// True when a checkpoint at eCash height `height` for `block` passes rule 3:
@@ -1106,10 +1116,23 @@ async fn bid(
         tracing::debug!(height, "the fees of one block give no bid");
         return Ok(Bid::Declined);
     }
-    match enforcer
-        .create_bmm_request(bid, tip, &pair.commitment())
-        .await
-    {
+    if enforcer.scan_in_flight() {
+        tracing::info!(height, "a wallet scan runs, so the bid waits");
+        return Ok(Bid::Busy);
+    }
+    let Some(answer) = within(
+        BID_DEADLINE,
+        enforcer.create_bmm_request(bid, tip, &pair.commitment()),
+    )
+    .await
+    else {
+        tracing::warn!(
+            height,
+            "the bid took too long, and the tip gets no other bid"
+        );
+        return Ok(Bid::Unknown);
+    };
+    match answer {
         Ok(txid) => {
             tracing::info!(height, bid, slot, %txid, "the loop bid for an eCash block");
             memory.lock().await.remember(pair);
@@ -1150,7 +1173,10 @@ pub fn bids_for(no_bid: bool, last_bid_tip: Option<BlockHash>, tip: BlockHash) -
 /// passes rule 3 yet, the node refused the bid tx, or the round failed before
 /// any bid tx. A bid whose outcome is unknown gets no second try.
 pub fn bids_again(result: &Result<Bid, BmmError>) -> bool {
-    matches!(result, Ok(Bid::NoBlock | Bid::Rejected) | Err(_))
+    matches!(
+        result,
+        Ok(Bid::NoBlock | Bid::Rejected | Bid::Busy) | Err(_)
+    )
 }
 
 /// True when a failed round must stop the loop. The enforcer and the Solana
@@ -1470,6 +1496,15 @@ mod tests {
         assert!(!round_error_is_fatal(&block));
         assert!(round_error_is_fatal(&BmmError::BadBidPercent(0)));
         assert!(round_error_is_fatal(&BmmError::HeightTooLarge(1)));
+    }
+
+    #[tokio::test]
+    async fn a_bid_past_its_deadline_has_an_unknown_outcome() {
+        let stuck = within(Duration::from_millis(20), std::future::pending::<()>()).await;
+        assert!(stuck.is_none());
+        assert_eq!(within(Duration::from_secs(5), async { 7 }).await, Some(7));
+        assert!(!bids_again(&Ok(Bid::Unknown)));
+        assert!(bids_again(&Ok(Bid::Busy)), "a running scan delays the bid");
     }
 
     #[test]
