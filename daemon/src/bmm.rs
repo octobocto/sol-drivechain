@@ -895,27 +895,6 @@ async fn round(
         Err(error) => tracing::warn!(%error, "the loop cannot read the fees of the blocks"),
     }
 
-    if !settings.no_bid && *last_bid_tip != Some(tip.0) {
-        let retry = match bid(live, &mut enforcer, memory, rules, tip).await {
-            // The credits of the branch can catch up before the next
-            // eCash block, so the next round tries the same tip again.
-            Ok(Bid::NoBlock) => true,
-            Ok(_) => false,
-            Err(error) => {
-                if round_error_is_fatal(&error) {
-                    return Err(error);
-                }
-                // A bid is an offer, not a duty. The loop must keep the
-                // settles going when the eCash wallet or the enforcer
-                // refuses one bid.
-                tracing::warn!(%error, "the bid failed, and the loop goes on");
-                false
-            }
-        };
-        if !retry {
-            *last_bid_tip = Some(tip.0);
-        }
-    }
     let pairs = memory.lock().await.pairs_to_publish(
         config.bmm_next_height,
         tip_height,
@@ -929,7 +908,27 @@ async fn round(
         .lock()
         .await
         .forget_fees_below(tip_height.saturating_sub(settings.confirmations + 1));
-    settle(live, settings, identity, tip).await
+    // The settles and the pairs go first, so a slow bid or a wallet scan
+    // never holds them back.
+    let settled = settle(live, settings, identity, tip).await;
+    // The settles can take long, and a bid must name the newest tip.
+    let tip = enforcer.tip().await?;
+    if bids_for(settings.no_bid, *last_bid_tip, tip.0) {
+        let result = bid(live, &mut enforcer, memory, rules, tip).await;
+        if let Err(error) = &result {
+            if round_error_is_fatal(error) {
+                return result.map(|_| ());
+            }
+            // A bid is an offer, not a duty. The loop must keep the settles
+            // going when the eCash wallet or the enforcer refuses one bid.
+            tracing::warn!(%error, "the bid failed, and the next round tries the tip again");
+        }
+        let retry = bids_again(&result);
+        if !retry {
+            *last_bid_tip = Some(tip.0);
+        }
+    }
+    settled
 }
 
 /// What one round of the loop did about the bid for the next eCash block.
@@ -940,6 +939,21 @@ pub enum Bid {
     Declined,
     /// No recorded block of the followed branch passes rule 3 yet.
     NoBlock,
+    /// The node or the wallet refused the bid tx for sure, so no tx went out.
+    Rejected,
+    /// The bid tx may have gone out, and its answer was lost.
+    Unknown,
+    /// A wallet scan runs, so the bid waits for a later round.
+    Busy,
+}
+
+/// Keeps and publishes the pair of a bid before the bid goes out. A bid with
+/// a lost answer can still win, and its commitment then needs the pair.
+pub async fn keep_pair(memory: &Mutex<Memory>, rpc: &RpcClient, pair: Pair) {
+    memory.lock().await.remember(pair);
+    if let Err(error) = publish_pairs(rpc, &[pair]).await {
+        tracing::warn!(%error, height = pair.height, "the loop cannot publish its pair yet");
+    }
 }
 
 /// True when a checkpoint at eCash height `height` for `block` passes rule 3:
@@ -1098,16 +1112,17 @@ async fn bid(
         tracing::debug!(height, "the fees of one block give no bid");
         return Ok(Bid::Declined);
     }
+    if enforcer.scan_in_flight() {
+        tracing::info!(height, "a wallet scan runs, so the bid waits");
+        return Ok(Bid::Busy);
+    }
+    keep_pair(memory, &live.rpc, pair).await;
     match enforcer
         .create_bmm_request(bid, tip, &pair.commitment())
         .await
     {
         Ok(txid) => {
             tracing::info!(height, bid, slot, %txid, "the loop bid for an eCash block");
-            memory.lock().await.remember(pair);
-            if let Err(error) = publish_pairs(&live.rpc, &[pair]).await {
-                tracing::warn!(%error, height, "the loop cannot publish its pair yet");
-            }
             Ok(Bid::Sent(pair))
         }
         Err(error) if tip_moved(&error) => {
@@ -1119,8 +1134,33 @@ async fn bid(
             );
             Ok(Bid::Declined)
         }
-        Err(error) => Err(error.into()),
+        Err(error) if crate::enforcer::bid_rejected(&error) => {
+            tracing::warn!(%error, height, "the node refused the bid, and the next round bids again");
+            Ok(Bid::Rejected)
+        }
+        Err(error) => {
+            // The bid tx may be out. A second one could pay twice, so the
+            // loop makes no other bid for this tip.
+            tracing::warn!(%error, height, "the bid has no clear answer, and the tip gets no other bid");
+            Ok(Bid::Unknown)
+        }
     }
+}
+
+/// True when the round bids for the eCash tip `tip`, read after the settles:
+/// bids are on, and the loop made no final bid for that tip yet.
+pub fn bids_for(no_bid: bool, last_bid_tip: Option<BlockHash>, tip: BlockHash) -> bool {
+    !no_bid && last_bid_tip != Some(tip)
+}
+
+/// True when the next round bids for the same tip again: no recorded block
+/// passes rule 3 yet, the node refused the bid tx, or the round failed before
+/// any bid tx. A bid whose outcome is unknown gets no second try.
+pub fn bids_again(result: &Result<Bid, BmmError>) -> bool {
+    matches!(
+        result,
+        Ok(Bid::NoBlock | Bid::Rejected | Bid::Busy) | Err(_)
+    )
 }
 
 /// True when a failed round must stop the loop. The enforcer and the Solana
@@ -1506,6 +1546,50 @@ mod tests {
         assert!(!round_error_is_fatal(&block));
         assert!(round_error_is_fatal(&BmmError::BadBidPercent(0)));
         assert!(round_error_is_fatal(&BmmError::HeightTooLarge(1)));
+    }
+
+    #[tokio::test]
+    async fn a_pair_is_kept_and_published_before_its_bid() {
+        let memory = Mutex::new(Memory::default());
+        let rpc = RpcClient::new_mock("succeeds".to_owned());
+        let pair = pair_at(500, 9);
+        keep_pair(&memory, &rpc, pair).await;
+        // The bid then has a lost answer, and the pair stays for the publish.
+        assert!(!bids_again(&Ok(Bid::Unknown)));
+        let kept = memory.lock().await.pairs_to_publish(400, 505, 6);
+        assert_eq!(kept, vec![pair]);
+        assert!(bids_again(&Ok(Bid::Busy)), "a running scan delays the bid");
+    }
+
+    #[test]
+    fn the_bid_names_the_tip_after_the_settles() {
+        let before = BlockHash::from_byte_array([1u8; 32]);
+        let after = BlockHash::from_byte_array([2u8; 32]);
+        // A tip that moved during the settles gets its bid in this round.
+        assert!(bids_for(false, Some(before), after));
+        assert!(!bids_for(false, Some(after), after));
+        assert!(!bids_for(true, None, after));
+    }
+
+    #[test]
+    fn a_failed_bid_tries_the_tip_again_in_the_next_round() {
+        let stale = BmmError::Enforcer(crate::enforcer::EnforcerError::Call {
+            call: "CreateBmmCriticalDataTransaction",
+            source: tonic::Status::unknown("bad-txns-inputs-missingorspent"),
+        });
+        assert!(bids_again(&Err(stale)));
+        assert!(bids_again(&Ok(Bid::NoBlock)));
+        assert!(bids_again(&Ok(Bid::Rejected)));
+        assert!(
+            !bids_again(&Ok(Bid::Unknown)),
+            "a lost answer gets no second bid"
+        );
+        assert!(!bids_again(&Ok(Bid::Declined)));
+        assert!(!bids_again(&Ok(Bid::Sent(Pair {
+            height: 1,
+            block: [1u8; 32],
+            payee: Pubkey::new_from_array([2u8; 32]),
+        }))));
     }
 
     #[test]
