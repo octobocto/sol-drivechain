@@ -916,7 +916,9 @@ async fn round(
     // The settles and the pairs go first, so a slow bid or a wallet scan
     // never holds them back.
     let settled = settle(live, settings, identity, tip, &config, reads).await;
-    if !settings.no_bid && *last_bid_tip != Some(tip.0) {
+    // The settles can take long, and a bid must name the newest tip.
+    let tip = enforcer.tip().await?;
+    if bids_for(settings.no_bid, *last_bid_tip, tip.0) {
         let result = bid(live, &mut enforcer, memory, rules, tip).await;
         if let Err(error) = &result {
             if round_error_is_fatal(error) {
@@ -1136,6 +1138,12 @@ async fn bid(
             Ok(Bid::Unknown)
         }
     }
+}
+
+/// True when the round bids for the eCash tip `tip`, read after the settles:
+/// bids are on, and the loop made no final bid for that tip yet.
+pub fn bids_for(no_bid: bool, last_bid_tip: Option<BlockHash>, tip: BlockHash) -> bool {
+    !no_bid && last_bid_tip != Some(tip)
 }
 
 /// True when the next round bids for the same tip again: no recorded block
@@ -1462,6 +1470,16 @@ mod tests {
         assert!(!round_error_is_fatal(&block));
         assert!(round_error_is_fatal(&BmmError::BadBidPercent(0)));
         assert!(round_error_is_fatal(&BmmError::HeightTooLarge(1)));
+    }
+
+    #[test]
+    fn the_bid_names_the_tip_after_the_settles() {
+        let before = BlockHash::from_byte_array([1u8; 32]);
+        let after = BlockHash::from_byte_array([2u8; 32]);
+        // A tip that moved during the settles gets its bid in this round.
+        assert!(bids_for(false, Some(before), after));
+        assert!(!bids_for(false, Some(after), after));
+        assert!(!bids_for(true, None, after));
     }
 
     #[test]

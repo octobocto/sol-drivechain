@@ -783,10 +783,10 @@ impl Enforcer {
                     return Err(error);
                 };
                 tracing::warn!(%error, "the enforcer wallet holds a spent coin, so it scans again");
-                match tokio::time::timeout(FULL_SCAN_TIMEOUT, self.full_scan()).await {
-                    Ok(scanned) => scanned?,
-                    Err(_) => return Err(EnforcerError::ScanTimeout),
-                }
+                let scanned = tokio::time::timeout(FULL_SCAN_TIMEOUT, self.full_scan())
+                    .await
+                    .unwrap_or(Err(EnforcerError::ScanTimeout));
+                after_scan(error, scanned)?;
                 self.send_bmm_request(bid_sats, tip, h_star).await
             }
             result => result,
@@ -1041,6 +1041,18 @@ pub fn spends_a_gone_coin(error: &EnforcerError) -> bool {
         EnforcerError::Call { source, .. }
             if source.message().contains("bad-txns-inputs-missingorspent")
     )
+}
+
+/// The outcome of a stale-coin refusal after the wallet scan. A failed scan
+/// sent no new tx, so the refusal stays, and the next round can bid again.
+pub fn after_scan(refusal: EnforcerError, scanned: Result<()>) -> Result<()> {
+    match scanned {
+        Ok(()) => Ok(()),
+        Err(scan) => {
+            tracing::warn!(error = %scan, "the wallet scan failed, and the bid stays refused");
+            Err(refusal)
+        }
+    }
 }
 
 /// True when the bid tx spends a coin that the active chain does not hold.
@@ -1376,6 +1388,25 @@ mod tests {
             source: tonic::Status::deadline_exceeded("timeout"),
         }));
         assert!(!bid_rejected(&EnforcerError::ScanTimeout));
+    }
+
+    #[test]
+    fn a_failed_scan_keeps_the_refusal() {
+        let refusal = || EnforcerError::Call {
+            call: "CreateBmmCriticalDataTransaction",
+            source: tonic::Status::unknown("bad-txns-inputs-missingorspent"),
+        };
+        assert!(after_scan(refusal(), Ok(())).is_ok());
+        for scan in [
+            EnforcerError::ScanTimeout,
+            EnforcerError::Call {
+                call: "FullScan",
+                source: tonic::Status::aborted("a scan runs"),
+            },
+        ] {
+            let kept = after_scan(refusal(), Err(scan)).unwrap_err();
+            assert!(bid_rejected(&kept), "{kept}");
+        }
     }
 
     #[tokio::test]
