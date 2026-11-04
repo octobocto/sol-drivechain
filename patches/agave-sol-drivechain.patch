@@ -1245,7 +1245,7 @@ index c5a5f4d..65a3936 100644
      /// A wrapper around `root_utils::check_and_handle_new_root` which:
      /// - calls into `root_utils::set_bank_forks_root`
 diff --git a/core/src/validator.rs b/core/src/validator.rs
-index 400ad25..1021348 100644
+index 400ad25..8ecabcd 100644
 --- a/core/src/validator.rs
 +++ b/core/src/validator.rs
 @@ -2159,6 +2159,18 @@ fn post_process_restored_tower(
@@ -1267,23 +1267,31 @@ index 400ad25..1021348 100644
          let slot_history = root_bank
              .get_slot_history()
              .expect("slot history must exist");
-@@ -2399,6 +2411,15 @@ fn load_blockstore(
+@@ -2399,6 +2411,23 @@ fn load_blockstore(
      // following boot sequence (esp BankForks) could set root. so stash the original value
      // of blockstore root away here as soon as possible.
      let original_blockstore_root = blockstore.max_root();
-+    // sol-drivechain: each slot of this ledger that this node froze before
++    // sol-drivechain: each block of this ledger that this node froze before
 +    // takes the answer of that run, so an eCash reorg since cannot stop it.
-+    sol_drivechain_bmm::answers::answers().set_replay_root(
++    let answers = sol_drivechain_bmm::answers::answers();
++    answers.set_replay_root(
 +        blockstore
 +            .highest_slot()
 +            .ok()
 +            .flatten()
 +            .unwrap_or(original_blockstore_root),
 +    );
++    let ledger = Arc::downgrade(&blockstore);
++    answers.set_frozen_hashes(move |slot| {
++        ledger
++            .upgrade()?
++            .get_bank_hash(slot)
++            .map(|hash| hash.to_bytes())
++    });
      process_options.halt_at_slot = blockstore.highest_slot().unwrap_or(None);
  
      let enable_rpc_transaction_history =
-@@ -2588,7 +2609,10 @@ impl<'a> ProcessBlockStore<'a> {
+@@ -2588,7 +2617,10 @@ impl<'a> ProcessBlockStore<'a> {
          // Load and post process tower
          let tower = {
              let restored_tower = Tower::restore(self.config.tower_storage.as_ref(), self.id);
@@ -1643,15 +1651,34 @@ index dbc053b..ed34d7f 100644
  solana-account-decoder = { workspace = true }
  solana-accounts-db = { workspace = true }
 diff --git a/rpc/src/rpc.rs b/rpc/src/rpc.rs
-index 7bf84a0..e6ec90e 100644
+index 7bf84a0..2819e8e 100644
 --- a/rpc/src/rpc.rs
 +++ b/rpc/src/rpc.rs
-@@ -146,6 +146,48 @@ fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
+@@ -146,6 +146,67 @@ fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
      }
  }
  
-+/// sol-drivechain: the bank of the BMM finalized slot, or an error when the
-+/// bank forks no longer hold it.
++/// sol-drivechain: exactly the bank at the BMM final slot, or an error.
++#[allow(clippy::result_large_err)]
++fn bmm_final_bank(
++    bank_forks: &BankForks,
++    slot: Slot,
++) -> std::result::Result<Arc<Bank>, RpcCustomError> {
++    bank_forks
++        .get(slot)
++        .ok_or(RpcCustomError::BlockNotAvailable { slot })
++}
++
++/// sol-drivechain: the status of `signature` at or below the slot of `bank`.
++/// The status cache also gives the newer roots, and a BMM final bank can be
++/// below the root.
++fn status_at(bank: &Bank, signature: &Signature) -> Option<(Slot, transaction::Result<()>)> {
++    bank.get_signature_status_slot(signature)
++        .filter(|(slot, _)| *slot <= bank.slot())
++}
++
++/// sol-drivechain: the bank of the BMM finalized slot for a read of account
++/// state, or an error when the bank forks no longer hold it.
 +#[allow(clippy::result_large_err)]
 +fn bmm_finalized_bank(
 +    bank_forks: &BankForks,
@@ -1695,7 +1722,7 @@ index 7bf84a0..e6ec90e 100644
  fn is_finalized(
      block_commitment_cache: &BlockCommitmentCache,
      bank: &Bank,
-@@ -269,11 +311,21 @@ impl JsonRpcRequestProcessor {
+@@ -269,11 +330,50 @@ impl JsonRpcRequestProcessor {
  
  impl JsonRpcRequestProcessor {
      fn get_bank_with_config(&self, config: RpcContextConfig) -> Result<Arc<Bank>> {
@@ -1704,8 +1731,37 @@ index 7bf84a0..e6ec90e 100644
 -            min_context_slot,
 -        } = config;
 -        let bank = self.bank(commitment);
-+        let bank = self.bank(config.commitment);
++        let bank = self.metadata_bank(config.commitment)?;
 +        Self::check_min_context_slot(bank, config.min_context_slot)
++    }
++
++    /// sol-drivechain: the bank for a read of block metadata. At `finalized`
++    /// it is exactly the BMM final bank, which can lie below the root, or an
++    /// error. It never takes another bank in its place.
++    #[allow(clippy::result_large_err)]
++    fn metadata_bank(
++        &self,
++        commitment: Option<CommitmentConfig>,
++    ) -> std::result::Result<Arc<Bank>, RpcCustomError> {
++        let final_slot = sol_drivechain_bmm::fork_choice::enabled()
++            .then(sol_drivechain_bmm::fork_choice::final_root);
++        self.metadata_bank_at(commitment, final_slot)
++    }
++
++    /// `metadata_bank` with `final_slot`, the BMM final slot when BMM is on.
++    #[allow(clippy::result_large_err)]
++    fn metadata_bank_at(
++        &self,
++        commitment: Option<CommitmentConfig>,
++        final_slot: Option<Slot>,
++    ) -> std::result::Result<Arc<Bank>, RpcCustomError> {
++        let level = commitment.unwrap_or_default().commitment;
++        match final_slot {
++            Some(slot) if level == CommitmentLevel::Finalized => {
++                bmm_final_bank(&self.bank_forks.read().unwrap(), slot)
++            }
++            _ => Ok(self.bank(commitment)),
++        }
 +    }
 +
 +    /// sol-drivechain: the bank for a read of account state. At `finalized`
@@ -1722,7 +1778,7 @@ index 7bf84a0..e6ec90e 100644
          if let Some(min_context_slot) = min_context_slot
              && bank.slot() < min_context_slot
          {
-@@ -343,6 +395,35 @@ impl JsonRpcRequestProcessor {
+@@ -343,6 +443,35 @@ impl JsonRpcRequestProcessor {
          Ok(accounts)
      }
  
@@ -1758,7 +1814,7 @@ index 7bf84a0..e6ec90e 100644
      #[allow(deprecated)]
      fn bank(&self, commitment: Option<CommitmentConfig>) -> Arc<Bank> {
          debug!("RPC commitment_config: {commitment:?}");
-@@ -538,7 +619,7 @@ impl JsonRpcRequestProcessor {
+@@ -538,7 +667,7 @@ impl JsonRpcRequestProcessor {
              commitment,
              min_context_slot,
          } = config.unwrap_or_default();
@@ -1767,7 +1823,7 @@ index 7bf84a0..e6ec90e 100644
              commitment,
              min_context_slot,
          })?;
-@@ -552,6 +633,7 @@ impl JsonRpcRequestProcessor {
+@@ -552,6 +681,7 @@ impl JsonRpcRequestProcessor {
              })
              .await
              .expect("rpc: get_encoded_account panicked")?;
@@ -1775,7 +1831,7 @@ index 7bf84a0..e6ec90e 100644
          Ok(new_response(&bank, response))
      }
  
-@@ -566,7 +648,7 @@ impl JsonRpcRequestProcessor {
+@@ -566,7 +696,7 @@ impl JsonRpcRequestProcessor {
              commitment,
              min_context_slot,
          } = config.unwrap_or_default();
@@ -1784,7 +1840,7 @@ index 7bf84a0..e6ec90e 100644
              commitment,
              min_context_slot,
          })?;
-@@ -584,6 +666,7 @@ impl JsonRpcRequestProcessor {
+@@ -584,6 +714,7 @@ impl JsonRpcRequestProcessor {
                      .expect("rpc: get_encoded_account panicked")?,
              );
          }
@@ -1792,7 +1848,21 @@ index 7bf84a0..e6ec90e 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -610,7 +693,7 @@ impl JsonRpcRequestProcessor {
+@@ -591,9 +722,10 @@ impl JsonRpcRequestProcessor {
+         &self,
+         data_len: usize,
+         commitment: Option<CommitmentConfig>,
+-    ) -> u64 {
+-        self.bank(commitment)
+-            .get_minimum_balance_for_rent_exemption(data_len)
++    ) -> Result<u64> {
++        Ok(self
++            .metadata_bank(commitment)?
++            .get_minimum_balance_for_rent_exemption(data_len))
+     }
+ 
+     pub async fn get_program_accounts(
+@@ -610,7 +742,7 @@ impl JsonRpcRequestProcessor {
              commitment,
              min_context_slot,
          } = config.unwrap_or_default();
@@ -1801,7 +1871,7 @@ index 7bf84a0..e6ec90e 100644
              commitment,
              min_context_slot,
          })?;
-@@ -660,6 +743,7 @@ impl JsonRpcRequestProcessor {
+@@ -660,6 +792,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Result<Vec<_>>>()?
          };
@@ -1809,7 +1879,18 @@ index 7bf84a0..e6ec90e 100644
          Ok(match with_context {
              true => OptionalContext::Context(new_response(&bank, accounts)),
              false => OptionalContext::NoContext(accounts),
-@@ -938,8 +1022,10 @@ impl JsonRpcRequestProcessor {
+@@ -896,8 +1029,8 @@ impl JsonRpcRequestProcessor {
+     pub fn get_inflation_governor(
+         &self,
+         commitment: Option<CommitmentConfig>,
+-    ) -> RpcInflationGovernor {
+-        self.bank(commitment).inflation().into()
++    ) -> Result<RpcInflationGovernor> {
++        Ok(self.metadata_bank(commitment)?.inflation().into())
+     }
+ 
+     pub fn get_inflation_rate(&self) -> RpcInflationRate {
+@@ -938,8 +1071,10 @@ impl JsonRpcRequestProcessor {
          pubkey: &Pubkey,
          config: RpcContextConfig,
      ) -> Result<RpcResponse<u64>> {
@@ -1822,7 +1903,18 @@ index 7bf84a0..e6ec90e 100644
      }
  
      pub fn confirm_transaction(
-@@ -966,6 +1052,16 @@ impl JsonRpcRequestProcessor {
+@@ -947,8 +1082,8 @@ impl JsonRpcRequestProcessor {
+         signature: &Signature,
+         commitment: Option<CommitmentConfig>,
+     ) -> Result<RpcResponse<bool>> {
+-        let bank = self.bank(commitment);
+-        let status = bank.get_signature_status(signature);
++        let bank = self.metadata_bank(commitment)?;
++        let status = status_at(&bank, signature).map(|(_, status)| status);
+         match status {
+             Some(status) => Ok(new_response(&bank, status.is_ok())),
+             None => Ok(new_response(&bank, false)),
+@@ -966,6 +1101,16 @@ impl JsonRpcRequestProcessor {
      }
  
      fn get_slot(&self, config: RpcContextConfig) -> Result<Slot> {
@@ -1839,7 +1931,16 @@ index 7bf84a0..e6ec90e 100644
          let bank = self.get_bank_with_config(config)?;
          Ok(bank.slot())
      }
-@@ -1065,7 +1161,7 @@ impl JsonRpcRequestProcessor {
+@@ -994,7 +1139,7 @@ impl JsonRpcRequestProcessor {
+         start_slot: Slot,
+         limit: usize,
+     ) -> Result<Vec<Pubkey>> {
+-        let bank = self.bank(commitment);
++        let bank = self.metadata_bank(commitment)?;
+ 
+         let (mut epoch, mut slot_index) =
+             bank.epoch_schedule().get_epoch_and_slot_index(start_slot);
+@@ -1065,7 +1210,7 @@ impl JsonRpcRequestProcessor {
          config: Option<RpcLargestAccountsConfig>,
      ) -> RpcCustomResult<RpcResponse<Vec<RpcAccountBalance>>> {
          let config = config.unwrap_or_default();
@@ -1848,7 +1949,7 @@ index 7bf84a0..e6ec90e 100644
  
          if let Some((slot, accounts)) = self.get_cached_largest_accounts(&config.filter) {
              Ok(RpcResponse {
-@@ -1109,6 +1205,7 @@ impl JsonRpcRequestProcessor {
+@@ -1109,6 +1254,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Vec<RpcAccountBalance>>();
  
@@ -1856,7 +1957,7 @@ index 7bf84a0..e6ec90e 100644
              self.set_cached_largest_accounts(&config.filter, bank.slot(), &accounts);
              Ok(new_response(&bank, accounts))
          }
-@@ -1119,7 +1216,7 @@ impl JsonRpcRequestProcessor {
+@@ -1119,7 +1265,7 @@ impl JsonRpcRequestProcessor {
          config: Option<RpcSupplyConfig>,
      ) -> RpcCustomResult<RpcResponse<RpcSupply>> {
          let config = config.unwrap_or_default();
@@ -1865,7 +1966,7 @@ index 7bf84a0..e6ec90e 100644
          let non_circulating_supply =
              self.calculate_non_circulating_supply(&bank)
                  .await
-@@ -1137,6 +1234,7 @@ impl JsonRpcRequestProcessor {
+@@ -1137,6 +1283,7 @@ impl JsonRpcRequestProcessor {
                  .collect()
          };
  
@@ -1873,7 +1974,7 @@ index 7bf84a0..e6ec90e 100644
          Ok(new_response(
              &bank,
              RpcSupply {
-@@ -1160,7 +1258,7 @@ impl JsonRpcRequestProcessor {
+@@ -1160,7 +1307,7 @@ impl JsonRpcRequestProcessor {
              None
          };
  
@@ -1882,7 +1983,38 @@ index 7bf84a0..e6ec90e 100644
          let commission_rate_in_basis_points = bank
              .feature_set
              .is_active(&agave_feature_set::commission_rate_in_basis_points::id());
-@@ -2011,7 +2109,7 @@ impl JsonRpcRequestProcessor {
+@@ -1640,7 +1787,7 @@ impl JsonRpcRequestProcessor {
+         signature: Signature,
+         commitment: Option<CommitmentConfig>,
+     ) -> Result<Option<RpcSignatureConfirmation>> {
+-        let bank = self.bank(commitment);
++        let bank = self.metadata_bank(commitment)?;
+         Ok(self
+             .get_transaction_status(signature, &bank)
+             .map(|transaction_status| {
+@@ -1659,10 +1806,8 @@ impl JsonRpcRequestProcessor {
+         signature: Signature,
+         commitment: Option<CommitmentConfig>,
+     ) -> Result<Option<transaction::Result<()>>> {
+-        let bank = self.bank(commitment);
+-        Ok(bank
+-            .get_signature_status_slot(&signature)
+-            .map(|(_, status)| status))
++        let bank = self.metadata_bank(commitment)?;
++        Ok(status_at(&bank, &signature).map(|(_, status)| status))
+     }
+ 
+     pub async fn get_signature_statuses(
+@@ -1729,7 +1874,7 @@ impl JsonRpcRequestProcessor {
+         signature: Signature,
+         bank: &Bank,
+     ) -> Option<TransactionStatus> {
+-        let (slot, status) = bank.get_signature_status_slot(&signature)?;
++        let (slot, status) = status_at(bank, &signature)?;
+ 
+         let optimistically_confirmed_bank = self.bank(Some(CommitmentConfig::confirmed()));
+         let optimistically_confirmed =
+@@ -2011,7 +2156,7 @@ impl JsonRpcRequestProcessor {
          pubkey: &Pubkey,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<UiTokenAmount>> {
@@ -1891,7 +2023,7 @@ index 7bf84a0..e6ec90e 100644
          let account = bank.get_account(pubkey).ok_or_else(|| {
              Error::invalid_params("Invalid param: could not find account".to_string())
          })?;
-@@ -2027,6 +2125,7 @@ impl JsonRpcRequestProcessor {
+@@ -2027,6 +2172,7 @@ impl JsonRpcRequestProcessor {
              .expect("Token account mint should be convertible to Pubkey");
          let (_, data) = get_mint_owner_and_additional_data(&bank, mint)?;
          let balance = token_amount_to_ui_amount_v3(token_account.base.amount, &data);
@@ -1899,7 +2031,7 @@ index 7bf84a0..e6ec90e 100644
          Ok(new_response(&bank, balance))
      }
  
-@@ -2035,7 +2134,7 @@ impl JsonRpcRequestProcessor {
+@@ -2035,7 +2181,7 @@ impl JsonRpcRequestProcessor {
          mint: &Pubkey,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<UiTokenAmount>> {
@@ -1908,7 +2040,7 @@ index 7bf84a0..e6ec90e 100644
          let mint_account = bank.get_account(mint).ok_or_else(|| {
              Error::invalid_params("Invalid param: could not find account".to_string())
          })?;
-@@ -2066,6 +2165,7 @@ impl JsonRpcRequestProcessor {
+@@ -2066,6 +2212,7 @@ impl JsonRpcRequestProcessor {
                  scaled_ui_amount_config,
              },
          );
@@ -1916,7 +2048,7 @@ index 7bf84a0..e6ec90e 100644
          Ok(new_response(&bank, supply))
      }
  
-@@ -2074,7 +2174,7 @@ impl JsonRpcRequestProcessor {
+@@ -2074,7 +2221,7 @@ impl JsonRpcRequestProcessor {
          mint: Pubkey,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<Vec<RpcTokenAccountBalance>>> {
@@ -1925,7 +2057,7 @@ index 7bf84a0..e6ec90e 100644
          let (mint_owner, data) = get_mint_owner_and_additional_data(&bank, &mint)?;
          if !is_known_spl_token_id(&mint_owner) {
              return Err(Error::invalid_params(
-@@ -2122,6 +2222,7 @@ impl JsonRpcRequestProcessor {
+@@ -2122,6 +2269,7 @@ impl JsonRpcRequestProcessor {
              })
              .collect::<Result<Vec<_>>>()?;
  
@@ -1933,7 +2065,7 @@ index 7bf84a0..e6ec90e 100644
          Ok(new_response(&bank, token_balances))
      }
  
-@@ -2138,7 +2239,7 @@ impl JsonRpcRequestProcessor {
+@@ -2138,7 +2286,7 @@ impl JsonRpcRequestProcessor {
              commitment,
              min_context_slot,
          } = config.unwrap_or_default();
@@ -1942,7 +2074,7 @@ index 7bf84a0..e6ec90e 100644
              commitment,
              min_context_slot,
          })?;
-@@ -2176,6 +2277,7 @@ impl JsonRpcRequestProcessor {
+@@ -2176,6 +2324,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Result<Vec<_>>>()?
          };
@@ -1950,7 +2082,7 @@ index 7bf84a0..e6ec90e 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -2192,7 +2294,7 @@ impl JsonRpcRequestProcessor {
+@@ -2192,7 +2341,7 @@ impl JsonRpcRequestProcessor {
              commitment,
              min_context_slot,
          } = config.unwrap_or_default();
@@ -1959,7 +2091,7 @@ index 7bf84a0..e6ec90e 100644
              commitment,
              min_context_slot,
          })?;
-@@ -2242,6 +2344,7 @@ impl JsonRpcRequestProcessor {
+@@ -2242,6 +2391,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Result<Vec<_>>>()?
          };
@@ -1967,7 +2099,7 @@ index 7bf84a0..e6ec90e 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -2825,10 +2928,134 @@ pub mod rpc_minimal {
+@@ -2825,10 +2975,134 @@ pub mod rpc_minimal {
              options: Option<RpcLeaderScheduleConfigWrapper>,
              config: Option<RpcLeaderScheduleConfig>,
          ) -> Result<Option<RpcLeaderSchedule>>;
@@ -2102,7 +2234,61 @@ index 7bf84a0..e6ec90e 100644
          type Metadata = JsonRpcRequestProcessor;
  
          fn get_balance(
-@@ -4032,7 +4259,7 @@ pub mod rpc_full {
+@@ -2968,7 +3242,7 @@ pub mod rpc_minimal {
+                 let _ = verify_pubkey(identity)?;
+             }
+ 
+-            let bank = meta.bank(config.commitment);
++            let bank = meta.metadata_bank(config.commitment)?;
+             let slot = slot.unwrap_or_else(|| bank.slot());
+             let epoch = bank.epoch_schedule().get_epoch(slot);
+ 
+@@ -3064,7 +3338,7 @@ pub mod rpc_bank {
+             if data_len as u64 > solana_system_interface::MAX_PERMITTED_DATA_LENGTH {
+                 return Err(Error::invalid_request());
+             }
+-            Ok(meta.get_minimum_balance_for_rent_exemption(data_len, commitment))
++            meta.get_minimum_balance_for_rent_exemption(data_len, commitment)
+         }
+ 
+         fn get_inflation_governor(
+@@ -3073,7 +3347,7 @@ pub mod rpc_bank {
+             commitment: Option<CommitmentConfig>,
+         ) -> Result<RpcInflationGovernor> {
+             debug!("get_inflation_governor rpc request received");
+-            Ok(meta.get_inflation_governor(commitment))
++            meta.get_inflation_governor(commitment)
+         }
+ 
+         fn get_inflation_rate(&self, meta: Self::Metadata) -> Result<RpcInflationRate> {
+@@ -3139,7 +3413,7 @@ pub mod rpc_bank {
+                 None
+             };
+ 
+-            let bank = meta.bank(config.commitment);
++            let bank = meta.checked_bank(config.commitment)?;
+             let (first_slot, last_slot) = match config.range {
+                 None => (
+                     bank.epoch_schedule().get_first_slot_in_epoch(bank.epoch()),
+@@ -3815,7 +4089,7 @@ pub mod rpc_full {
+             let pubkey = verify_pubkey(&pubkey_str)?;
+ 
+             let config = config.unwrap_or_default();
+-            let bank = meta.bank(config.commitment);
++            let bank = meta.metadata_bank(config.commitment)?;
+ 
+             let blockhash = if let Some(blockhash) = config.recent_blockhash {
+                 verify_hash(&blockhash)?
+@@ -3886,7 +4160,7 @@ pub mod rpc_full {
+             } else {
+                 preflight_commitment.map(|commitment| CommitmentConfig { commitment })
+             };
+-            let preflight_bank = &*meta.get_bank_with_config(RpcContextConfig {
++            let preflight_bank = &*meta.get_state_bank_with_config(RpcContextConfig {
+                 commitment: preflight_commitment,
+                 min_context_slot,
+             })?;
+@@ -4032,7 +4306,7 @@ pub mod rpc_full {
              let (_, mut unsanitized_tx) =
                  decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
  
@@ -2111,10 +2297,78 @@ index 7bf84a0..e6ec90e 100644
                  commitment,
                  min_context_slot,
              })?;
-@@ -5152,6 +5379,61 @@ pub mod tests {
+@@ -4328,7 +4602,7 @@ pub mod rpc_full {
+                 data,
+                 TransactionBinaryEncoding::Base64,
+             )?;
+-            let bank = &*meta.get_bank_with_config(config.unwrap_or_default())?;
++            let bank = &*meta.get_state_bank_with_config(config.unwrap_or_default())?;
+             let sanitized_versioned_message = SanitizedVersionedMessage::try_from(message)
+                 .map_err(|err| {
+                     Error::invalid_params(format!("invalid transaction message: {err}"))
+@@ -5152,6 +5426,120 @@ pub mod tests {
          }
      }
  
++    #[test]
++    fn test_bmm_final_bank_is_exact_and_may_lie_below_the_root() {
++        let genesis = create_genesis_config(100);
++        let bank = Bank::new_for_tests(&genesis.genesis_config);
++        let bank_forks = BankForks::new_rw_arc(bank);
++        let root = bank_forks.read().unwrap().root_bank();
++        let child = Bank::new_from_parent(root, SlotLeader::default(), 1);
++        bank_forks.write().unwrap().insert(child);
++        bank_forks.write().unwrap().set_root(1, None, Some(0));
++        let forks = bank_forks.read().unwrap();
++        assert_eq!(bmm_final_bank(&forks, 0).unwrap().slot(), 0);
++        assert!(bmm_final_bank(&forks, 7).is_err());
++    }
++
++    #[test]
++    fn test_bmm_final_bank_shows_no_status_of_a_newer_root() {
++        let genesis = create_genesis_config(1_000_000);
++        let bank = Bank::new_for_tests(&genesis.genesis_config);
++        let bank_forks = BankForks::new_rw_arc(bank);
++        let final_bank = bank_forks.read().unwrap().root_bank();
++        let child = Bank::new_from_parent(final_bank.clone(), SlotLeader::default(), 1);
++        let signature = child
++            .transfer(10, &genesis.mint_keypair, &Pubkey::new_unique())
++            .unwrap();
++        child.freeze();
++        bank_forks.write().unwrap().insert(child);
++        bank_forks.write().unwrap().set_root(1, None, Some(0));
++        assert_eq!(
++            final_bank
++                .get_signature_status_slot(&signature)
++                .map(|(slot, _)| slot),
++            Some(1)
++        );
++        assert_eq!(status_at(&final_bank, &signature), None);
++        let root = bank_forks.read().unwrap().root_bank();
++        assert_eq!(status_at(&root, &signature), Some((1, Ok(()))));
++    }
++
++    #[test]
++    fn test_bmm_metadata_reads_take_the_final_bank_and_never_the_root() {
++        let genesis = create_genesis_config(1_000_000);
++        let meta = JsonRpcRequestProcessor::new_from_bank(
++            Bank::new_for_tests(&genesis.genesis_config),
++            SocketAddrSpace::Unspecified,
++        );
++        let final_bank = meta.bank_forks.read().unwrap().root_bank();
++        let child = Bank::new_from_parent(final_bank, SlotLeader::default(), 1);
++        meta.bank_forks.write().unwrap().insert(child);
++        meta.bank_forks.write().unwrap().set_root(1, None, Some(0));
++        let finalized = Some(CommitmentConfig::finalized());
++        assert_eq!(meta.metadata_bank_at(finalized, Some(0)).unwrap().slot(), 0);
++        assert!(matches!(
++            meta.metadata_bank_at(finalized, Some(7)),
++            Err(RpcCustomError::BlockNotAvailable { slot: 7 })
++        ));
++        let confirmed = Some(CommitmentConfig::confirmed());
++        assert!(meta.metadata_bank_at(confirmed, Some(7)).is_ok());
++    }
++
 +    #[test]
 +    fn test_bmm_final_slot_compares_the_min_context_slot_to_the_final_root() {
 +        assert_eq!(bmm_final_slot(40, None).unwrap(), 40);
@@ -2303,7 +2557,7 @@ index 2c2292f..52634d7 100644
  solana-account-info = { workspace = true }
  solana-accounts-db = { workspace = true }
 diff --git a/runtime/src/bank.rs b/runtime/src/bank.rs
-index c8399cb..e65b4e8 100644
+index c8399cb..c4dec90 100644
 --- a/runtime/src/bank.rs
 +++ b/runtime/src/bank.rs
 @@ -233,6 +233,7 @@ use {
@@ -2347,7 +2601,7 @@ index c8399cb..e65b4e8 100644
              self.finish_accounts_lt_hash_updates();
              *hash = self.hash_internal_state();
              self.rc.accounts.accounts_db.mark_slot_frozen(self.slot());
-+            self.keep_bmm_answers();
++            self.keep_bmm_answers(&hash);
          }
      }
  
@@ -2423,10 +2677,10 @@ index c8399cb..e65b4e8 100644
                  && let Some(feature) = feature::state::from_account(&account)
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..51c3bef
+index 0000000..681f9bd
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,885 @@
+@@ -0,0 +1,918 @@
 +//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
@@ -2879,10 +3133,10 @@ index 0000000..51c3bef
 +    /// Writes the answers of the committed txs of this bank to the answers
 +    /// file. A failed write stops the validator, because a later replay
 +    /// needs the answer.
-+    pub(super) fn keep_bmm_answers(&self) {
++    pub(super) fn keep_bmm_answers(&self, bank_hash: &Hash) {
 +        let slot = self.slot();
 +        let status_cache = self.status_cache.read().unwrap();
-+        let kept = answers().freeze(slot, |signature, blockhash| {
++        let kept = answers().freeze(slot, &bank_hash.to_bytes(), |signature, blockhash| {
 +            status_cache
 +                .get_status(
 +                    solana_signature::Signature::from(*signature),
@@ -3131,6 +3385,39 @@ index 0000000..51c3bef
 +                assert_eq!(first, second);
 +            }
 +        }
++    }
++
++    #[test]
++    fn a_replaced_block_with_the_same_settle_tx_asks_the_bridge_again() {
++        let genesis = create_genesis_config(1_000_000_000);
++        let (start, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis.genesis_config);
++        store_bridge(&start, 100, 40, 0);
++        let slot = 900_001;
++        let bank = Bank::new_from_parent_with_bank_forks(
++            bank_forks.as_ref(),
++            start,
++            SlotLeader::default(),
++            slot,
++        );
++        let settle_tx = tx(credit_of_view(41), true);
++        let signature: [u8; 64] = settle_tx.signature().as_ref().try_into().unwrap();
++        let first_run = vec![9; 4];
++        static LEDGER_HASH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
++        answers().set_frozen_hashes(move |frozen| {
++            (frozen == slot).then(|| [LEDGER_HASH.load(std::sync::atomic::Ordering::Relaxed); 32])
++        });
++        answers().note(slot, &signature, &[0; 32], &BMM_ANSWER_ID, &first_run);
++        answers().freeze(slot, &[1; 32], |_, _| true).unwrap();
++        answers().set_replay_root(u64::MAX);
++        assert_eq!(
++            answer_of(check(&bank, settle_tx.clone(), BmmCheck::Replay)),
++            first_run
++        );
++
++        LEDGER_HASH.store(2, std::sync::atomic::Ordering::Relaxed);
++        let asked = answer_of(check(&bank, settle_tx.clone(), BmmCheck::Replay));
++        assert_ne!(asked, first_run);
++        assert_eq!(asked, answer_of(check(&bank, settle_tx, BmmCheck::Leader)));
 +    }
 +
 +    #[test]
@@ -3480,16 +3767,17 @@ index 0000000..0538a00
 +workspace = true
 diff --git a/sol-drivechain-bmm/src/answers.rs b/sol-drivechain-bmm/src/answers.rs
 new file mode 100644
-index 0000000..9546c9f
+index 0000000..bf37e56
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/answers.rs
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,551 @@
 +//! The answers of the pre-check, per tx. A replay of a rooted slot uses the
 +//! answer of its first run, because a later eCash reorg can drop the block
 +//! that the tx names, and the view then has no answer for it.
 +//!
 +//! The check of a tx only notes its answer. When the bank of the slot
-+//! freezes, the answers of the committed txs go to the file in one write.
++//! freezes, the answers of the committed txs go to the file in one write,
++//! with the bank hash. Only the same block of the slot uses them again.
 +
 +use {
 +    solana_pubkey::Pubkey,
@@ -3516,16 +3804,29 @@ index 0000000..9546c9f
 +    data: Vec<u8>,
 +}
 +
++/// An answer of a committed tx, and the hash of the bank that froze it.
++/// A line from before the hash has none.
++#[derive(Clone, Debug, PartialEq, Eq)]
++struct Kept {
++    bank_hash: Option<[u8; 32]>,
++    key: Pubkey,
++    data: Vec<u8>,
++}
++
 +#[derive(Default)]
 +struct State {
-+    by_tx: HashMap<TxKey, (Pubkey, Vec<u8>)>,
++    by_tx: HashMap<TxKey, Kept>,
 +    noted: BTreeMap<u64, HashMap<[u8; 64], Noted>>,
 +    path: Option<PathBuf>,
 +    file: crate::Sink,
 +    /// The blockstore root at the start. Only a slot at or below it takes a
 +    /// recorded answer.
 +    replay_root: Option<u64>,
++    /// The bank hash that the ledger holds for a frozen slot.
++    frozen_hash: Option<FrozenHash>,
 +}
++
++type FrozenHash = Box<dyn Fn(u64) -> Option<[u8; 32]> + Send>;
 +
 +/// The answers that this validator gave to the txs of its blocks.
 +#[derive(Default)]
@@ -3580,13 +3881,26 @@ index 0000000..9546c9f
 +        self.state.lock().unwrap().replay_root = Some(slot);
 +    }
 +
-+    /// The answer of the first run of a tx in a slot from before the start.
++    /// Sets where the ledger keeps the bank hash of each frozen slot. A purge
++    /// of a block also drops its hash.
++    pub fn set_frozen_hashes(
++        &self,
++        frozen_hash: impl Fn(u64) -> Option<[u8; 32]> + Send + 'static,
++    ) {
++        self.state.lock().unwrap().frozen_hash = Some(Box::new(frozen_hash));
++    }
++
++    /// The answer of the first run of a tx in a slot from before the start,
++    /// when the ledger still holds the frozen block of that run.
 +    pub fn recorded(&self, slot: u64, signature: &[u8; 64]) -> Option<(Pubkey, Vec<u8>)> {
 +        let state = self.state.lock().unwrap();
 +        if state.replay_root.is_none_or(|root| slot > root) {
 +            return None;
 +        }
-+        state.by_tx.get(&(slot, *signature)).cloned()
++        let kept = state.by_tx.get(&(slot, *signature))?;
++        let frozen_hash = state.frozen_hash.as_ref()?;
++        (kept.bank_hash.is_some() && kept.bank_hash == frozen_hash(slot))
++            .then(|| (kept.key, kept.data.clone()))
 +    }
 +
 +    /// Notes the answer that a tx in `slot` gets. `freeze` keeps it when the
@@ -3611,10 +3925,11 @@ index 0000000..9546c9f
 +    }
 +
 +    /// Keeps the noted answers of `slot` whose tx `committed` gives true for,
-+    /// with one write and one sync.
++    /// with the hash of the frozen bank, in one write.
 +    pub fn freeze(
 +        &self,
 +        slot: u64,
++        bank_hash: &[u8; 32],
 +        mut committed: impl FnMut(&[u8; 64], &[u8; 32]) -> bool,
 +    ) -> io::Result<()> {
 +        let mut state = self.state.lock().unwrap();
@@ -3625,11 +3940,15 @@ index 0000000..9546c9f
 +            if !committed(&signature, &noted.blockhash) {
 +                continue;
 +            }
-+            let entry = (noted.key, noted.data);
++            let entry = Kept {
++                bank_hash: Some(*bank_hash),
++                key: noted.key,
++                data: noted.data,
++            };
 +            if state.by_tx.get(&(slot, signature)) == Some(&entry) {
 +                continue;
 +            }
-+            text.push_str(&line(slot, &signature, &entry.0, &entry.1));
++            text.push_str(&line(slot, &signature, &entry));
 +            kept.push(((slot, signature), entry));
 +        }
 +        if text.is_empty() {
@@ -3677,21 +3996,27 @@ index 0000000..9546c9f
 +    }
 +}
 +
-+fn line(slot: u64, signature: &[u8; 64], key: &Pubkey, data: &[u8]) -> String {
-+    format!(
-+        "answer {slot} {} {} {}\n",
++fn line(slot: u64, signature: &[u8; 64], kept: &Kept) -> String {
++    let mut text = format!(
++        "answer {slot} {} {} {}",
 +        to_hex(signature),
-+        to_hex(key.as_ref()),
-+        to_hex(data)
-+    )
++        to_hex(kept.key.as_ref()),
++        to_hex(&kept.data)
++    );
++    if let Some(bank_hash) = &kept.bank_hash {
++        text.push(' ');
++        text.push_str(&to_hex(bank_hash));
++    }
++    text.push('\n');
++    text
 +}
 +
-+fn render(by_tx: &HashMap<TxKey, (Pubkey, Vec<u8>)>) -> Vec<u8> {
++fn render(by_tx: &HashMap<TxKey, Kept>) -> Vec<u8> {
 +    let mut entries: Vec<_> = by_tx.iter().collect();
 +    entries.sort_by_key(|((slot, signature), _)| (*slot, *signature));
 +    let mut text = String::new();
-+    for ((slot, signature), (key, data)) in entries {
-+        text.push_str(&line(*slot, signature, key, data));
++    for ((slot, signature), kept) in entries {
++        text.push_str(&line(*slot, signature, kept));
 +    }
 +    text.into_bytes()
 +}
@@ -3711,18 +4036,30 @@ index 0000000..9546c9f
 +}
 +
 +/// A later line for the same tx takes the place of an earlier one.
-+fn parse(text: &str) -> Option<HashMap<TxKey, (Pubkey, Vec<u8>)>> {
++fn parse(text: &str) -> Option<HashMap<TxKey, Kept>> {
 +    let mut by_tx = HashMap::new();
 +    for line in text.lines().filter(|line| !line.trim().is_empty()) {
 +        let words: Vec<&str> = line.split_whitespace().collect();
-+        let ["answer", slot, signature, key, data] = words.as_slice() else {
-+            return None;
++        let (slot, signature, key, data, bank_hash) = match words.as_slice() {
++            ["answer", slot, signature, key, data] => (slot, signature, key, data, None),
++            ["answer", slot, signature, key, data, bank_hash] => (
++                slot,
++                signature,
++                key,
++                data,
++                Some(from_hex(bank_hash)?.try_into().ok()?),
++            ),
++            _ => return None,
 +        };
 +        let signature: [u8; 64] = from_hex(signature)?.try_into().ok()?;
 +        let key: [u8; 32] = from_hex(key)?.try_into().ok()?;
 +        by_tx.insert(
 +            (slot.parse().ok()?, signature),
-+            (Pubkey::new_from_array(key), from_hex(data)?),
++            Kept {
++                bank_hash,
++                key: Pubkey::new_from_array(key),
++                data: from_hex(data)?,
++            },
 +        );
 +    }
 +    Some(by_tx)
@@ -3739,9 +4076,16 @@ index 0000000..9546c9f
 +        dir
 +    }
 +
++    /// A store whose ledger holds the hash that `keep` freezes each slot with.
++    fn stored() -> AnswerStore {
++        let store = AnswerStore::default();
++        store.set_frozen_hashes(|slot| Some([slot as u8; 32]));
++        store
++    }
++
 +    fn keep(store: &AnswerStore, slot: u64, signature: [u8; 64], data: &[u8]) {
 +        store.note(slot, &signature, &[0; 32], &BMM_ANSWER_ID, data);
-+        store.freeze(slot, |_, _| true).unwrap();
++        store.freeze(slot, &[slot as u8; 32], |_, _| true).unwrap();
 +    }
 +
 +    fn lines(dir: &Path) -> usize {
@@ -3754,12 +4098,12 @@ index 0000000..9546c9f
 +    #[test]
 +    fn a_rooted_slot_takes_the_answer_of_its_first_run_after_a_restart() {
 +        let dir = temp_dir("restart");
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1, 2, 3]);
 +        keep(&store, 41, [8; 64], &[4]);
 +
-+        let again = AnswerStore::default();
++        let again = stored();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(40);
 +        assert_eq!(
@@ -3772,7 +4116,7 @@ index 0000000..9546c9f
 +
 +    #[test]
 +    fn a_slot_above_the_root_never_takes_a_recorded_answer() {
-+        let store = AnswerStore::default();
++        let store = stored();
 +        keep(&store, 41, [8; 64], &[4]);
 +        assert_eq!(store.recorded(41, &[8; 64]), None);
 +        store.set_replay_root(40);
@@ -3784,11 +4128,11 @@ index 0000000..9546c9f
 +    #[test]
 +    fn a_later_answer_for_the_same_tx_takes_the_place_of_the_first() {
 +        let dir = temp_dir("later");
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        keep(&store, 40, [7; 64], &[2]);
-+        let again = AnswerStore::default();
++        let again = stored();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(40);
 +        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![2])));
@@ -3798,18 +4142,18 @@ index 0000000..9546c9f
 +    #[test]
 +    fn only_a_committed_tx_writes_its_answer() {
 +        let dir = temp_dir("committed");
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.open(&dir).unwrap();
 +        store.note(40, &[7; 64], &[1; 32], &BMM_ANSWER_ID, &[1]);
 +        store.note(40, &[8; 64], &[2; 32], &BMM_ANSWER_ID, &[2]);
 +        store.note(40, &[8; 64], &[2; 32], &BMM_ANSWER_ID, &[2]);
 +        store
-+            .freeze(40, |signature, blockhash| {
++            .freeze(40, &[0; 32], |signature, blockhash| {
 +                signature == &[7; 64] && blockhash == &[1; 32]
 +            })
 +            .unwrap();
 +        assert_eq!(lines(&dir), 1);
-+        store.freeze(40, |_, _| true).unwrap();
++        store.freeze(40, &[0; 32], |_, _| true).unwrap();
 +        assert_eq!(lines(&dir), 1);
 +        store.set_replay_root(40);
 +        assert_eq!(store.recorded(40, &[8; 64]), None);
@@ -3819,7 +4163,7 @@ index 0000000..9546c9f
 +    #[test]
 +    fn the_same_answer_twice_writes_one_line() {
 +        let dir = temp_dir("twice");
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        keep(&store, 40, [7; 64], &[1]);
@@ -3830,7 +4174,7 @@ index 0000000..9546c9f
 +    #[test]
 +    fn the_answers_below_a_slot_leave_the_file() {
 +        let dir = temp_dir("prune");
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        keep(&store, 50, [8; 64], &[2]);
@@ -3838,7 +4182,7 @@ index 0000000..9546c9f
 +        assert_eq!(store.lowest_slot(), Some(50));
 +        keep(&store, 60, [9; 64], &[3]);
 +        assert_eq!(lines(&dir), 2);
-+        let again = AnswerStore::default();
++        let again = stored();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(60);
 +        assert_eq!(again.recorded(40, &[7; 64]), None);
@@ -3848,11 +4192,11 @@ index 0000000..9546c9f
 +
 +    #[test]
 +    fn a_noted_answer_waits_for_its_bank_until_the_root_passes_it() {
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.note(10, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
-+        store.freeze(10_000, |_, _| true).unwrap();
++        store.freeze(10_000, &[0; 32], |_, _| true).unwrap();
 +        store.prune_noted_below(10);
-+        store.freeze(10, |_, _| true).unwrap();
++        store.freeze(10, &[10; 32], |_, _| true).unwrap();
 +        store.set_replay_root(10);
 +        assert_eq!(store.recorded(10, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
 +        store.note(20, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
@@ -3863,7 +4207,7 @@ index 0000000..9546c9f
 +    #[test]
 +    fn a_part_of_a_last_line_is_dropped_at_the_open() {
 +        let dir = temp_dir("partial");
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        let mut file = OpenOptions::new()
@@ -3871,7 +4215,7 @@ index 0000000..9546c9f
 +            .open(dir.join(ANSWERS_FILE))
 +            .unwrap();
 +        file.write_all(b"answer 41 0a").unwrap();
-+        let again = AnswerStore::default();
++        let again = stored();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(41);
 +        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
@@ -3886,7 +4230,7 @@ index 0000000..9546c9f
 +    #[test]
 +    fn a_failed_append_leaves_no_part_of_a_line() {
 +        let dir = temp_dir("partial-write");
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        let failed = crate::append_or_roll_back(
@@ -3899,7 +4243,7 @@ index 0000000..9546c9f
 +        );
 +        assert!(failed.is_err());
 +        keep(&store, 42, [9; 64], &[3]);
-+        let again = AnswerStore::default();
++        let again = stored();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(42);
 +        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
@@ -3910,20 +4254,20 @@ index 0000000..9546c9f
 +    #[test]
 +    fn a_broken_log_fails_each_later_freeze() {
 +        let dir = temp_dir("broken");
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.open(&dir).unwrap();
 +        store.state.lock().unwrap().file = crate::Sink::Broken;
 +        store.note(40, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
-+        assert!(store.freeze(40, |_, _| true).is_err());
++        assert!(store.freeze(40, &[0; 32], |_, _| true).is_err());
 +        store.note(41, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
-+        assert!(store.freeze(41, |_, _| true).is_err());
++        assert!(store.freeze(41, &[0; 32], |_, _| true).is_err());
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
 +    #[test]
 +    fn a_prune_that_cannot_rename_keeps_the_old_file_and_handle() {
 +        let dir = temp_dir("prune-rename");
-+        let store = AnswerStore::default();
++        let store = stored();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        keep(&store, 50, [8; 64], &[2]);
@@ -3931,7 +4275,7 @@ index 0000000..9546c9f
 +        assert!(store.prune_below(45).is_err());
 +        keep(&store, 60, [9; 64], &[3]);
 +        fs::remove_dir_all(dir.join(ANSWERS_FILE).with_extension("tmp")).unwrap();
-+        let again = AnswerStore::default();
++        let again = stored();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(60);
 +        assert_eq!(again.recorded(60, &[9; 64]), Some((BMM_ANSWER_ID, vec![3])));
@@ -3942,7 +4286,39 @@ index 0000000..9546c9f
 +    fn a_bad_line_stops_the_open() {
 +        let dir = temp_dir("bad");
 +        fs::write(dir.join(ANSWERS_FILE), "answer 1 zz\n").unwrap();
-+        assert!(AnswerStore::default().open(&dir).is_err());
++        assert!(stored().open(&dir).is_err());
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn only_the_frozen_block_of_the_first_run_takes_its_answer() {
++        let frozen = std::sync::Arc::new(Mutex::new(HashMap::from([(50u64, [50u8; 32])])));
++        let ledger = std::sync::Arc::clone(&frozen);
++        let store = AnswerStore::default();
++        store.set_frozen_hashes(move |slot| ledger.lock().unwrap().get(&slot).copied());
++        store.set_replay_root(60);
++        keep(&store, 50, [8; 64], &[2]);
++        assert_eq!(store.recorded(50, &[8; 64]), Some((BMM_ANSWER_ID, vec![2])));
++        frozen.lock().unwrap().insert(50, [51; 32]);
++        assert_eq!(store.recorded(50, &[8; 64]), None);
++        frozen.lock().unwrap().remove(&50);
++        assert_eq!(store.recorded(50, &[8; 64]), None);
++        assert_eq!(AnswerStore::default().recorded(50, &[8; 64]), None);
++    }
++
++    #[test]
++    fn a_line_without_a_bank_hash_takes_no_answer() {
++        let dir = temp_dir("no-hash");
++        let data = format!(
++            "answer 40 {} {} 01\n",
++            to_hex(&[7; 64]),
++            to_hex(BMM_ANSWER_ID.as_ref())
++        );
++        fs::write(dir.join(ANSWERS_FILE), data).unwrap();
++        let store = stored();
++        store.open(&dir).unwrap();
++        store.set_replay_root(50);
++        assert_eq!(store.recorded(40, &[7; 64]), None);
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +}
