@@ -27,8 +27,10 @@
 #    without a commitment, the stake votes move the root. A branch that splits
 #    behind the root and holds more checkpoints stops the validator with exit
 #    code 75, and the next start loads an older snapshot. A checkpoint for a
-#    bank that this node does not hold counts only when a staked peer says
-#    that it holds that bank. Such a checkpoint never holds the root. When it stops the fallback, its peers
+#    bank that this node does not hold counts only when staked peers with
+#    more than a third of the stake say that they hold that bank. Such a
+#    checkpoint never holds the root, and it causes a restart only after a
+#    peer delivered its full block. When it stops the fallback, its peers
 #    must bring the bank within 12 eCash blocks, or this node distrusts them.
 #    The RPC `finalized` commitment is the newest root that BMM moved.
 # 8. A commitment h* counts only when a pair (bank hash, payee) with
