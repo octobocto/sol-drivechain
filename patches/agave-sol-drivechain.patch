@@ -5353,10 +5353,10 @@ index 0000000..248a0d1
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..de6553c
+index 0000000..7b31ac5
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2777 @@
+@@ -0,0 +1,2779 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -5954,8 +5954,14 @@ index 0000000..de6553c
 +/// blocks.
 +pub const DISTRUST_BLOCKS: u64 = 1008;
 +
-+/// The absent checkpoints whose bank staked peers with more than a third of
-+/// `total_stake` hold. `stake` gives the epoch stake of a node. A peer in
++/// A peer with less than this part of the epoch stake vouches for nothing. It
++/// bounds the peers that can cause a restart until a restart fetches the
++/// vouched blocks first.
++pub const MIN_VOUCH_STAKE_PARTS: u64 = 1_000;
++
++/// The absent checkpoints whose bank a staked peer holds, when that peer has
++/// at least 1/`MIN_VOUCH_STAKE_PARTS` of `total_stake`. `stake` gives the epoch
++/// stake of a node. A peer in
 +/// `distrusted` does not count, and a peer in the open proof counts only for
 +/// the banks of that proof.
 +pub fn vouched(
@@ -5978,15 +5984,13 @@ index 0000000..de6553c
 +    absent
 +        .iter()
 +        .filter(|checkpoint| {
-+            let mut nodes = attesters(&checkpoint.bank_hash);
-+            nodes.sort_unstable();
-+            nodes.dedup();
-+            let held: u128 = nodes
-+                .iter()
-+                .filter(|node| !doubted(node, &checkpoint.bank_hash))
-+                .map(|node| u128::from(stake(node)))
-+                .sum();
-+            held.saturating_mul(3) > u128::from(total_stake)
++            attesters(&checkpoint.bank_hash).iter().any(|node| {
++                let stake = u128::from(stake(node));
++                !doubted(node, &checkpoint.bank_hash)
++                    && stake > 0
++                    && stake.saturating_mul(u128::from(MIN_VOUCH_STAKE_PARTS))
++                        >= u128::from(total_stake)
++            })
 +        })
 +        .copied()
 +        .collect()
@@ -7045,27 +7049,25 @@ index 0000000..de6553c
 +    }
 +
 +    #[test]
-+    fn only_trusted_attesters_with_more_than_a_third_of_the_stake_vouch() {
++    fn only_trusted_attesters_with_a_thousandth_of_the_stake_vouch() {
 +        let absent = [unknown(100)];
 +        let stake = |node: &NodeId| u64::from(node[0]);
 +        let held_by = |nodes: Vec<NodeId>| move |_: &BankHash| nodes.clone();
 +        let saved = Saved::default();
 +        let vouch = |nodes: Vec<NodeId>, saved: &Saved| {
-+            vouched(&absent, held_by(nodes), stake, 30, saved, 100)
++            vouched(&absent, held_by(nodes), stake, 100_000, saved, 100)
 +        };
-+        assert!(vouch(vec![node(1)], &saved).is_empty());
-+        assert!(vouch(vec![node(10)], &saved).is_empty());
-+        assert!(vouch(vec![node(5), node(5)], &saved).is_empty());
-+        assert_eq!(vouch(vec![node(5), node(6)], &saved), vec![unknown(100)]);
-+        assert_eq!(vouch(vec![node(11)], &saved), vec![unknown(100)]);
++        assert!(vouch(vec![node(99)], &saved).is_empty());
++        assert!(vouch(vec![node(50), node(60)], &saved).is_empty());
++        assert_eq!(vouch(vec![node(100)], &saved), vec![unknown(100)]);
 +        let distrusted = Saved {
 +            distrusted: vec![Distrust {
-+                node: node(6),
++                node: node(100),
 +                until_height: 150,
 +            }],
 +            ..Saved::default()
 +        };
-+        assert!(vouch(vec![node(5), node(6)], &distrusted).is_empty());
++        assert!(vouch(vec![node(100)], &distrusted).is_empty());
 +    }
 +
 +    #[test]
@@ -7612,16 +7614,16 @@ index 0000000..de6553c
 +                &absent,
 +                attesters,
 +                stake,
-+                1_000,
++                1_000_000,
 +                &Saved::default(),
 +                105,
 +            ));
 +            restart_at(&checkpoints, 105, &anchors, &[], 0)
 +        };
-+        assert_eq!(restart_with(&[(1, 1)]), None);
-+        assert_eq!(restart_with(&[(1, 333)]), None);
++        assert_eq!(restart_with(&[(1, 999)]), None);
++        assert_eq!(restart_with(&[(1, 999), (2, 999)]), None);
 +        assert_eq!(
-+            restart_with(&[(1, 200), (2, 134)]),
++            restart_with(&[(1, 250_000)]),
 +            Some(Restart {
 +                anchor: anchor(100, 5),
 +                trigger_height: 102,
@@ -8258,10 +8260,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..d1a8504
+index 0000000..0f6e704
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2044 @@
+@@ -0,0 +1,2087 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -9013,6 +9015,10 @@ index 0000000..d1a8504
 +/// A backfill that adds no block for this long stops to hold a replay.
 +const BACKFILL_STALL: Duration = Duration::from_secs(5);
 +
++/// A replay waits this long for a fresh read of the enforcer before it says
++/// that a block is too far ahead.
++const AHEAD_POLL_WAIT: Duration = Duration::from_secs(2);
++
 +/// One step of a wait, so an exit or a recovered enforcer is seen soon.
 +const WAIT_STEP: Duration = Duration::from_secs(1);
 +
@@ -9232,6 +9238,7 @@ index 0000000..d1a8504
 +    /// while the enforcer answers. A replay waits for `NotYet` within
 +    /// `REPLAY_WAIT` per slot, because its own view can lag.
 +    fn resolve<T>(&self, wait: Wait, mut query: impl FnMut(&mut State) -> Found<T>) -> Lookup<T> {
++        let asked_at = Instant::now();
 +        let mut state = self.state.lock().unwrap();
 +        loop {
 +            let found = query(&mut state);
@@ -9247,7 +9254,18 @@ index 0000000..d1a8504
 +            let backfill = matches!(found, Found::Backfill) && state.backfilling();
 +            match found {
 +                Found::Ready(value) => return Lookup::Ready(value),
-+                Found::Never | Found::Ahead if !away => return Lookup::Never,
++                Found::Never if !away => return Lookup::Never,
++                // Only a view that read the enforcer after the question can
++                // say that a block is too far ahead.
++                Found::Ahead
++                    if !away
++                        && (state
++                            .synced_at
++                            .is_some_and(|synced_at| synced_at > asked_at)
++                            || asked_at.elapsed() >= AHEAD_POLL_WAIT) =>
++                {
++                    return Lookup::Never;
++                }
 +                _ if state.exiting() => return Lookup::NotYet,
 +                _ => (),
 +            }
@@ -10178,15 +10196,23 @@ index 0000000..d1a8504
 +        view.replace_from(&chain(100, 105, 0));
 +        view.mark_synced();
 +        let start = Instant::now();
-+        assert_eq!(
-+            view.answer(1_105, &hash(44), 6, 0, Wait::Replay { slot: 8 }),
-+            Lookup::Never
-+        );
++        std::thread::scope(|scope| {
++            scope.spawn(|| {
++                std::thread::sleep(Duration::from_millis(100));
++                view.mark_synced();
++            });
++            assert_eq!(
++                view.answer(1_105, &hash(44), 6, 0, Wait::Replay { slot: 8 }),
++                Lookup::Never
++            );
++        });
++        assert!(start.elapsed() < Duration::from_millis(1500));
++        let stale = Instant::now();
 +        assert_eq!(
 +            view.hash_at(1_105, 0, Wait::Replay { slot: 8 }),
 +            Lookup::Never
 +        );
-+        assert!(start.elapsed() < Duration::from_millis(500));
++        assert!(stale.elapsed() >= AHEAD_POLL_WAIT);
 +        view.state.lock().unwrap().synced_at = None;
 +        view.state.lock().unwrap().budgets.insert(9, Duration::ZERO);
 +        let exit = Arc::new(AtomicBool::new(true));
@@ -10195,6 +10221,25 @@ index 0000000..d1a8504
 +            view.answer(1_105, &hash(44), 6, 0, Wait::Replay { slot: 9 }),
 +            Lookup::NotYet
 +        );
++    }
++
++    #[test]
++    fn a_stale_view_reads_the_enforcer_again_before_it_says_ahead() {
++        let view = BmmView::default();
++        view.set_source(Arc::new(AtomicBool::new(false)));
++        view.replace_from(&chain(100, 105, 0));
++        view.mark_synced();
++        std::thread::scope(|scope| {
++            scope.spawn(|| {
++                std::thread::sleep(Duration::from_millis(100));
++                view.replace_from(&chain(106, 116, 0));
++                view.mark_synced();
++            });
++            assert!(matches!(
++                view.deep_block(110, &hash(110), 6, 0, Wait::Replay { slot: 30 }),
++                Lookup::Ready(_)
++            ));
++        });
 +    }
 +
 +    #[test]
