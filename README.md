@@ -298,7 +298,7 @@ only makes blocks.
 | Block record | The runtime writes the last block of each 32 slots and its credits into `BmmB1ocks…`. |
 | Pairs | `bmmPublishPairs`, `bmmGetPairs`, and `bmmKnownBanks` on the RPC, the `bmm-pairs` file, and the push to and the pull from the staked peers. A peer signs each `bmmKnownBanks` reply with its node key over the asked banks, the slots, a nonce of the asker, and the time. |
 | Kept answers | The `bmm-answers` file keeps the answer of each settle and credit that the node ran. |
-| Fork choice | Checkpoints select the branch and move the root. A checkpoint for a bank that this node does not hold counts only when staked peers with more than a third of the stake hold that bank. The RPC `finalized` commitment is the newest root that BMM moved. |
+| Fork choice | Checkpoints select the branch and move the root. A checkpoint for a bank that this node does not hold counts only when a staked peer with at least 0.1% of the epoch stake holds that bank. The 0.1% floor is an interim guard until a restart fetches the vouched blocks first. The RPC `finalized` commitment is the newest root that BMM moved. |
 | Values | The genesis account `BmmParams…` holds the sidechain slot, N, K, and L. No tx can write it. |
 | Flags | `--bmm-enforcer-url` on the validator. `--bmm-sidechain-slot`, `--bmm-confirmations`, `--bmm-root-depth`, and `--bmm-fallback-blocks` on `solana-genesis`. |
 
@@ -309,7 +309,8 @@ a fee payer that holds the fee gets a place in the queue. A
 question that no new eCash block can answer leaves the queue at once. On
 replay, the questions of one slot wait 10 seconds in all for a late eCash
 block, and then the block is dead. A question for a block more than 2 blocks
-past a healthy view is dead at once. While the enforcer does not answer, the
+past the view is dead when a fresh read of the enforcer, within 2 seconds,
+still does not hold it. While the enforcer does not answer, the
 replay waits and marks no block dead. A leader needs one more block than
 replay, so a healthy node never waits.
 

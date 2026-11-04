@@ -27,8 +27,9 @@
 #    without a commitment, the stake votes move the root. A branch that splits
 #    behind the root and holds more checkpoints stops the validator with exit
 #    code 75, and the next start loads an older snapshot. A checkpoint for a
-#    bank that this node does not hold counts only when staked peers with
-#    more than a third of the stake say that they hold that bank. Such a
+#    bank that this node does not hold counts only when a staked peer with
+#    at least 0.1% of the epoch stake says that it holds that bank, an
+#    interim guard until a restart fetches the vouched blocks first. Such a
 #    checkpoint never holds the root. When it stops the fallback or causes a
 #    restart, its peers must bring the bank within 12 eCash blocks, or this
 #    node distrusts them.
