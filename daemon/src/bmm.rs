@@ -901,22 +901,16 @@ async fn round(
     }
 
     if !settings.no_bid && *last_bid_tip != Some(tip.0) {
-        let retry = match bid(live, &mut enforcer, memory, rules, tip).await {
-            // The credits of the branch can catch up before the next
-            // eCash block, so the next round tries the same tip again.
-            Ok(Bid::NoBlock) => true,
-            Ok(_) => false,
-            Err(error) => {
-                if round_error_is_fatal(&error) {
-                    return Err(error);
-                }
-                // A bid is an offer, not a duty. The loop must keep the
-                // settles going when the eCash wallet or the enforcer
-                // refuses one bid.
-                tracing::warn!(%error, "the bid failed, and the loop goes on");
-                false
+        let result = bid(live, &mut enforcer, memory, rules, tip).await;
+        if let Err(error) = &result {
+            if round_error_is_fatal(error) {
+                return result.map(|_| ());
             }
-        };
+            // A bid is an offer, not a duty. The loop must keep the settles
+            // going when the eCash wallet or the enforcer refuses one bid.
+            tracing::warn!(%error, "the bid failed, and the next round tries the tip again");
+        }
+        let retry = bids_again(&result);
         if !retry {
             *last_bid_tip = Some(tip.0);
         }
@@ -1126,6 +1120,12 @@ async fn bid(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// True when the next round bids for the same tip again: no recorded block
+/// passes rule 3 yet, or the enforcer refused the bid for this round.
+pub fn bids_again(result: &Result<Bid, BmmError>) -> bool {
+    matches!(result, Ok(Bid::NoBlock) | Err(_))
 }
 
 /// True when a failed round must stop the loop. The enforcer and the Solana
@@ -1445,6 +1445,22 @@ mod tests {
         assert!(!round_error_is_fatal(&block));
         assert!(round_error_is_fatal(&BmmError::BadBidPercent(0)));
         assert!(round_error_is_fatal(&BmmError::HeightTooLarge(1)));
+    }
+
+    #[test]
+    fn a_failed_bid_tries_the_tip_again_in_the_next_round() {
+        let stale = BmmError::Enforcer(crate::enforcer::EnforcerError::Call {
+            call: "CreateBmmCriticalDataTransaction",
+            source: tonic::Status::unknown("bad-txns-inputs-missingorspent"),
+        });
+        assert!(bids_again(&Err(stale)));
+        assert!(bids_again(&Ok(Bid::NoBlock)));
+        assert!(!bids_again(&Ok(Bid::Declined)));
+        assert!(!bids_again(&Ok(Bid::Sent(Pair {
+            height: 1,
+            block: [1u8; 32],
+            payee: Pubkey::new_from_array([2u8; 32]),
+        }))));
     }
 
     #[test]

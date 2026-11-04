@@ -13,14 +13,14 @@ use crate::proto::mainchain::{
     wallet_service_client::WalletServiceClient,
     withdrawal_bundle_event::event::Event as BundleEventKind,
     AckAllProposalsPolicy, CreateBmmCriticalDataTransactionRequest,
-    CreateDepositTransactionRequest, CreateNewAddressRequest, GenerateToAddressRequest,
-    GetBalanceRequest, GetBlockHeaderInfoRequest, GetBmmHStarCommitmentRequest,
-    GetChainInfoRequest, GetChainTipRequest, GetCtipRequest, GetSidechainProposalsRequest,
-    GetSidechainsRequest, GetTwoWayPegDataRequest, GetWithdrawalBundleProposalsRequest,
-    Network as ProtoNetwork, ProposeWithdrawalBundleRequest, SetAckAllProposalsRequest,
-    SetSidechainAckRequest, SetWithdrawalBundlePolicyRequest, SidechainDeclaration,
-    SubmitSidechainProposalRequest, SubscribeEventsRequest, SubscribeEventsResponse,
-    WithdrawalBundlePolicy,
+    CreateDepositTransactionRequest, CreateNewAddressRequest, FullScanRequest,
+    GenerateToAddressRequest, GetBalanceRequest, GetBlockHeaderInfoRequest,
+    GetBmmHStarCommitmentRequest, GetChainInfoRequest, GetChainTipRequest, GetCtipRequest,
+    GetSidechainProposalsRequest, GetSidechainsRequest, GetTwoWayPegDataRequest,
+    GetWithdrawalBundleProposalsRequest, Network as ProtoNetwork, ProposeWithdrawalBundleRequest,
+    SetAckAllProposalsRequest, SetSidechainAckRequest, SetWithdrawalBundlePolicyRequest,
+    SidechainDeclaration, SubmitSidechainProposalRequest, SubscribeEventsRequest,
+    SubscribeEventsResponse, WithdrawalBundlePolicy,
 };
 
 pub type Result<T> = std::result::Result<T, EnforcerError>;
@@ -737,8 +737,39 @@ impl Enforcer {
     }
 
     /// Sends a BIP301 BMM request. It pays `bid_sats` to the miner of the
-    /// block after `tip`, and only if that coinbase holds `h_star`.
+    /// block after `tip`, and only if that coinbase holds `h_star`. A wallet
+    /// that a reorg left with a spent coin scans the chain again, and the
+    /// request goes out one more time.
     pub async fn create_bmm_request(
+        &mut self,
+        bid_sats: u64,
+        tip: (BlockHash, u32),
+        h_star: &[u8; 32],
+    ) -> Result<Txid> {
+        match self.send_bmm_request(bid_sats, tip, h_star).await {
+            Err(error) if spends_a_gone_coin(&error) => {
+                tracing::warn!(%error, "the enforcer wallet holds a spent coin, so it scans again");
+                self.full_scan().await?;
+                self.send_bmm_request(bid_sats, tip, h_star).await
+            }
+            result => result,
+        }
+    }
+
+    /// Scans the whole chain for the enforcer wallet, so it drops the coins
+    /// that a reorg spent.
+    pub async fn full_scan(&mut self) -> Result<()> {
+        self.wallet
+            .full_scan(FullScanRequest {})
+            .await
+            .map_err(|source| EnforcerError::Call {
+                call: "FullScan",
+                source,
+            })?;
+        Ok(())
+    }
+
+    async fn send_bmm_request(
         &mut self,
         bid_sats: u64,
         tip: (BlockHash, u32),
@@ -963,6 +994,16 @@ pub(crate) async fn peg_data_from(
         events.extend(chain.peg_events(start, end).await?);
     }
     Ok(events)
+}
+
+/// True when the node refused a tx of the enforcer wallet because an input
+/// is missing or spent: the wallet still holds a coin that a reorg spent.
+pub fn spends_a_gone_coin(error: &EnforcerError) -> bool {
+    matches!(
+        error,
+        EnforcerError::Call { source, .. }
+            if source.message().contains("bad-txns-inputs-missingorspent")
+    )
 }
 
 /// Reads the Bitcoin network out of the enforcer answer.
@@ -1239,6 +1280,24 @@ mod tests {
             .build()
             .unwrap()
             .block_on(future)
+    }
+
+    #[test]
+    fn a_missing_or_spent_input_reads_as_a_gone_coin() {
+        let stale = EnforcerError::Call {
+            call: "CreateBmmCriticalDataTransaction",
+            source: tonic::Status::unknown(
+                "error creating BMM request: failed to broadcast BMM request tx via RPC: \
+                 ErrorObject { code: ServerError(-25), message: \"bad-txns-inputs-missingorspent\" }",
+            ),
+        };
+        assert!(spends_a_gone_coin(&stale));
+        let other = EnforcerError::Call {
+            call: "CreateBmmCriticalDataTransaction",
+            source: tonic::Status::unknown("insufficient funds"),
+        };
+        assert!(!spends_a_gone_coin(&other));
+        assert!(!spends_a_gone_coin(&EnforcerError::MissingField("txid")));
     }
 
     #[test]
