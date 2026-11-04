@@ -310,14 +310,14 @@ block, and then the block is dead. While the enforcer does not answer, the
 replay waits and marks no block dead. A leader needs one more block than
 replay, so a healthy node never waits.
 
-A replay of a slot at or below the root of the start takes the answer from
-`bmm-answers`, not from the enforcer. The node ran that slot before, and the
-slot is final by rule 6. An eCash reorg deeper than N or D after that run can
-remove the eCash block that a settle or a credit names. Without the kept
-answer, a restart or a replay from the genesis marks that slot dead. A slot
-above the root always asks the enforcer, so no new block can use a kept
-answer. A node that replays from the genesis without the file of the node that
-ran the slot still needs the enforcer answer.
+A replay of a slot of the ledger at the start takes the answer from
+`bmm-answers`, not from the enforcer, when this node ran that slot before. An
+eCash reorg deeper than N or D after that run can remove the eCash block that a
+settle or a credit names. Without the kept answer, a restart or a replay from
+the genesis marks that slot dead. A slot that comes after the start always asks
+the enforcer, so no new block can use a kept answer. A node that replays from
+the genesis without the file of the node that ran the slot still needs the
+enforcer answer.
 
 A payee that cannot take the payout gets nothing, and the fees go to the next
 winner. The settle still lands. The key and the account decide this, never the

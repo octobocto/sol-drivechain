@@ -1245,7 +1245,7 @@ index c5a5f4d..65a3936 100644
      /// A wrapper around `root_utils::check_and_handle_new_root` which:
      /// - calls into `root_utils::set_bank_forks_root`
 diff --git a/core/src/validator.rs b/core/src/validator.rs
-index 400ad25..0e34001 100644
+index 400ad25..1021348 100644
 --- a/core/src/validator.rs
 +++ b/core/src/validator.rs
 @@ -2159,6 +2159,18 @@ fn post_process_restored_tower(
@@ -1267,15 +1267,23 @@ index 400ad25..0e34001 100644
          let slot_history = root_bank
              .get_slot_history()
              .expect("slot history must exist");
-@@ -2399,6 +2411,7 @@ fn load_blockstore(
+@@ -2399,6 +2411,15 @@ fn load_blockstore(
      // following boot sequence (esp BankForks) could set root. so stash the original value
      // of blockstore root away here as soon as possible.
      let original_blockstore_root = blockstore.max_root();
-+    sol_drivechain_bmm::answers::answers().set_replay_root(original_blockstore_root);
++    // sol-drivechain: each slot of this ledger that this node froze before
++    // takes the answer of that run, so an eCash reorg since cannot stop it.
++    sol_drivechain_bmm::answers::answers().set_replay_root(
++        blockstore
++            .highest_slot()
++            .ok()
++            .flatten()
++            .unwrap_or(original_blockstore_root),
++    );
      process_options.halt_at_slot = blockstore.highest_slot().unwrap_or(None);
  
      let enable_rpc_transaction_history =
-@@ -2588,7 +2601,10 @@ impl<'a> ProcessBlockStore<'a> {
+@@ -2588,7 +2609,10 @@ impl<'a> ProcessBlockStore<'a> {
          // Load and post process tower
          let tower = {
              let restored_tower = Tower::restore(self.config.tower_storage.as_ref(), self.id);
@@ -1635,10 +1643,10 @@ index dbc053b..ed34d7f 100644
  solana-account-decoder = { workspace = true }
  solana-accounts-db = { workspace = true }
 diff --git a/rpc/src/rpc.rs b/rpc/src/rpc.rs
-index 7bf84a0..c4750f3 100644
+index 7bf84a0..e6ec90e 100644
 --- a/rpc/src/rpc.rs
 +++ b/rpc/src/rpc.rs
-@@ -146,6 +146,37 @@ fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
+@@ -146,6 +146,48 @@ fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
      }
  }
  
@@ -1673,19 +1681,48 @@ index 7bf84a0..c4750f3 100644
 +    Ok(())
 +}
 +
++/// sol-drivechain: `getSlot` at `finalized`, which needs no bank.
++fn bmm_final_slot(final_root: Slot, min_context_slot: Option<Slot>) -> Result<Slot> {
++    if min_context_slot.is_some_and(|min_context_slot| final_root < min_context_slot) {
++        return Err(RpcCustomError::MinContextSlotNotReached {
++            context_slot: final_root,
++        }
++        .into());
++    }
++    Ok(final_root)
++}
++
  fn is_finalized(
      block_commitment_cache: &BlockCommitmentCache,
      bank: &Bank,
-@@ -273,7 +304,7 @@ impl JsonRpcRequestProcessor {
-             commitment,
-             min_context_slot,
-         } = config;
+@@ -269,11 +311,21 @@ impl JsonRpcRequestProcessor {
+ 
+ impl JsonRpcRequestProcessor {
+     fn get_bank_with_config(&self, config: RpcContextConfig) -> Result<Arc<Bank>> {
+-        let RpcContextConfig {
+-            commitment,
+-            min_context_slot,
+-        } = config;
 -        let bank = self.bank(commitment);
-+        let bank = self.checked_bank(commitment)?;
++        let bank = self.bank(config.commitment);
++        Self::check_min_context_slot(bank, config.min_context_slot)
++    }
++
++    /// sol-drivechain: the bank for a read of account state. At `finalized`
++    /// it fails while the BMM finalized bank cannot serve its own state.
++    fn get_state_bank_with_config(&self, config: RpcContextConfig) -> Result<Arc<Bank>> {
++        let bank = self.checked_bank(config.commitment)?;
++        Self::check_min_context_slot(bank, config.min_context_slot)
++    }
++
++    fn check_min_context_slot(
++        bank: Arc<Bank>,
++        min_context_slot: Option<Slot>,
++    ) -> Result<Arc<Bank>> {
          if let Some(min_context_slot) = min_context_slot
              && bank.slot() < min_context_slot
          {
-@@ -343,6 +374,35 @@ impl JsonRpcRequestProcessor {
+@@ -343,6 +395,35 @@ impl JsonRpcRequestProcessor {
          Ok(accounts)
      }
  
@@ -1721,7 +1758,16 @@ index 7bf84a0..c4750f3 100644
      #[allow(deprecated)]
      fn bank(&self, commitment: Option<CommitmentConfig>) -> Arc<Bank> {
          debug!("RPC commitment_config: {commitment:?}");
-@@ -552,6 +612,7 @@ impl JsonRpcRequestProcessor {
+@@ -538,7 +619,7 @@ impl JsonRpcRequestProcessor {
+             commitment,
+             min_context_slot,
+         } = config.unwrap_or_default();
+-        let bank = self.get_bank_with_config(RpcContextConfig {
++        let bank = self.get_state_bank_with_config(RpcContextConfig {
+             commitment,
+             min_context_slot,
+         })?;
+@@ -552,6 +633,7 @@ impl JsonRpcRequestProcessor {
              })
              .await
              .expect("rpc: get_encoded_account panicked")?;
@@ -1729,7 +1775,16 @@ index 7bf84a0..c4750f3 100644
          Ok(new_response(&bank, response))
      }
  
-@@ -584,6 +645,7 @@ impl JsonRpcRequestProcessor {
+@@ -566,7 +648,7 @@ impl JsonRpcRequestProcessor {
+             commitment,
+             min_context_slot,
+         } = config.unwrap_or_default();
+-        let bank = self.get_bank_with_config(RpcContextConfig {
++        let bank = self.get_state_bank_with_config(RpcContextConfig {
+             commitment,
+             min_context_slot,
+         })?;
+@@ -584,6 +666,7 @@ impl JsonRpcRequestProcessor {
                      .expect("rpc: get_encoded_account panicked")?,
              );
          }
@@ -1737,7 +1792,16 @@ index 7bf84a0..c4750f3 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -660,6 +722,7 @@ impl JsonRpcRequestProcessor {
+@@ -610,7 +693,7 @@ impl JsonRpcRequestProcessor {
+             commitment,
+             min_context_slot,
+         } = config.unwrap_or_default();
+-        let bank = self.get_bank_with_config(RpcContextConfig {
++        let bank = self.get_state_bank_with_config(RpcContextConfig {
+             commitment,
+             min_context_slot,
+         })?;
+@@ -660,6 +743,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Result<Vec<_>>>()?
          };
@@ -1745,27 +1809,20 @@ index 7bf84a0..c4750f3 100644
          Ok(match with_context {
              true => OptionalContext::Context(new_response(&bank, accounts)),
              false => OptionalContext::NoContext(accounts),
-@@ -939,7 +1002,9 @@ impl JsonRpcRequestProcessor {
+@@ -938,8 +1022,10 @@ impl JsonRpcRequestProcessor {
+         pubkey: &Pubkey,
          config: RpcContextConfig,
      ) -> Result<RpcResponse<u64>> {
-         let bank = self.get_bank_with_config(config)?;
+-        let bank = self.get_bank_with_config(config)?;
 -        Ok(new_response(&bank, bank.get_balance(pubkey)))
++        let bank = self.get_state_bank_with_config(config)?;
 +        let balance = bank.get_balance(pubkey);
 +        self.verify_finalized(&bank)?;
 +        Ok(new_response(&bank, balance))
      }
  
      pub fn confirm_transaction(
-@@ -947,7 +1012,7 @@ impl JsonRpcRequestProcessor {
-         signature: &Signature,
-         commitment: Option<CommitmentConfig>,
-     ) -> Result<RpcResponse<bool>> {
--        let bank = self.bank(commitment);
-+        let bank = self.checked_bank(commitment)?;
-         let status = bank.get_signature_status(signature);
-         match status {
-             Some(status) => Ok(new_response(&bank, status.is_ok())),
-@@ -966,6 +1031,14 @@ impl JsonRpcRequestProcessor {
+@@ -966,6 +1052,16 @@ impl JsonRpcRequestProcessor {
      }
  
      fn get_slot(&self, config: RpcContextConfig) -> Result<Slot> {
@@ -1773,23 +1830,16 @@ index 7bf84a0..c4750f3 100644
 +        // stays readable in a fallback.
 +        if config.commitment.unwrap_or_default().commitment == CommitmentLevel::Finalized
 +            && sol_drivechain_bmm::fork_choice::enabled()
-+            && config.min_context_slot.is_none()
 +        {
-+            return Ok(sol_drivechain_bmm::fork_choice::final_root());
++            return bmm_final_slot(
++                sol_drivechain_bmm::fork_choice::final_root(),
++                config.min_context_slot,
++            );
 +        }
          let bank = self.get_bank_with_config(config)?;
          Ok(bank.slot())
      }
-@@ -994,7 +1067,7 @@ impl JsonRpcRequestProcessor {
-         start_slot: Slot,
-         limit: usize,
-     ) -> Result<Vec<Pubkey>> {
--        let bank = self.bank(commitment);
-+        let bank = self.checked_bank(commitment)?;
- 
-         let (mut epoch, mut slot_index) =
-             bank.epoch_schedule().get_epoch_and_slot_index(start_slot);
-@@ -1065,7 +1138,7 @@ impl JsonRpcRequestProcessor {
+@@ -1065,7 +1161,7 @@ impl JsonRpcRequestProcessor {
          config: Option<RpcLargestAccountsConfig>,
      ) -> RpcCustomResult<RpcResponse<Vec<RpcAccountBalance>>> {
          let config = config.unwrap_or_default();
@@ -1798,7 +1848,7 @@ index 7bf84a0..c4750f3 100644
  
          if let Some((slot, accounts)) = self.get_cached_largest_accounts(&config.filter) {
              Ok(RpcResponse {
-@@ -1109,6 +1182,7 @@ impl JsonRpcRequestProcessor {
+@@ -1109,6 +1205,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Vec<RpcAccountBalance>>();
  
@@ -1806,7 +1856,7 @@ index 7bf84a0..c4750f3 100644
              self.set_cached_largest_accounts(&config.filter, bank.slot(), &accounts);
              Ok(new_response(&bank, accounts))
          }
-@@ -1119,7 +1193,7 @@ impl JsonRpcRequestProcessor {
+@@ -1119,7 +1216,7 @@ impl JsonRpcRequestProcessor {
          config: Option<RpcSupplyConfig>,
      ) -> RpcCustomResult<RpcResponse<RpcSupply>> {
          let config = config.unwrap_or_default();
@@ -1815,7 +1865,7 @@ index 7bf84a0..c4750f3 100644
          let non_circulating_supply =
              self.calculate_non_circulating_supply(&bank)
                  .await
-@@ -1137,6 +1211,7 @@ impl JsonRpcRequestProcessor {
+@@ -1137,6 +1234,7 @@ impl JsonRpcRequestProcessor {
                  .collect()
          };
  
@@ -1823,7 +1873,7 @@ index 7bf84a0..c4750f3 100644
          Ok(new_response(
              &bank,
              RpcSupply {
-@@ -1160,7 +1235,7 @@ impl JsonRpcRequestProcessor {
+@@ -1160,7 +1258,7 @@ impl JsonRpcRequestProcessor {
              None
          };
  
@@ -1832,25 +1882,7 @@ index 7bf84a0..c4750f3 100644
          let commission_rate_in_basis_points = bank
              .feature_set
              .is_active(&agave_feature_set::commission_rate_in_basis_points::id());
-@@ -1640,7 +1715,7 @@ impl JsonRpcRequestProcessor {
-         signature: Signature,
-         commitment: Option<CommitmentConfig>,
-     ) -> Result<Option<RpcSignatureConfirmation>> {
--        let bank = self.bank(commitment);
-+        let bank = self.checked_bank(commitment)?;
-         Ok(self
-             .get_transaction_status(signature, &bank)
-             .map(|transaction_status| {
-@@ -1659,7 +1734,7 @@ impl JsonRpcRequestProcessor {
-         signature: Signature,
-         commitment: Option<CommitmentConfig>,
-     ) -> Result<Option<transaction::Result<()>>> {
--        let bank = self.bank(commitment);
-+        let bank = self.checked_bank(commitment)?;
-         Ok(bank
-             .get_signature_status_slot(&signature)
-             .map(|(_, status)| status))
-@@ -2011,7 +2086,7 @@ impl JsonRpcRequestProcessor {
+@@ -2011,7 +2109,7 @@ impl JsonRpcRequestProcessor {
          pubkey: &Pubkey,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<UiTokenAmount>> {
@@ -1859,7 +1891,7 @@ index 7bf84a0..c4750f3 100644
          let account = bank.get_account(pubkey).ok_or_else(|| {
              Error::invalid_params("Invalid param: could not find account".to_string())
          })?;
-@@ -2027,6 +2102,7 @@ impl JsonRpcRequestProcessor {
+@@ -2027,6 +2125,7 @@ impl JsonRpcRequestProcessor {
              .expect("Token account mint should be convertible to Pubkey");
          let (_, data) = get_mint_owner_and_additional_data(&bank, mint)?;
          let balance = token_amount_to_ui_amount_v3(token_account.base.amount, &data);
@@ -1867,7 +1899,7 @@ index 7bf84a0..c4750f3 100644
          Ok(new_response(&bank, balance))
      }
  
-@@ -2035,7 +2111,7 @@ impl JsonRpcRequestProcessor {
+@@ -2035,7 +2134,7 @@ impl JsonRpcRequestProcessor {
          mint: &Pubkey,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<UiTokenAmount>> {
@@ -1876,7 +1908,7 @@ index 7bf84a0..c4750f3 100644
          let mint_account = bank.get_account(mint).ok_or_else(|| {
              Error::invalid_params("Invalid param: could not find account".to_string())
          })?;
-@@ -2066,6 +2142,7 @@ impl JsonRpcRequestProcessor {
+@@ -2066,6 +2165,7 @@ impl JsonRpcRequestProcessor {
                  scaled_ui_amount_config,
              },
          );
@@ -1884,7 +1916,7 @@ index 7bf84a0..c4750f3 100644
          Ok(new_response(&bank, supply))
      }
  
-@@ -2074,7 +2151,7 @@ impl JsonRpcRequestProcessor {
+@@ -2074,7 +2174,7 @@ impl JsonRpcRequestProcessor {
          mint: Pubkey,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<Vec<RpcTokenAccountBalance>>> {
@@ -1893,7 +1925,7 @@ index 7bf84a0..c4750f3 100644
          let (mint_owner, data) = get_mint_owner_and_additional_data(&bank, &mint)?;
          if !is_known_spl_token_id(&mint_owner) {
              return Err(Error::invalid_params(
-@@ -2122,6 +2199,7 @@ impl JsonRpcRequestProcessor {
+@@ -2122,6 +2222,7 @@ impl JsonRpcRequestProcessor {
              })
              .collect::<Result<Vec<_>>>()?;
  
@@ -1901,7 +1933,16 @@ index 7bf84a0..c4750f3 100644
          Ok(new_response(&bank, token_balances))
      }
  
-@@ -2176,6 +2254,7 @@ impl JsonRpcRequestProcessor {
+@@ -2138,7 +2239,7 @@ impl JsonRpcRequestProcessor {
+             commitment,
+             min_context_slot,
+         } = config.unwrap_or_default();
+-        let bank = self.get_bank_with_config(RpcContextConfig {
++        let bank = self.get_state_bank_with_config(RpcContextConfig {
+             commitment,
+             min_context_slot,
+         })?;
+@@ -2176,6 +2277,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Result<Vec<_>>>()?
          };
@@ -1909,7 +1950,16 @@ index 7bf84a0..c4750f3 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -2242,6 +2321,7 @@ impl JsonRpcRequestProcessor {
+@@ -2192,7 +2294,7 @@ impl JsonRpcRequestProcessor {
+             commitment,
+             min_context_slot,
+         } = config.unwrap_or_default();
+-        let bank = self.get_bank_with_config(RpcContextConfig {
++        let bank = self.get_state_bank_with_config(RpcContextConfig {
+             commitment,
+             min_context_slot,
+         })?;
+@@ -2242,6 +2344,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Result<Vec<_>>>()?
          };
@@ -1917,7 +1967,7 @@ index 7bf84a0..c4750f3 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -2825,10 +2905,134 @@ pub mod rpc_minimal {
+@@ -2825,10 +2928,134 @@ pub mod rpc_minimal {
              options: Option<RpcLeaderScheduleConfigWrapper>,
              config: Option<RpcLeaderScheduleConfig>,
          ) -> Result<Option<RpcLeaderSchedule>>;
@@ -2052,37 +2102,26 @@ index 7bf84a0..c4750f3 100644
          type Metadata = JsonRpcRequestProcessor;
  
          fn get_balance(
-@@ -2968,7 +3172,7 @@ pub mod rpc_minimal {
-                 let _ = verify_pubkey(identity)?;
-             }
+@@ -4032,7 +4259,7 @@ pub mod rpc_full {
+             let (_, mut unsanitized_tx) =
+                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
  
--            let bank = meta.bank(config.commitment);
-+            let bank = meta.checked_bank(config.commitment)?;
-             let slot = slot.unwrap_or_else(|| bank.slot());
-             let epoch = bank.epoch_schedule().get_epoch(slot);
- 
-@@ -3139,7 +3343,7 @@ pub mod rpc_bank {
-                 None
-             };
- 
--            let bank = meta.bank(config.commitment);
-+            let bank = meta.checked_bank(config.commitment)?;
-             let (first_slot, last_slot) = match config.range {
-                 None => (
-                     bank.epoch_schedule().get_first_slot_in_epoch(bank.epoch()),
-@@ -3815,7 +4019,7 @@ pub mod rpc_full {
-             let pubkey = verify_pubkey(&pubkey_str)?;
- 
-             let config = config.unwrap_or_default();
--            let bank = meta.bank(config.commitment);
-+            let bank = meta.checked_bank(config.commitment)?;
- 
-             let blockhash = if let Some(blockhash) = config.recent_blockhash {
-                 verify_hash(&blockhash)?
-@@ -5152,6 +5356,54 @@ pub mod tests {
+-            let bank = &*meta.get_bank_with_config(RpcContextConfig {
++            let bank = &*meta.get_state_bank_with_config(RpcContextConfig {
+                 commitment,
+                 min_context_slot,
+             })?;
+@@ -5152,6 +5379,61 @@ pub mod tests {
          }
      }
  
++    #[test]
++    fn test_bmm_final_slot_compares_the_min_context_slot_to_the_final_root() {
++        assert_eq!(bmm_final_slot(40, None).unwrap(), 40);
++        assert_eq!(bmm_final_slot(40, Some(40)).unwrap(), 40);
++        assert!(bmm_final_slot(40, Some(41)).is_err());
++    }
++
 +    #[test]
 +    fn test_bmm_finalized_bank_fails_when_the_bank_is_gone() {
 +        let genesis = create_genesis_config(100);
@@ -2135,7 +2174,7 @@ index 7bf84a0..c4750f3 100644
      fn test_rpc_request_processor_new() {
          let bob_pubkey = solana_pubkey::new_rand();
 diff --git a/rpc/src/rpc_subscriptions.rs b/rpc/src/rpc_subscriptions.rs
-index 88b2b2b..c0c4ed6 100644
+index 88b2b2b..483f55c 100644
 --- a/rpc/src/rpc_subscriptions.rs
 +++ b/rpc/src/rpc_subscriptions.rs
 @@ -133,6 +133,12 @@ impl std::fmt::Debug for NotificationEntry {
@@ -2151,12 +2190,23 @@ index 88b2b2b..c0c4ed6 100644
  fn check_commitment_and_notify<P, S, B, F, X, I>(
      params: &P,
      subscription: &SubscriptionInfo,
-@@ -152,8 +158,12 @@ where
+@@ -142,6 +148,7 @@ fn check_commitment_and_notify<P, S, B, F, X, I>(
+     filter_results: F,
+     notifier: &RpcNotifier,
+     is_final: bool,
++    reads_accounts: bool,
+ ) -> bool
+ where
+     S: Clone + Serialize,
+@@ -152,8 +159,15 @@ where
  {
      let mut notified = false;
      let bank = bank_forks.read().unwrap().get(slot);
 -    if let Some(bank) = bank {
-+    let usable = || bmm_state_usable(sol_drivechain_bmm::fork_choice::enabled(), slot, bank_forks);
++    let usable = || {
++        !reads_accounts
++            || bmm_state_usable(sol_drivechain_bmm::fork_choice::enabled(), slot, bank_forks)
++    };
 +    if let Some(bank) = bank.filter(|_| usable()) {
          let results = bank_method(&bank, params);
 +        if !usable() {
@@ -2165,7 +2215,7 @@ index 88b2b2b..c0c4ed6 100644
          let mut w_last_notified_slot = subscription.last_notified_slot.write().unwrap();
          let (filter_results, result_slot) =
              filter_results(results, params, *w_last_notified_slot, bank);
-@@ -471,7 +481,9 @@ fn initial_last_notified_slot(
+@@ -471,7 +485,9 @@ fn initial_last_notified_slot(
              };
  
              let bank = bank_forks.read().unwrap().get(slot)?;
@@ -2176,7 +2226,41 @@ index 88b2b2b..c0c4ed6 100644
          }
          _ => None,
      }
-@@ -1240,6 +1252,21 @@ pub(crate) mod tests {
+@@ -958,6 +974,7 @@ impl RpcSubscriptions {
+                             filter_account_result,
+                             notifier,
+                             false,
++                            true,
+                         );
+ 
+                         if notified {
+@@ -1062,6 +1079,7 @@ impl RpcSubscriptions {
+                             filter_logs_results,
+                             notifier,
+                             false,
++                            false,
+                         );
+ 
+                         if notified {
+@@ -1083,6 +1101,7 @@ impl RpcSubscriptions {
+                             filter_program_results,
+                             notifier,
+                             false,
++                            true,
+                         );
+ 
+                         if notified {
+@@ -1103,7 +1122,8 @@ impl RpcSubscriptions {
+                             },
+                             filter_signature_result,
+                             notifier,
+-                            true, // Unsubscribe.
++                            true, // Unsubscribe.,
++                            false,
+                         );
+ 
+                         if notified {
+@@ -1240,6 +1260,21 @@ pub(crate) mod tests {
          std::{collections::HashSet, sync::atomic::AtomicU64},
      };
  
@@ -3396,7 +3480,7 @@ index 0000000..0538a00
 +workspace = true
 diff --git a/sol-drivechain-bmm/src/answers.rs b/sol-drivechain-bmm/src/answers.rs
 new file mode 100644
-index 0000000..55a3f08
+index 0000000..9546c9f
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/answers.rs
 @@ -0,0 +1,462 @@
@@ -3490,13 +3574,13 @@ index 0000000..55a3f08
 +        Ok(())
 +    }
 +
-+    /// Sets the blockstore root of the start. A slot at or below it is final
-+    /// by rule 6, and this node already ran it.
++    /// Sets the highest slot of the ledger at the start. A slot at or below
++    /// it that has a kept answer is a slot that this node already ran.
 +    pub fn set_replay_root(&self, slot: u64) {
 +        self.state.lock().unwrap().replay_root = Some(slot);
 +    }
 +
-+    /// The answer of the first run of a tx in a rooted slot.
++    /// The answer of the first run of a tx in a slot from before the start.
 +    pub fn recorded(&self, slot: u64, signature: &[u8; 64]) -> Option<(Pubkey, Vec<u8>)> {
 +        let state = self.state.lock().unwrap();
 +        if state.replay_root.is_none_or(|root| slot > root) {
