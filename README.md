@@ -293,7 +293,8 @@ only makes blocks.
 | `sol-drivechain-bmm` | A view of the active eCash chain, filled from the local enforcer. |
 | Settle check | For each tx with a top-level `settle_bmm(H, M, S)`, the bank asks the view. It passes only when M is the active block at H. A leader needs N + 1 blocks on top, and replay needs N. |
 | Credit check | For each tx with a top-level `credit_deposits(H, M, ...)`, the bank asks the view for the deposits of M, after D confirmations. |
-| Answers | The runtime builds `BmmAnswer` and `DepositAnswer` for the tx, the same way as the instructions sysvar. No tx can write them. |
+| Paid check | For each tx with a top-level `bundle_paid(through, H, M, M6ID)`, the bank asks the view whether M, the active block at H, holds a Succeeded event for the M6ID. A leader needs K + 1 blocks on top, and replay needs K. |
+| Answers | The runtime builds `BmmAnswer`, `DepositAnswer`, and `BmmPaid` for the tx, the same way as the instructions sysvar. No tx can write them. |
 | Block record | The runtime writes the last block of each 32 slots and its credits into `BmmB1ocks…`. |
 | Pairs | `bmmPublishPairs`, `bmmGetPairs`, and `bmmKnownBanks` on the RPC, the `bmm-pairs` file, and the push to and the pull from the staked peers. A peer signs each `bmmKnownBanks` reply with its node key over the asked banks, the slots, a nonce of the asker, and the time. |
 | Kept answers | The `bmm-answers` file keeps the answer of each settle and credit that the node ran. |
