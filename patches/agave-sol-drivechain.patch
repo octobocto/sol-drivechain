@@ -2696,10 +2696,10 @@ index c8399cb..c4dec90 100644
                  && let Some(feature) = feature::state::from_account(&account)
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..681f9bd
+index 0000000..603c1b3
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,918 @@
+@@ -0,0 +1,934 @@
 +//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
@@ -2876,7 +2876,8 @@ index 0000000..681f9bd
 +                    Lookup::NotYet
 +                        if check != BmmCheck::Leader
 +                            || signature.is_some_and(|signature| {
-+                                held().admit(&signature, tx.fee_payer(), Instant::now())
++                                self.can_pay_fee(tx.fee_payer(), details.fee_details().total_fee())
++                                    && held().admit(&signature, tx.fee_payer(), Instant::now())
 +                            }) =>
 +                    {
 +                        log::debug!("the BMM view has no answer yet for {question:?} as {check:?}");
@@ -2982,6 +2983,12 @@ index 0000000..681f9bd
 +            .iter()
 +            .position(|key| key == voter)
 +            .is_some_and(|index| tx.is_signer(index))
++    }
++
++    /// True when `payer` holds `fee`, so a held tx can pay when it runs.
++    fn can_pay_fee(&self, payer: &Pubkey, fee: u64) -> bool {
++        self.get_account(payer)
++            .is_some_and(|account| account.lamports() >= fee.max(1))
 +    }
 +
 +    fn recorded_answer(
@@ -3447,8 +3454,13 @@ index 0000000..681f9bd
 +            tx(credit(41, 2), true),
 +            BmmCheck::Simulation
 +        )));
++        let poor = Keypair::new();
 +        let payer = Keypair::new();
-+        let leader_check = |_| {
++        bank.store_account(
++            &payer.pubkey(),
++            &AccountSharedData::new(1_000_000, 0, &Pubkey::default()),
++        );
++        let leader_check = |payer: &Keypair| {
 +            let instruction = Instruction::new_with_bytes(
 +                sol_drivechain_bmm::BRIDGE_PROGRAM_ID,
 +                &settle(195),
@@ -3457,7 +3469,7 @@ index 0000000..681f9bd
 +            let transaction = Transaction::new_signed_with_payer(
 +                &[instruction],
 +                Some(&payer.pubkey()),
-+                &[&payer],
++                &[payer],
 +                Hash::new_unique(),
 +            );
 +            check(
@@ -3466,8 +3478,12 @@ index 0000000..681f9bd
 +                BmmCheck::Leader,
 +            )
 +        };
++        assert_eq!(
++            leader_check(&poor),
++            Err(TransactionError::InvalidProgramForExecution)
++        );
 +        let mut results: Vec<_> = (0..=sol_drivechain_bmm::held::MAX_PER_PAYER)
-+            .map(leader_check)
++            .map(|_| leader_check(&payer))
 +            .collect();
 +        assert_eq!(
 +            results.pop(),
