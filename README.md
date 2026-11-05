@@ -327,7 +327,9 @@ a fee payer that holds the fee gets a place in the queue. A
 question that no new eCash block can answer leaves the queue at once. On
 replay, the questions of one slot wait 10 seconds in all for a late eCash
 block, and then the block is dead. The slots of one leader in one epoch wait
-60 seconds in all. While the enforcer does not answer, the
+60 seconds in all. A question for the block one past the view still waits
+at least 3 seconds per slot when the leader used its 60 seconds. While the
+enforcer does not answer, the
 replay waits and marks no block dead. A leader needs one more block than
 replay, so a healthy node never waits.
 

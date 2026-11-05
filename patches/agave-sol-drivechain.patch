@@ -8406,10 +8406,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..1958208
+index 0000000..8556251
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2092 @@
+@@ -0,0 +1,2213 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -8618,6 +8618,11 @@ index 0000000..1958208
 +/// The replayed slots of one leader in one epoch wait this long in all, so a
 +/// staked leader cannot make each of its blocks wait `REPLAY_WAIT`.
 +pub const LEADER_REPLAY_WAIT: Duration = Duration::from_secs(60);
++
++/// The questions of one replayed slot for a block one past the view wait at
++/// least this long in all, also when the leader used its `LEADER_REPLAY_WAIT`.
++/// So a node one block behind does not fail such a slot at once.
++pub const BOUNDARY_WAIT: Duration = Duration::from_secs(3);
 +
 +/// The size of the `BmmAnswer` data: height, block hash, found, commitment,
 +/// Solana block, recorded, credited height, credits active.
@@ -9178,9 +9183,11 @@ index 0000000..1958208
 +/// blocks past what the view can answer. `Mismatch` names another block than
 +/// the view holds with exactly `depth` blocks on top, which a reorg to a
 +/// chain one block longer can still change. `Backfill` waits for older blocks.
++/// `Next` names a block exactly one past what the view can answer.
 +enum Found<T> {
 +    Ready(T),
 +    NotYet,
++    Next,
 +    Ahead,
 +    Mismatch,
 +    Backfill,
@@ -9208,6 +9215,8 @@ index 0000000..1958208
 +    budgets: HashMap<u64, Duration>,
 +    /// The wait that each leader has left in an epoch.
 +    leader_budgets: HashMap<([u8; 32], u64), Duration>,
++    /// The `BOUNDARY_WAIT` that each replayed slot has left.
++    boundary_budgets: HashMap<u64, Duration>,
 +    /// The last time that a backfill started or added older blocks.
 +    backfill_progress: Option<Instant>,
 +}
@@ -9277,6 +9286,7 @@ index 0000000..1958208
 +                    Found::Mismatch
 +                }
 +            }
++            _ if missing == 1 => Found::Next,
 +            _ if missing <= MAX_AHEAD => Found::NotYet,
 +            _ => Found::Ahead,
 +        }
@@ -9293,22 +9303,29 @@ index 0000000..1958208
 +        if self.lowest().is_some_and(|lowest| height < lowest) {
 +            return self.below_view(height, floor);
 +        }
-+        if height.saturating_sub(tip_height) <= MAX_AHEAD {
++        if height.saturating_sub(tip_height) == 1 {
++            Found::Next
++        } else if height.saturating_sub(tip_height) <= MAX_AHEAD {
 +            Found::NotYet
 +        } else {
 +            Found::Ahead
 +        }
 +    }
 +
-+    /// The healthy wait that `slot` and its leader have left. A wait while
-+    /// the enforcer is away or a backfill adds blocks uses none of it.
-+    fn budget(&mut self, slot: u64, leader: ([u8; 32], u64)) -> Duration {
++    /// The healthy wait that `slot` and its leader have left. A question
++    /// one block past the view can also use the `BOUNDARY_WAIT` of the slot.
++    /// A wait while the enforcer is away or a backfill adds blocks uses none
++    /// of it.
++    fn budget(&mut self, slot: u64, leader: ([u8; 32], u64), next: bool) -> Duration {
 +        if self.budgets.len() >= MAX_BUDGETS {
 +            let mut slots: Vec<u64> = self.budgets.keys().copied().collect();
 +            slots.sort_unstable();
 +            for old in &slots[..slots.len() / 2] {
 +                self.budgets.remove(old);
 +            }
++            let budgets = &self.budgets;
++            self.boundary_budgets
++                .retain(|slot, _| budgets.contains_key(slot));
 +        }
 +        if self.leader_budgets.len() >= MAX_BUDGETS {
 +            let newest = self.leader_budgets.keys().map(|(_, epoch)| *epoch).max();
@@ -9320,14 +9337,21 @@ index 0000000..1958208
 +            .leader_budgets
 +            .entry(leader)
 +            .or_insert(LEADER_REPLAY_WAIT);
++        if next {
++            let boundary_left = *self.boundary_budgets.entry(slot).or_insert(BOUNDARY_WAIT);
++            return slot_left.min(leader_left.max(boundary_left));
++        }
 +        slot_left.min(leader_left)
 +    }
 +
-+    fn spend(&mut self, slot: u64, leader: ([u8; 32], u64), spent: Duration) {
++    fn spend(&mut self, slot: u64, leader: ([u8; 32], u64), next: bool, spent: Duration) {
 +        if let Some(left) = self.budgets.get_mut(&slot) {
 +            *left = left.saturating_sub(spent);
 +        }
 +        if let Some(left) = self.leader_budgets.get_mut(&leader) {
++            *left = left.saturating_sub(spent);
++        }
++        if let Some(left) = self.boundary_budgets.get_mut(&slot).filter(|_| next) {
 +            *left = left.saturating_sub(spent);
 +        }
 +    }
@@ -9401,7 +9425,8 @@ index 0000000..1958208
 +
 +    /// A leader drops a question `Ahead` of the view. A replay waits for it
 +    /// within `REPLAY_WAIT` per slot and `LEADER_REPLAY_WAIT` per leader and
-+    /// epoch, because its own view can lag.
++    /// epoch, or `BOUNDARY_WAIT` per slot for a block one past the view,
++    /// because its own view can lag.
 +    fn resolve<T>(&self, wait: Wait, mut query: impl FnMut(&mut State) -> Found<T>) -> Lookup<T> {
 +        let mut state = self.state.lock().unwrap();
 +        loop {
@@ -9414,13 +9439,14 @@ index 0000000..1958208
 +            else {
 +                return match found {
 +                    Found::Ready(value) => Lookup::Ready(value),
-+                    Found::NotYet | Found::Backfill => Lookup::NotYet,
++                    Found::NotYet | Found::Next | Found::Backfill => Lookup::NotYet,
 +                    Found::Ahead | Found::Mismatch | Found::Never => Lookup::Never,
 +                };
 +            };
 +            // A view that the enforcer does not update cannot say "never".
 +            let away = state.exit.is_some() && !state.healthy();
 +            let backfill = matches!(found, Found::Backfill) && state.backfilling();
++            let next = matches!(found, Found::Next);
 +            match found {
 +                Found::Ready(value) => return Lookup::Ready(value),
 +                Found::Never if !away => return Lookup::Never,
@@ -9431,7 +9457,7 @@ index 0000000..1958208
 +            let step = if paused {
 +                WAIT_STEP
 +            } else {
-+                match state.budget(slot, (leader, epoch)) {
++                match state.budget(slot, (leader, epoch), next) {
 +                    left if left.is_zero() => return Lookup::NotYet,
 +                    left => left.min(WAIT_STEP),
 +                }
@@ -9439,7 +9465,7 @@ index 0000000..1958208
 +            let start = Instant::now();
 +            state = self.changed.wait_timeout(state, step).unwrap().0;
 +            if !paused {
-+                state.spend(slot, (leader, epoch), start.elapsed());
++                state.spend(slot, (leader, epoch), next, start.elapsed());
 +            }
 +        }
 +    }
@@ -10383,7 +10409,7 @@ index 0000000..1958208
 +                leader,
 +                epoch: 4,
 +            };
-+            assert_eq!(view.answer(105, &hash(105), 6, 0, wait), Lookup::NotYet);
++            assert_eq!(view.answer(106, &hash(106), 6, 0, wait), Lookup::NotYet);
 +        }
 +        assert!(start.elapsed() < Duration::from_secs(1));
 +        let state = view.state.lock().unwrap();
@@ -10411,6 +10437,101 @@ index 0000000..1958208
 +            );
 +        }
 +        assert!(start.elapsed() < Duration::from_secs(1));
++    }
++
++    /// A view at tip 109 whose replay of `slot` has `leader_left` of the
++    /// leader wait.
++    fn view_with_leader_wait(slot: u64, leader_left: Duration) -> Arc<BmmView> {
++        let view = Arc::new(BmmView::default());
++        view.replace_from(&chain(100, 109, 0));
++        view.mark_synced();
++        view.state
++            .lock()
++            .unwrap()
++            .leader_budgets
++            .insert(([slot as u8; 32], 0), leader_left);
++        view
++    }
++
++    #[test]
++    fn a_block_one_past_the_view_waits_on_an_empty_leader_wait() {
++        let view = view_with_leader_wait(15, Duration::ZERO);
++        let writer = Arc::clone(&view);
++        let handle = std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(100));
++            writer.replace_from(&chain(110, 110, 0));
++            writer.mark_synced();
++        });
++        assert_eq!(
++            view.answer(104, &hash(104), 6, 0, replay(15)),
++            Lookup::Ready(Some([104; 32]))
++        );
++        handle.join().unwrap();
++        let writer = Arc::clone(&view);
++        let handle = std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(100));
++            writer.replace_from(&chain(111, 111, 0));
++            writer.mark_synced();
++        });
++        assert_eq!(view.hash_at(111, 0, replay(15)), Lookup::Ready(hash(111)));
++        handle.join().unwrap();
++    }
++
++    #[test]
++    fn a_block_one_past_the_view_gives_not_yet_after_the_boundary_wait() {
++        let view = view_with_leader_wait(16, Duration::ZERO);
++        view.state
++            .lock()
++            .unwrap()
++            .boundary_budgets
++            .insert(16, Duration::from_millis(300));
++        let start = Instant::now();
++        assert_eq!(view.hash_at(110, 0, replay(16)), Lookup::NotYet);
++        assert!(start.elapsed() >= Duration::from_millis(300));
++        assert!(start.elapsed() < Duration::from_secs(1));
++        assert_eq!(
++            view.answer(104, &hash(104), 6, 0, replay(16)),
++            Lookup::NotYet
++        );
++        assert!(start.elapsed() < Duration::from_secs(1));
++    }
++
++    #[test]
++    fn a_block_one_past_the_view_waits_the_slot_wait_on_the_leader_wait() {
++        let leader_left = Duration::from_secs(5);
++        let view = view_with_leader_wait(17, leader_left);
++        {
++            let mut state = view.state.lock().unwrap();
++            state.budgets.insert(17, Duration::from_millis(400));
++            state.boundary_budgets.insert(17, Duration::ZERO);
++        }
++        let start = Instant::now();
++        assert_eq!(
++            view.answer(104, &hash(104), 6, 0, replay(17)),
++            Lookup::NotYet
++        );
++        assert!(start.elapsed() >= Duration::from_millis(400));
++        assert!(start.elapsed() < Duration::from_secs(1));
++        let state = view.state.lock().unwrap();
++        assert!(
++            state
++                .leader_budgets
++                .get(&([17; 32], 0))
++                .is_some_and(|left| *left < leader_left)
++        );
++        assert_eq!(state.budgets.get(&17), Some(&Duration::ZERO));
++    }
++
++    #[test]
++    fn a_block_two_past_the_view_fails_at_once_on_an_empty_leader_wait() {
++        let view = view_with_leader_wait(18, Duration::ZERO);
++        let start = Instant::now();
++        assert_eq!(
++            view.answer(105, &hash(105), 6, 0, replay(18)),
++            Lookup::NotYet
++        );
++        assert_eq!(view.hash_at(111, 0, replay(18)), Lookup::NotYet);
++        assert!(start.elapsed() < Duration::from_millis(500));
 +    }
 +
 +    #[test]
