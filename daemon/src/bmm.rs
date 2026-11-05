@@ -221,9 +221,12 @@ impl BidRules {
 /// height.
 const REMEMBERED_HEIGHTS: u64 = 1_000;
 
+/// The memory keeps at most this many own pairs per eCash height.
+const MAX_PAIRS_PER_HEIGHT: usize = 64;
+
 /// The validator holds at most this many unchecked pairs per eCash height
 /// (`MAX_UNCHECKED_PER_HEIGHT` in the validator patch).
-const MAX_PAIRS_PER_HEIGHT: usize = 16;
+const VALIDATOR_PAIRS_PER_HEIGHT: usize = 16;
 
 /// The answer of a validator that holds the most unchecked pairs at the
 /// height of a pair (the `MAX_UNCHECKED_PER_HEIGHT` refusal in the patch).
@@ -321,7 +324,8 @@ impl Memory {
     }
 
     /// The own pairs that no settle passed yet, for a new publish at eCash tip
-    /// `tip_height`.
+    /// `tip_height`. A height above the tip gives only its newest
+    /// `VALIDATOR_PAIRS_PER_HEIGHT` pairs.
     pub fn pairs_to_publish(
         &mut self,
         next_height: u64,
@@ -330,21 +334,76 @@ impl Memory {
     ) -> Vec<Pair> {
         self.pairs
             .retain(|_, (_, pair)| pair.height.saturating_add(REMEMBERED_HEIGHTS) >= tip_height);
-        let mut pairs: Vec<Pair> = self
+        let mut pairs: Vec<(u64, Pair)> = self
             .pairs
             .values()
-            .map(|(_, pair)| *pair)
-            .filter(|pair| {
+            .copied()
+            .filter(|(_, pair)| {
                 pair.height >= next_height && pair.height + confirmations + 2 >= tip_height
             })
             .collect();
-        pairs.sort_by_key(|pair| pair.height);
+        pairs.sort_by_key(|(order, pair)| (pair.height, std::cmp::Reverse(*order)));
+        let mut sent_at_height = (0, 0);
         pairs
+            .into_iter()
+            .filter(|(_, pair)| {
+                if pair.height <= tip_height {
+                    return true;
+                }
+                if sent_at_height.0 != pair.height {
+                    sent_at_height = (pair.height, 0);
+                }
+                sent_at_height.1 += 1;
+                sent_at_height.1 <= VALIDATOR_PAIRS_PER_HEIGHT
+            })
+            .map(|(_, pair)| pair)
+            .collect()
     }
 }
 
 /// An active eCash block and its commitment for the sidechain.
 pub type ActiveBlock = (BlockHash, Option<[u8; 32]>);
+
+/// Keeps each pair at a height above `tip_height`, and each pair whose
+/// height has no active block yet. At a height with a block it keeps only the
+/// pair that the block commits to. A height whose block read fails keeps no
+/// pair, and the first read error comes back with the pairs. `pairs` must be
+/// in height order.
+pub async fn pairs_for_blocks<F, Fut>(
+    pairs: Vec<Pair>,
+    tip_height: u64,
+    mut block_at: F,
+) -> (Vec<Pair>, Result<(), BmmError>)
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<Option<ActiveBlock>, BmmError>>,
+{
+    let mut kept = Vec::with_capacity(pairs.len());
+    let mut first_error = None;
+    let mut block: Option<(u64, Option<Option<ActiveBlock>>)> = None;
+    for pair in pairs {
+        if pair.height > tip_height {
+            kept.push(pair);
+            continue;
+        }
+        if block.map(|(height, _)| height) != Some(pair.height) {
+            let found = match block_at(pair.height).await {
+                Ok(found) => Some(found),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    None
+                }
+            };
+            block = Some((pair.height, found));
+        }
+        match block.and_then(|(_, found)| found) {
+            None => {}
+            Some(Some((_, commitment))) if commitment != Some(pair.commitment()) => {}
+            Some(_) => kept.push(pair),
+        }
+    }
+    (kept, first_error.map_or(Ok(()), Err))
+}
 
 /// The reads of eCash and Solana that a template needs, and the pair publish.
 pub trait Chain: Send + Sync {
@@ -901,7 +960,15 @@ async fn round(
         settings.confirmations,
     );
     // A validator that was away when the loop published gets the pair now.
-    if let Err(error) = publish_pairs(rpc, &pairs).await {
+    // After the eCash block only the won pair goes out, because the
+    // validator holds few pairs per height.
+    let published = async {
+        let (pairs, read) =
+            pairs_for_blocks(pairs, tip_height, |height| live.active_block(tip, height)).await;
+        publish_pairs(rpc, &pairs).await?;
+        read
+    };
+    if let Err(error) = published.await {
         tracing::warn!(%error, "the loop cannot publish its pairs");
     }
     memory
@@ -1811,16 +1878,94 @@ mod tests {
         assert_eq!(memory.pair(&pair.commitment()), None);
     }
 
-    #[test]
-    fn a_height_keeps_only_the_newest_pairs_that_the_validator_holds() {
-        let mut memory = Memory::default();
-        let pairs: Vec<Pair> = (0..=MAX_PAIRS_PER_HEIGHT as u8)
-            .map(|byte| Pair {
-                height: 100,
-                block: [byte; 32],
-                payee: Pubkey::new_from_array([7u8; 32]),
+    fn pairs_at(height: u64, count: u16) -> Vec<Pair> {
+        (0..count)
+            .map(|index| {
+                let mut block = [0u8; 32];
+                block[..2].copy_from_slice(&index.to_le_bytes());
+                Pair {
+                    height,
+                    block,
+                    payee: Pubkey::new_from_array([7u8; 32]),
+                }
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn a_height_keeps_more_pairs_than_the_validator_holds() {
+        let mut memory = Memory::default();
+        let pairs = pairs_at(100, 17);
+        for pair in &pairs {
+            memory.remember(*pair);
+        }
+        for pair in &pairs {
+            assert_eq!(memory.pair(&pair.commitment()), Some(*pair));
+        }
+    }
+
+    #[test]
+    fn a_height_without_a_block_publishes_only_the_newest_pairs_that_the_validator_holds() {
+        let mut memory = Memory::default();
+        let open = pairs_at(106, 20);
+        let mut mined = pairs_at(104, 20);
+        for pair in &mut mined {
+            pair.block[2] = 1;
+        }
+        for pair in open.iter().chain(&mined) {
+            memory.remember(*pair);
+        }
+        let published = memory.pairs_to_publish(100, 105, 6);
+        let commitments = |pairs: &mut dyn Iterator<Item = &Pair>| {
+            let mut found: Vec<[u8; 32]> = pairs.map(Pair::commitment).collect();
+            found.sort_unstable();
+            found
+        };
+        let at = |height| commitments(&mut published.iter().filter(|pair| pair.height == height));
+        assert_eq!(at(106), commitments(&mut open[4..].iter()));
+        assert_eq!(at(104), commitments(&mut mined.iter()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_block_read_still_publishes_the_pairs_above_the_tip() {
+        let mut pairs = pairs_at(100, 2);
+        pairs.extend(pairs_at(101, 2));
+        pairs.extend(pairs_at(102, 2));
+        let (kept, read) = pairs_for_blocks(pairs.clone(), 101, |height| async move {
+            match height {
+                100 => Err(BmmError::HeightTooLarge(height)),
+                _ => Ok(None),
+            }
+        })
+        .await;
+        assert_eq!(kept, pairs[2..]);
+        assert!(matches!(read, Err(BmmError::HeightTooLarge(100))));
+    }
+
+    #[tokio::test]
+    async fn after_its_block_a_height_publishes_only_the_committed_pair() {
+        let mut pairs = pairs_at(100, 3);
+        pairs.extend(pairs_at(101, 2));
+        pairs.extend(pairs_at(102, 2));
+        pairs.extend(pairs_at(103, 2));
+        let won = pairs[1];
+        let hash = BlockHash::from_byte_array([1u8; 32]);
+        let (kept, read) = pairs_for_blocks(pairs.clone(), 102, |height| async move {
+            Ok(match height {
+                100 => Some((hash, Some(won.commitment()))),
+                101 => Some((hash, None)),
+                _ => None,
+            })
+        })
+        .await;
+        read.unwrap();
+        assert_eq!(kept, [&[won][..], &pairs[5..]].concat());
+    }
+
+    #[test]
+    fn a_height_keeps_only_the_newest_pairs_up_to_the_bound() {
+        let mut memory = Memory::default();
+        let pairs = pairs_at(100, MAX_PAIRS_PER_HEIGHT as u16 + 1);
         for pair in &pairs {
             memory.remember(*pair);
         }
