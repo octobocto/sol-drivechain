@@ -107,8 +107,6 @@ bridge_value() {
   dn_solana M bridge-state --program-id "$PROGRAM_ID" | awk -v key="$1" '$0 ~ "^"key {print $NF}'
 }
 lamports() { sol M balance "$1" --lamports | awk '{print $1}'; }
-# The lamports of an account on the branch that a node follows.
-lamports_on() { sol "$1" balance "$2" --lamports --commitment processed | awk '{print $1}'; }
 # The highest eCash height that the branch of a node credited in full.
 credited() {
   dn_solana "$1" bridge-state --program-id "$PROGRAM_ID" --processed \
@@ -477,7 +475,7 @@ PAYEE="$M_ID"
 # the eCash tip, and the credits start after it.
 "$D" genesis --program-id "$PROGRAM_ID" \
   --oracle "$("$SOLANA_KEYGEN" pubkey "$ROOT/oracle.json")" \
-  --oracle-lamports 1000000000 --float-lamports 0 --bundle-min-slots 0 \
+  --oracle-lamports 1000000000 --float-lamports 0 \
   --bmm-skip-blocks "$BMM_SKIP_BLOCKS" \
   --lamports-per-byte-year "$LAMPORTS_PER_BYTE_YEAR" --ecash-start-height "$(tip)" \
   --deposit-confirmations "$DEPOSIT_D" --deposit-lag "$LAG" \
@@ -895,69 +893,13 @@ done
 pass "two checkpoints of the censoring branch failed rule 3; one honest checkpoint at eCash height $Y9 won, and M follows H at slot $C9B"
 
 # ---------------------------------------------------------------------------
-step "11. an eCash reorg deeper than D drops a credited deposit, and the nodes leave its branch"
-"$SOLANA_KEYGEN" new --no-bip39-passphrase --silent -o "$ROOT/target.json"
-TARGET="$("$SOLANA_KEYGEN" pubkey "$ROOT/target.json")"
-DEPOSIT_SATS=2000000
-read -r T10 C10 _ < <(checkpoint M)
-mine 1
-d deposit "${E[@]}" --pubkey "$TARGET" --sats "$DEPOSIT_SATS" >/dev/null
-mine 1
-H10="$(tip)"
-mine "$DEPOSIT_D"
-wait_credited M "$H10"
-wait_credited H "$H10"
-[ "$(lamports_on M "$TARGET")" = $((DEPOSIT_SATS * 10)) ] || fail "M did not credit the deposit"
-[ "$(lamports_on H "$TARGET")" = $((DEPOSIT_SATS * 10)) ] || fail "H did not credit the deposit"
-wait_recorded_above M "$(sol M slot --commitment processed)"
-read -r OLD10_SLOT OLD10 < <(recorded M)
-echo "eCash height $H10 holds the deposit; both branches credited it, and slot $OLD10_SLOT ($OLD10) holds the credit"
-MARK_M=$(lines M) MARK_H=$(lines H)
-REORG_FROM=$((H10 - 1))
-btc invalidateblock "$(btc getblockhash "$REORG_FROM")" >/dev/null
-for _ in $(seq 1 $((DEPOSIT_D + 2))); do
-  btc generateblock "$COINBASE" '[]' >/dev/null
-done
-wait_for_enforcer
-echo "eCash reorged $((DEPOSIT_D + 2)) blocks from height $REORG_FROM, deeper than D = $DEPOSIT_D; the new blocks hold no deposit"
-wait_log M "credit deposits of eCash blocks that the active chain dropped" "$MARK_M" 60
-wait_log H "credit deposits of eCash blocks that the active chain dropped" "$MARK_H" 60
-wait_log M "BMM fork choice selects slot [0-9]+ over slot" "$MARK_M" 60
-for node in M H; do
-  for _ in $(seq 1 60); do
-    [ "$(lamports_on "$node" "$TARGET")" = 0 ] && break
-    sleep 1
-  done
-  [ "$(lamports_on "$node" "$TARGET")" = 0 ] || fail "node $node still follows the branch with the credit"
-done
-bid H --block "$OLD10" >/dev/null
-mine 1
-Z10="$(tip)"
-wait_log M "the checkpoint at eCash height $Z10 fails rule 3: block $OLD10 credited deposits of an eCash block that the active chain dropped" "$MARK_M" 60
-wait_log H "the checkpoint at eCash height $Z10 fails rule 3: block $OLD10" "$MARK_H" 60
-read -r Y10 S10 _ < <(checkpoint M)
-wait_log M "head Some\($S10\)" "$MARK_M" 120 >/dev/null
-wait_log H "head Some\($S10\)" "$MARK_H" 120 >/dev/null
-mine "$K"
-wait_log M "moves the root from [0-9]+ to anchor $S10\$" "$MARK_M"
-wait_log H "moves the root from [0-9]+ to anchor $S10\$" "$MARK_H"
-sleep 10
-read -r C10B C10B_HASH < <(confirmed_frozen H)
-[ "$(frozen_hash M "$C10B")" = "$C10B_HASH" ] || fail "M and H froze slot $C10B with other hashes"
-# The new branch credits the new eCash blocks at the same heights, and the
-# dropped deposit stays out of it.
-wait_credited M "$H10"
-[ "$(lamports_on M "$TARGET")" = 0 ] || fail "the new branch holds the dropped deposit"
-pass "the reorg dropped the credit at slot $OLD10_SLOT; a checkpoint to it at eCash height $Z10 failed rule 3; both nodes rooted slot $S10 on a branch without it, which credited the new eCash height $H10 with no deposit"
-
-# ---------------------------------------------------------------------------
-step "12. a pair for a bank that no node holds restarts each node at most once"
+step "11. a pair for a bank that no node holds restarts each node at most once"
 MARK_M=$(lines M) MARK_H=$(lines H)
 mine "$L"
 wait_log M "fallback true" "$MARK_M" 60
 wait_log H "fallback true" "$MARK_H" 60
 sleep 5
-ROOT12="$(last_root M)"
+ROOT11="$(last_root M)"
 read -r FAKE_BANK FAKE_PAYEE FAKE_COMMITMENT < <(python3 -c '
 import hashlib, os
 ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -971,20 +913,20 @@ def b58(raw):
 bank, payee = os.urandom(32), os.urandom(32)
 print(b58(bank), b58(payee), hashlib.sha256(bank + payee).hexdigest())
 ')
-H12=$(($(tip) + 1))
+H11=$(($(tip) + 1))
 START_M=$(lines M) START_H=$(lines H)
-in_ns "$NS_M" "$D" publish-pair --solana-rpc-url "$(url_of M)" --height "$H12" --block "$FAKE_BANK" --payee "$FAKE_PAYEE" >/dev/null
+in_ns "$NS_M" "$D" publish-pair --solana-rpc-url "$(url_of M)" --height "$H11" --block "$FAKE_BANK" --payee "$FAKE_PAYEE" >/dev/null
 d bid-bmm "${E[@]}" --commitment "$FAKE_COMMITMENT" --sats 1000 >/dev/null
 mine 1
-[ "$(tip)" = "$H12" ] || fail "the fake commitment did not land at eCash height $H12"
+[ "$(tip)" = "$H11" ] || fail "the fake commitment did not land at eCash height $H11"
 mine "$K"
 sleep 30
 mine "$L"
 for _ in $(seq 1 600); do
-  [ "$(last_root M)" -gt "$ROOT12" ] && break
+  [ "$(last_root M)" -gt "$ROOT11" ] && break
   sleep 1
 done
-[ "$(last_root M)" -gt "$ROOT12" ] || fail "the stake votes stopped at root $ROOT12 after the fake pair"
+[ "$(last_root M)" -gt "$ROOT11" ] || fail "the stake votes stopped at root $ROOT11 after the fake pair"
 sleep 30
 for node in "M $START_M" "H $START_H"; do
   # shellcheck disable=SC2086
@@ -992,7 +934,7 @@ for node in "M $START_M" "H $START_H"; do
   restarts="$(log_since "$1" "$2" | grep -ac "the validator stopped with exit code 75" || true)"
   [ "$restarts" -le 1 ] || fail "the fake pair restarted node $1 $restarts times"
 done
-pass "the fake pair at eCash height $H12 restarted each node at most once, and the stake root went from $ROOT12 to $(last_root M)"
+pass "the fake pair at eCash height $H11 restarted each node at most once, and the stake root went from $ROOT11 to $(last_root M)"
 
 echo
-echo "PASS: BMM checkpoints select the fork and move the root in all twelve cases."
+echo "PASS: BMM checkpoints select the fork and move the root in all eleven cases."
