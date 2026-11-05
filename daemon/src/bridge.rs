@@ -16,12 +16,6 @@ pub const MAX_BUNDLE_RECORDS: u64 = 1_500;
 /// The lowest mainchain fee of one withdrawal. It must match the bridge program.
 pub const MIN_FEE_SATS: u64 = 1_000;
 
-/// The lowest fee while `waiting` records wait for a seal. It must match
-/// `min_fee_sats` of the bridge program.
-pub fn min_fee_sats(waiting: u64) -> u64 {
-    MIN_FEE_SATS.saturating_add(MIN_FEE_SATS.saturating_mul(waiting) / 100)
-}
-
 /// The slots that an unpaired commitment waits after the cursor reaches it.
 /// It must match `SKIP_GRACE_SLOTS` of the bridge program.
 pub const SKIP_GRACE_SLOTS: u64 = 300;
@@ -201,11 +195,6 @@ impl Config {
 
     /// The size of a config before the `bundle_m6id` field.
     pub const LEN_BEFORE_M6ID: usize = Self::LEN - 32;
-
-    /// The lowest fee that `withdraw` takes now.
-    pub fn min_fee_sats(&self) -> u64 {
-        min_fee_sats(self.withdrawal_count.saturating_sub(self.bundled_through))
-    }
 
     /// The record indices of the live bundle, if one is live.
     pub fn live_bundle(&self) -> Option<std::ops::Range<u64>> {
@@ -975,22 +964,6 @@ mod tests {
         assert_eq!(at(243), 6);
         assert_eq!(at(251), 600);
         assert_eq!(&data[259..291], &[6u8; 32]);
-    }
-
-    #[test]
-    fn the_fee_quote_rises_with_the_records_that_wait() {
-        assert_eq!(min_fee_sats(0), 1_000);
-        assert_eq!(min_fee_sats(1), 1_010);
-        assert_eq!(min_fee_sats(100), 2_000);
-        assert_eq!(min_fee_sats(1_499), 15_990);
-        let mut config = a_config();
-        config.withdrawal_count = 109;
-        config.bundled_through = 9;
-        assert_eq!(config.min_fee_sats(), 2_000);
-        config.bundled_through = 109;
-        assert_eq!(config.min_fee_sats(), 1_000);
-        config.bundled_through = 200;
-        assert_eq!(config.min_fee_sats(), 1_000);
     }
 
     #[test]
