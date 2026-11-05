@@ -7,6 +7,17 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 User=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
 Environment=HOME=/root
 Environment=PATH=/root/.cargo/bin:/root/.local/share/solana/install/active_release/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=ROOT=/root/sol-regtest

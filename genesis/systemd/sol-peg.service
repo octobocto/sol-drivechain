@@ -6,6 +6,30 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# The bundle file lands beside the oracle key by a rename, so the directory
+# stays writable, and the other keys disappear.
+ReadWritePaths=/root/src/sol-drivechain/keys
+InaccessiblePaths=-/root/src/sol-drivechain/keys/validator-identity.json -/root/src/sol-drivechain/keys/validator-vote.json -/root/src/sol-drivechain/keys/faucet.json -/root/src/sol-drivechain/keys/user.json -/root/src/sol-drivechain/keys/mnemonic.txt
 Environment=HOME=/root
 Environment=PEG_NETWORK=ecash
 Environment=PEG_SLOT=8
