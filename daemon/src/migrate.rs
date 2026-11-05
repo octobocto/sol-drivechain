@@ -66,6 +66,10 @@ pub struct Cursor {
     pub paid_through: u64,
     pub bundled_through: u64,
     pub bundle_sealed_height: u64,
+    /// The M6ID of the live bundle, in the internal byte order.
+    /// Zero without a live bundle.
+    #[serde(default)]
+    pub bundle_m6id: [u8; 32],
 }
 
 /// One account that carries over byte for byte.
@@ -246,6 +250,10 @@ pub enum MigrateError {
     Overcounted { supply: u64, found: u64 },
     #[error("the lamports overflow a u64")]
     Overflow,
+    #[error("the live bundle holds record {0}, and the chain holds no such record")]
+    MissingRecord(u64),
+    #[error(transparent)]
+    M6(#[from] crate::m6::M6Error),
     #[error(
         "accounts whose owner is no program hold {found} lamports, and the export cannot carry \
          them. Pass --accept-ownerless-lamports {found} to leave them behind"
@@ -324,7 +332,7 @@ pub async fn export(
         .find(|account| account.pubkey == config_key)
         .ok_or(MigrateError::NoConfig)?;
     let config_lamports = config.lamports;
-    let config = Config::decode(&config.data)?;
+    let config = Config::decode_any(&config.data)?;
     let cursor = Cursor {
         pegged_lamports: config.pegged_lamports,
         deposit_high_water: config.deposit_high_water,
@@ -341,6 +349,7 @@ pub async fn export(
         paid_through: config.paid_through,
         bundled_through: config.bundled_through,
         bundle_sealed_height: config.bundle_sealed_height,
+        bundle_m6id: live_m6id(program_id, config.live_bundle(), &bridge_accounts)?,
     };
 
     let mut carried = Carried {
@@ -376,6 +385,34 @@ pub async fn export(
     accept_ownerless_lamports(state.ownerless_lamports, accept_ownerless)?;
     state.epoch = epoch;
     Ok(state)
+}
+
+/// The M6ID of the bundle of the records in `live`, from `accounts`, or zero
+/// without a live bundle.
+fn live_m6id(
+    program_id: &Pubkey,
+    live: Option<std::ops::Range<u64>>,
+    accounts: &[RawAccount],
+) -> Result<[u8; 32], MigrateError> {
+    use bitcoin::hashes::Hash as _;
+
+    let Some(live) = live else {
+        return Ok([0u8; 32]);
+    };
+    let by_key: BTreeMap<Pubkey, &RawAccount> = accounts
+        .iter()
+        .map(|account| (account.pubkey, account))
+        .collect();
+    let records = live
+        .map(|index| {
+            by_key
+                .get(&bridge::withdrawal_pda(program_id, index).0)
+                .and_then(|account| WithdrawalRecord::decode(&account.data).ok())
+                .filter(|record| record.index == index)
+                .ok_or(MigrateError::MissingRecord(index))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(crate::m6::m6id(&crate::peg::bundle_of(&records)?).to_byte_array())
 }
 
 /// The accounts that the export collects, sorted by what happens to them.
@@ -655,6 +692,7 @@ mod tests {
             paid_through: 1,
             bundled_through: 2,
             bundle_sealed_height: 3,
+            bundle_m6id: [4u8; 32],
         }
     }
 
@@ -1090,6 +1128,45 @@ mod tests {
         old_vote[..4].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(vote_withdrawer(&old_vote), None);
         assert_eq!(stake_withdrawer(&[1, 0, 0, 0]), None);
+    }
+
+    fn a_record_raw(program_id: &Pubkey, index: u64) -> RawAccount {
+        let mut data = bridge::discriminator("account", "WithdrawalRecord").to_vec();
+        data.extend_from_slice(&index.to_le_bytes());
+        data.extend_from_slice(&[5u8; 32]);
+        for value in [20_000u64, 1_000, 1_000] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&22u32.to_le_bytes());
+        data.extend_from_slice(&[[0x00, 0x14].as_slice(), &[index as u8; 20]].concat());
+        data.push(255);
+        RawAccount {
+            pubkey: bridge::withdrawal_pda(program_id, index).0,
+            lamports: 1_000,
+            data,
+            executable: false,
+        }
+    }
+
+    #[test]
+    fn a_live_bundle_carries_the_m6id_of_its_records() {
+        use bitcoin::hashes::Hash as _;
+
+        let program_id = Pubkey::new_from_array([3u8; 32]);
+        let accounts: Vec<RawAccount> = (0..4)
+            .map(|index| a_record_raw(&program_id, index))
+            .collect();
+        let records: Vec<WithdrawalRecord> = accounts[1..3]
+            .iter()
+            .map(|account| WithdrawalRecord::decode(&account.data).unwrap())
+            .collect();
+        let want = crate::m6::m6id(&crate::peg::bundle_of(&records).unwrap()).to_byte_array();
+        assert_eq!(live_m6id(&program_id, Some(1..3), &accounts).unwrap(), want);
+        assert_eq!(live_m6id(&program_id, None, &accounts).unwrap(), [0u8; 32]);
+        assert!(matches!(
+            live_m6id(&program_id, Some(3..5), &accounts),
+            Err(MigrateError::MissingRecord(4))
+        ));
     }
 
     #[test]

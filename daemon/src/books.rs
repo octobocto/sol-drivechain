@@ -375,6 +375,7 @@ mod tests {
             bundle_min_slots: 0,
             bmm_skip_blocks: 0,
             bmm_next_since_slot: 0,
+            bundle_m6id: [0u8; 32],
         };
         data.paid_through = paid_through;
         data.bundled_through = bundled_through;

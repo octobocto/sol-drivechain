@@ -42,6 +42,11 @@ pub const TREASURY_SEED: &[u8] = b"treasury";
 pub const BMM_ANSWER_ID: Pubkey =
     Pubkey::from_str_const("BmmAnswer1111111111111111111111111111111111");
 
+/// The account that the patched validator builds for each `bundle_paid`. It
+/// must match `BMM_PAID_ID` in the Agave patch and the bridge program.
+pub const BMM_PAID_ID: Pubkey =
+    Pubkey::from_str_const("BmmPaid111111111111111111111111111111111111");
+
 /// The account that the patched validator builds for each credit. It must
 /// match `DEPOSIT_ANSWER_ID` in the Agave patch and the bridge program.
 pub const DEPOSIT_ANSWER_ID: Pubkey =
@@ -194,10 +199,14 @@ pub struct Config {
     pub bundle_min_slots: u64,
     pub bmm_skip_blocks: u64,
     pub bmm_next_since_slot: u64,
+    pub bundle_m6id: [u8; 32],
 }
 
 impl Config {
-    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 9;
+    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 9 + 32;
+
+    /// The size of a config before the `bundle_m6id` field.
+    pub const LEN_BEFORE_M6ID: usize = Self::LEN - 32;
 
     /// The lowest fee that `withdraw` takes now.
     pub fn min_fee_sats(&self) -> u64 {
@@ -258,7 +267,19 @@ impl Config {
         ] {
             data.extend_from_slice(&value.to_le_bytes());
         }
+        data.extend_from_slice(&self.bundle_m6id);
         data
+    }
+
+    /// Decodes a config, or an older one without `bundle_m6id`, which reads
+    /// as zero.
+    pub fn decode_any(data: &[u8]) -> Result<Self, BridgeError> {
+        if data.len() == Self::LEN_BEFORE_M6ID {
+            let mut data = data.to_vec();
+            data.resize(Self::LEN, 0);
+            return Self::decode(&data);
+        }
+        Self::decode(data)
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, BridgeError> {
@@ -302,6 +323,7 @@ impl Config {
             bundle_min_slots: reader.u64().ok_or_else(|| cut("bundle_min_slots"))?,
             bmm_skip_blocks: reader.u64().ok_or_else(|| cut("bmm_skip_blocks"))?,
             bmm_next_since_slot: reader.u64().ok_or_else(|| cut("bmm_next_since_slot"))?,
+            bundle_m6id: reader.array32().ok_or_else(|| cut("bundle_m6id"))?,
         })
     }
 }
@@ -446,27 +468,49 @@ pub fn transfer_ix(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
     }
 }
 
-/// Puts the oldest open records into the live bundle. The oracle signs.
-pub fn seal_bundle_ix(program_id: &Pubkey, oracle: &Pubkey) -> Instruction {
+/// Puts the open records up to `through` into the live bundle, whose blinded
+/// M6 has the ID `m6id` in the internal byte order. The oracle signs.
+pub fn seal_bundle_ix(
+    program_id: &Pubkey,
+    oracle: &Pubkey,
+    through: u64,
+    m6id: &[u8; 32],
+) -> Instruction {
+    let mut data = discriminator("global", "seal_bundle").to_vec();
+    data.extend_from_slice(&through.to_le_bytes());
+    data.extend_from_slice(m6id);
     Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(config_pda(program_id).0, false),
             AccountMeta::new_readonly(*oracle, true),
         ],
-        data: discriminator("global", "seal_bundle").to_vec(),
+        data,
     }
 }
 
-/// Marks the live bundle, which ends at `through`, paid. The oracle signs.
-pub fn bundle_paid_ix(program_id: &Pubkey, oracle: &Pubkey, through: u64) -> Instruction {
+/// Marks the live bundle, which ends at `through`, paid. eCash block
+/// `block_hash` at `height` holds the Succeeded event for `m6id`.
+/// `block_hash` is in the internal byte order. The oracle signs.
+pub fn bundle_paid_ix(
+    program_id: &Pubkey,
+    oracle: &Pubkey,
+    through: u64,
+    height: u64,
+    block_hash: &[u8; 32],
+    m6id: &[u8; 32],
+) -> Instruction {
     let mut data = discriminator("global", "bundle_paid").to_vec();
     data.extend_from_slice(&through.to_le_bytes());
+    data.extend_from_slice(&height.to_le_bytes());
+    data.extend_from_slice(block_hash);
+    data.extend_from_slice(m6id);
     Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(config_pda(program_id).0, false),
             AccountMeta::new_readonly(*oracle, true),
+            AccountMeta::new_readonly(BMM_PAID_ID, false),
         ],
         data,
     }
@@ -631,6 +675,7 @@ mod tests {
             bundle_min_slots: 1_000,
             bmm_skip_blocks: 6,
             bmm_next_since_slot: 600,
+            bundle_m6id: [6u8; 32],
         }
     }
 
@@ -701,6 +746,21 @@ mod tests {
         let mut long = current;
         long.push(0);
         assert!(Config::decode(&long).is_err());
+    }
+
+    #[test]
+    fn a_config_before_the_m6id_decodes_with_a_zero_m6id() {
+        let current = a_config().encode();
+        let old = &current[..Config::LEN_BEFORE_M6ID];
+        assert!(Config::decode(old).is_err());
+        assert_eq!(
+            Config::decode_any(old).unwrap(),
+            Config {
+                bundle_m6id: [0u8; 32],
+                ..a_config()
+            }
+        );
+        assert_eq!(Config::decode_any(&current).unwrap(), a_config());
     }
 
     #[test]
@@ -901,7 +961,7 @@ mod tests {
     fn the_config_sits_at_the_offsets_that_the_validator_reads() {
         let data = a_config().encode();
         let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        assert_eq!(data.len(), 259);
+        assert_eq!(data.len(), 291);
         assert_eq!(&data[8..40], &[7u8; 32]);
         assert_eq!(at(64), 900);
         assert_eq!(at(80), 6);
@@ -920,6 +980,7 @@ mod tests {
         assert_eq!(at(235), 1_000);
         assert_eq!(at(243), 6);
         assert_eq!(at(251), 600);
+        assert_eq!(&data[259..291], &[6u8; 32]);
     }
 
     #[test]
@@ -1016,10 +1077,20 @@ mod tests {
     fn the_oracle_signs_the_seal_and_the_payment() {
         let program_id = a_program_id();
         let oracle = Pubkey::new_from_array([1u8; 32]);
-        let seal = seal_bundle_ix(&program_id, &oracle);
-        assert_eq!(seal.data, discriminator("global", "seal_bundle"));
-        let paid = bundle_paid_ix(&program_id, &oracle, 9);
-        assert_eq!(&paid.data[8..16], &9u64.to_le_bytes());
+        let seal = seal_bundle_ix(&program_id, &oracle, 9, &[6u8; 32]);
+        assert_eq!(seal.data[..8], discriminator("global", "seal_bundle"));
+        assert_eq!(seal.data[8..16], 9u64.to_le_bytes());
+        assert_eq!(seal.data[16..], [6u8; 32]);
+        let paid = bundle_paid_ix(&program_id, &oracle, 9, 300, &[4u8; 32], &[6u8; 32]);
+        // The patch reads `bundle_paid_question` in this order.
+        assert_eq!(paid.data.len(), 88);
+        assert_eq!(paid.data[..8], discriminator("global", "bundle_paid"));
+        assert_eq!(paid.data[8..16], 9u64.to_le_bytes());
+        assert_eq!(paid.data[16..24], 300u64.to_le_bytes());
+        assert_eq!(paid.data[24..56], [4u8; 32]);
+        assert_eq!(paid.data[56..88], [6u8; 32]);
+        assert_eq!(paid.accounts[2].pubkey, BMM_PAID_ID);
+        assert!(!paid.accounts[2].is_writable && !paid.accounts[2].is_signer);
         for ix in [seal, paid] {
             assert!(ix.accounts[0].is_writable);
             assert_eq!(ix.accounts[1].pubkey, oracle);

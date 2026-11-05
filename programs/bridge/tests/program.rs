@@ -11,10 +11,10 @@ use anchor_lang::{
 };
 use litesvm::LiteSVM;
 use sol_drivechain_bridge::{
-    accounts, commitment_of, instruction, min_fee_sats, AnsweredDeposit, BmmAnswer, Config,
-    DepositAnswer, WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, DEPOSIT_ANSWER_ENTRY_LEN,
-    DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID, LAMPORTS_PER_SAT, MAX_BUNDLE_RECORDS,
-    MAX_SCRIPT_PUBKEY_LEN, MIN_FEE_SATS, PAIR_WINDOW,
+    accounts, commitment_of, instruction, min_fee_sats, AnsweredDeposit, BmmAnswer, BmmPaid,
+    Config, DepositAnswer, WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, BMM_PAID_ID,
+    BMM_PAID_LEN, DEPOSIT_ANSWER_ENTRY_LEN, DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID,
+    LAMPORTS_PER_SAT, MAX_BUNDLE_RECORDS, MAX_SCRIPT_PUBKEY_LEN, MIN_FEE_SATS, PAIR_WINDOW,
 };
 use solana_account::Account;
 use solana_instruction::Instruction;
@@ -35,6 +35,9 @@ const SYSVAR_PROGRAM: Pubkey =
 /// The eCash blocks that the credits must pass above a commitment without a
 /// pair before it can skip.
 const BMM_SKIP_BLOCKS: u64 = 1_000;
+
+/// The eCash height of the Succeeded event of a bundle in these tests.
+const PAID_HEIGHT: u64 = 300;
 
 /// The eCash height at which the chain starts to settle BMM.
 const BMM_START: u64 = 100;
@@ -320,18 +323,35 @@ impl Chain {
         self.send(instruction, &user)
     }
 
-    fn seal_as(&mut self, signer: &Keypair) -> Result<(), String> {
+    fn seal_through_as(
+        &mut self,
+        signer: &Keypair,
+        through: u64,
+        m6id: [u8; 32],
+    ) -> Result<(), String> {
         let instruction = self.build(
             accounts::SealBundle {
                 config: self.config,
                 oracle: signer.pubkey(),
             }
             .to_account_metas(None),
-            instruction::SealBundle {}.data(),
+            instruction::SealBundle { through, m6id }.data(),
         );
         let signer = signer.insecure_clone();
         self.svm.expire_blockhash();
         self.send(instruction, &signer)
+    }
+
+    fn seal_through(&mut self, through: u64) -> Result<(), String> {
+        let oracle = self.oracle.insecure_clone();
+        self.seal_through_as(&oracle, through, m6id_of(through))
+    }
+
+    /// Seals the oldest open records, at most `MAX_BUNDLE_RECORDS` of them.
+    fn seal_as(&mut self, signer: &Keypair) -> Result<(), String> {
+        let config = self.config();
+        let through = (config.paid_through + MAX_BUNDLE_RECORDS).min(config.withdrawal_count);
+        self.seal_through_as(signer, through, m6id_of(through))
     }
 
     fn seal(&mut self) -> Result<(), String> {
@@ -339,18 +359,75 @@ impl Chain {
         self.seal_as(&oracle)
     }
 
-    fn bundle_paid_as(&mut self, signer: &Keypair, through: u64) -> Result<(), String> {
+    /// Writes the `BmmPaid` account, the way the patched validator does for a
+    /// tx with a top-level `bundle_paid`.
+    fn paid_answer(&mut self, paid: BmmPaid) {
+        let mut data = vec![0u8; BMM_PAID_LEN];
+        data[..8].copy_from_slice(&paid.height.to_le_bytes());
+        data[8..40].copy_from_slice(&paid.block_hash);
+        data[40..72].copy_from_slice(&paid.m6id);
+        data[72] = u8::from(paid.paid);
+        data[73..81].copy_from_slice(&paid.paid_height.to_le_bytes());
+        self.svm
+            .set_account(
+                BMM_PAID_ID,
+                Account {
+                    lamports: 1,
+                    data,
+                    owner: SYSVAR_PROGRAM,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+    }
+
+    /// Sends `bundle_paid` with no change to the `BmmPaid` account.
+    fn ask_bundle_paid(
+        &mut self,
+        through: u64,
+        height: u64,
+        block_hash: [u8; 32],
+        m6id: [u8; 32],
+    ) -> Result<(), String> {
+        let oracle = self.oracle.insecure_clone();
+        self.ask_bundle_paid_as(&oracle, through, height, block_hash, m6id)
+    }
+
+    fn ask_bundle_paid_as(
+        &mut self,
+        signer: &Keypair,
+        through: u64,
+        height: u64,
+        block_hash: [u8; 32],
+        m6id: [u8; 32],
+    ) -> Result<(), String> {
         let instruction = self.build(
             accounts::BundlePaid {
                 config: self.config,
                 oracle: signer.pubkey(),
+                bmm_paid: BMM_PAID_ID,
             }
             .to_account_metas(None),
-            instruction::BundlePaid { through }.data(),
+            instruction::BundlePaid {
+                through,
+                height,
+                block_hash,
+                m6id,
+            }
+            .data(),
         );
         let signer = signer.insecure_clone();
         self.svm.expire_blockhash();
         self.send(instruction, &signer)
+    }
+
+    /// Marks the bundle that ends at `through` paid, with the answer that
+    /// eCash paid its M6ID at `PAID_HEIGHT`.
+    fn bundle_paid_as(&mut self, signer: &Keypair, through: u64) -> Result<(), String> {
+        let paid = a_paid_answer(m6id_of(through));
+        self.paid_answer(paid);
+        self.ask_bundle_paid_as(signer, through, paid.height, paid.block_hash, paid.m6id)
     }
 
     fn bundle_paid(&mut self, through: u64) -> Result<(), String> {
@@ -558,6 +635,24 @@ fn ecash_block(height: u64) -> [u8; 32] {
     block
 }
 
+/// The M6ID that these tests seal for the bundle that ends at `through`.
+fn m6id_of(through: u64) -> [u8; 32] {
+    let mut m6id = [0x6du8; 32];
+    m6id[..8].copy_from_slice(&through.to_le_bytes());
+    m6id
+}
+
+/// The answer that eCash block `ecash_block(PAID_HEIGHT)` paid `m6id`.
+fn a_paid_answer(m6id: [u8; 32]) -> BmmPaid {
+    BmmPaid {
+        height: PAID_HEIGHT,
+        block_hash: ecash_block(PAID_HEIGHT),
+        m6id,
+        paid: true,
+        paid_height: PAID_HEIGHT,
+    }
+}
+
 fn to(target: Pubkey, sequence_number: u64, value_sats: u64) -> AnsweredDeposit {
     AnsweredDeposit {
         sequence_number,
@@ -605,6 +700,7 @@ fn genesis_config(oracle: Pubkey, float_lamports: u64, bundle_min_slots: u64) ->
         bundle_min_slots,
         bmm_skip_blocks: BMM_SKIP_BLOCKS,
         bmm_next_since_slot: 0,
+        bundle_m6id: [0; 32],
     };
     let mut data = Vec::new();
     config
@@ -684,6 +780,23 @@ fn settle_bmm_carries_the_height_the_block_hash_then_the_solana_block() {
 }
 
 #[test]
+fn bundle_paid_carries_the_end_the_height_the_block_hash_then_the_m6id() {
+    // The patched validator reads the question in this order.
+    let data = instruction::BundlePaid {
+        through: 0x0a0b_0c0d,
+        height: 0x0102_0304_0506_0708,
+        block_hash: [9u8; 32],
+        m6id: [7u8; 32],
+    }
+    .data();
+    assert_eq!(data.len(), 88);
+    assert_eq!(&data[8..16], &0x0a0b_0c0du64.to_le_bytes());
+    assert_eq!(&data[16..24], &0x0102_0304_0506_0708u64.to_le_bytes());
+    assert_eq!(&data[24..56], &[9u8; 32]);
+    assert_eq!(&data[56..88], &[7u8; 32]);
+}
+
+#[test]
 fn the_commitment_is_sha256_of_the_solana_block_then_the_payee() {
     let payee = Pubkey::new_from_array([4u8; 32]);
     let mut bytes = SOLANA_BLOCK.to_vec();
@@ -700,7 +813,7 @@ fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
     let oracle = Pubkey::new_from_array([5u8; 32]);
     let data = genesis_config(oracle, 7, 9);
     let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-    assert_eq!(data.len(), 259);
+    assert_eq!(data.len(), 291);
     assert_eq!(&data[..8], Config::DISCRIMINATOR);
     assert_eq!(&data[8..40], oracle.as_ref());
     assert_eq!(at(64), BMM_START);
@@ -718,6 +831,7 @@ fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
     assert_eq!(at(235), 9);
     assert_eq!(at(243), BMM_SKIP_BLOCKS);
     assert_eq!(at(251), 0);
+    assert_eq!(data[259..291], [0; 32]);
 }
 
 #[test]
@@ -1563,6 +1677,116 @@ fn the_seal_keeps_the_ecash_height_of_the_credits() {
         .expect("the withdrawal lands");
     chain.seal().expect("the bundle seals");
     assert_eq!(chain.config().bundle_sealed_height, DEPOSIT_START + 1);
+}
+
+#[test]
+fn a_seal_ends_above_paid_through_and_within_the_cap_and_the_count() {
+    let mut chain = Chain::start();
+    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    for index in 0..2 {
+        chain
+            .withdraw(index, 2_000_000, min_fee_sats(index), &A_P2WPKH)
+            .expect("the withdrawal lands");
+    }
+    assert!(chain.seal_through(0).is_err());
+    assert!(chain.seal_through(3).is_err());
+    chain.seal_through(1).expect("a bundle of one record seals");
+    let config = chain.config();
+    assert_eq!((config.paid_through, config.bundled_through), (0, 1));
+    assert_eq!(config.bundle_m6id, m6id_of(1));
+    chain.bundle_paid(1).expect("the bundle pays");
+    assert!(chain.seal_through(1).is_err());
+    chain.seal_through(2).expect("the next record seals");
+}
+
+#[test]
+fn a_seal_above_the_record_cap_fails() {
+    let mut chain = Chain::start();
+    chain.deposit(0, 100_000_000).expect("the deposit lands");
+    for index in 0..=MAX_BUNDLE_RECORDS {
+        let fee_sats = min_fee_sats(index);
+        let each = (fee_sats + 600) * LAMPORTS_PER_SAT;
+        chain
+            .withdraw(index, each, fee_sats, &A_P2WPKH)
+            .expect("the withdrawal lands");
+    }
+    assert!(chain.seal_through(MAX_BUNDLE_RECORDS + 1).is_err());
+    chain
+        .seal_through(MAX_BUNDLE_RECORDS)
+        .expect("a bundle at the cap seals");
+}
+
+/// A chain with one record in the live bundle, sealed with `m6id_of(1)`.
+fn a_sealed_bundle() -> Chain {
+    let mut chain = Chain::start();
+    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    chain
+        .withdraw(0, 5_000_000, 1_000, &A_P2WPKH)
+        .expect("the withdrawal lands");
+    chain.seal().expect("the bundle seals");
+    chain
+}
+
+#[test]
+fn bundle_paid_without_an_answer_fails() {
+    let mut chain = a_sealed_bundle();
+    let paid = a_paid_answer(m6id_of(1));
+    assert!(chain
+        .ask_bundle_paid(1, paid.height, paid.block_hash, paid.m6id)
+        .is_err());
+    assert_eq!(chain.config().paid_through, 0);
+}
+
+#[test]
+fn bundle_paid_with_an_unpaid_answer_fails() {
+    let mut chain = a_sealed_bundle();
+    let paid = BmmPaid {
+        paid: false,
+        paid_height: 0,
+        ..a_paid_answer(m6id_of(1))
+    };
+    chain.paid_answer(paid);
+    assert!(chain
+        .ask_bundle_paid(1, paid.height, paid.block_hash, paid.m6id)
+        .is_err());
+    assert_eq!(chain.config().paid_through, 0);
+}
+
+#[test]
+fn bundle_paid_with_an_answer_for_another_question_fails() {
+    let mut chain = a_sealed_bundle();
+    let paid = a_paid_answer(m6id_of(1));
+    chain.paid_answer(paid);
+    for (height, block_hash, m6id) in [
+        (paid.height + 1, paid.block_hash, paid.m6id),
+        (paid.height, ecash_block(paid.height + 1), paid.m6id),
+        (paid.height, paid.block_hash, m6id_of(2)),
+    ] {
+        assert!(chain.ask_bundle_paid(1, height, block_hash, m6id).is_err());
+    }
+    assert_eq!(chain.config().paid_through, 0);
+}
+
+#[test]
+fn bundle_paid_for_another_m6id_than_the_sealed_one_fails() {
+    let mut chain = a_sealed_bundle();
+    let paid = a_paid_answer(m6id_of(2));
+    chain.paid_answer(paid);
+    assert!(chain
+        .ask_bundle_paid(1, paid.height, paid.block_hash, paid.m6id)
+        .is_err());
+    assert_eq!(chain.config().paid_through, 0);
+}
+
+#[test]
+fn bundle_paid_with_the_answer_for_the_sealed_m6id_marks_the_bundle_paid() {
+    let mut chain = a_sealed_bundle();
+    let paid = a_paid_answer(m6id_of(1));
+    chain.paid_answer(paid);
+    chain
+        .ask_bundle_paid(1, paid.height, paid.block_hash, paid.m6id)
+        .expect("the answer for the sealed M6ID marks the bundle paid");
+    assert_eq!(chain.config().paid_through, 1);
 }
 
 #[test]

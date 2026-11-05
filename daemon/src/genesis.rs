@@ -209,6 +209,7 @@ pub fn accounts(
         bundle_min_slots: params.bundle_min_slots,
         bmm_skip_blocks: params.bmm_skip_blocks,
         bmm_next_since_slot: 0,
+        bundle_m6id: [0u8; 32],
     };
     let mut accounts: BTreeMap<Pubkey, Account> = BTreeMap::new();
     let mut put = |pubkey: Pubkey, lamports: u64, owner: Pubkey, data: Vec<u8>| {
@@ -272,6 +273,7 @@ pub fn accounts(
         config.paid_through = cursor.paid_through;
         config.bundled_through = cursor.bundled_through;
         config.bundle_sealed_height = cursor.bundle_sealed_height;
+        config.bundle_m6id = cursor.bundle_m6id;
 
         let vault = *state
             .balances
@@ -717,7 +719,7 @@ mod tests {
         let accounts = accounts(&params(), None, &[]).unwrap();
         let config = find(&accounts, &bridge::config_pda(&params().program_id).0);
         assert_eq!(config.data.len(), Config::LEN);
-        assert_eq!(config.lamports, (128 + 259) * 4);
+        assert_eq!(config.lamports, (128 + 291) * 4);
         assert_eq!(config.owner, params().program_id);
         let record = find(&accounts, &bridge::BMM_BLOCKS_ID);
         assert_eq!(record.data, vec![0u8; bridge::BLOCK_RECORD_LEN]);
@@ -763,6 +765,7 @@ mod tests {
                 paid_through: 1,
                 bundled_through: 2,
                 bundle_sealed_height: 470,
+                bundle_m6id: [6u8; 32],
             },
             balances,
             accounts: vec![CarriedAccount {
@@ -813,6 +816,7 @@ mod tests {
         assert_eq!(config.float_lamports, 90_000 + 120_000);
         assert_eq!((config.paid_through, config.bundled_through), (1, 2));
         assert_eq!(config.bundle_sealed_height, 470);
+        assert_eq!(config.bundle_m6id, [6u8; 32]);
         assert_eq!(config.bundle_sealed_slot, 0);
         assert_eq!(config.bundle_min_slots, 4_000);
     }
