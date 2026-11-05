@@ -332,7 +332,7 @@ pub async fn export(
         .find(|account| account.pubkey == config_key)
         .ok_or(MigrateError::NoConfig)?;
     let config_lamports = config.lamports;
-    let config = Config::decode_any(&config.data)?;
+    let config = Config::decode(&config.data)?;
     let cursor = Cursor {
         pegged_lamports: config.pegged_lamports,
         deposit_high_water: config.deposit_high_water,

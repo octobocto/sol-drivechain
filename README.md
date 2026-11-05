@@ -485,13 +485,12 @@ chain has no entrypoint, so it cannot learn its own address. Its operator sets
 The mainchain releases the Bitcoin, not a key. A credit needs no key: the
 bridge takes the deposits that each validator reads from its own enforcer.
 The oracle key seals a bundle and marks it paid after eCash paid it. The
-program cannot see eCash, so it trusts the oracle for the payment. A stolen
-oracle key, or a false enforcer answer, can mark the live bundle paid before
-eCash pays it. Those records then close without a payout. The key cannot mark
-a record outside the live bundle, cannot move a lamport, and cannot mark a
-bundle paid before `bundle_min_slots` after its seal, about 18 days on eCash.
-So it closes at most one bundle in that time. Keep the enforcer on the same
-host as the daemon, because its gRPC has no TLS.
+bridge takes `bundle_paid` only when the answer of the local enforcer shows a
+Succeeded event for the M6ID of the seal, so a stolen oracle key alone cannot
+mark a bundle paid early. A false enforcer answer can mark the live bundle
+paid before eCash pays it. Those records then close without a payout. The key
+cannot mark a record outside the live bundle and cannot move a lamport. Keep
+the enforcer on the same host as the daemon, because its gRPC has no TLS.
 
 The units in `genesis/systemd` run as root inside a systemd sandbox. The
 validator answers RPC from the world, so it sees only its own identity and

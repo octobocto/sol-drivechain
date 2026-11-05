@@ -67,10 +67,6 @@ SLOTS_PER_EPOCH="${SLOTS_PER_EPOCH:-432000}"
 # The state file of a halted chain from `migrate-state`. The new genesis then
 # carries its balances, its open withdrawals, and its bridge cursor.
 STATE="${STATE:-}"
-# A bundle waits this many slots before the oracle can mark it paid, so a
-# stolen oracle key closes at most one bundle in that time. eCash pays a
-# bundle after 6049 blocks, about 9 million slots.
-BUNDLE_MIN_SLOTS="${BUNDLE_MIN_SLOTS:-4000000}"
 # Heights settle in order. A commitment with no known pair blocks the cursor
 # until the credits pass its height by this many eCash blocks, about one hour,
 # and then any sender moves past it.
@@ -192,7 +188,7 @@ else
 fi
 "$DAEMON" genesis --program-id "$PROGRAM_ID" --vault-sol "$VAULT_SOL" \
   --oracle "$("$SOLANA_KEYGEN" pubkey "$KEYS/oracle.json")" --oracle-lamports "$ORACLE_LAMPORTS" \
-  --float-lamports "$FLOAT_LAMPORTS" --bundle-min-slots "$BUNDLE_MIN_SLOTS" \
+  --float-lamports "$FLOAT_LAMPORTS" \
   --bmm-skip-blocks "$BMM_SKIP_BLOCKS" \
   --bootstrap-vote "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-vote.json")" \
   --bootstrap-stake "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-stake.json")" \

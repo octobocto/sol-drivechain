@@ -29,8 +29,6 @@ pub struct Params {
     /// accounts and that no deposit backs: the identity, the vote and stake
     /// accounts, and the faucet.
     pub float_lamports: u64,
-    /// The fewest slots between a bundle seal and its `bundle_paid`.
-    pub bundle_min_slots: u64,
     /// The eCash blocks that the credits must pass above a commitment without
     /// a pair before the BMM cursor skips it.
     pub bmm_skip_blocks: u64,
@@ -215,7 +213,6 @@ pub fn accounts(
         bundled_through: 0,
         bundle_sealed_height: 0,
         bundle_sealed_slot: 0,
-        bundle_min_slots: params.bundle_min_slots,
         bmm_skip_blocks: params.bmm_skip_blocks,
         bmm_next_since_slot: 0,
         bundle_m6id: [0u8; 32],
@@ -683,7 +680,6 @@ mod tests {
             oracle: Pubkey::new_from_array([4u8; 32]),
             oracle_lamports: 1_000_000,
             float_lamports: 120_000,
-            bundle_min_slots: 4_000,
             bmm_skip_blocks: 6,
             lamports_per_byte_year: 4,
             ecash_start_height: 500,
@@ -734,7 +730,7 @@ mod tests {
         let accounts = accounts(&params(), None, &[]).unwrap();
         let config = find(&accounts, &bridge::config_pda(&params().program_id).0);
         assert_eq!(config.data.len(), Config::LEN);
-        assert_eq!(config.lamports, (128 + 291) * 4);
+        assert_eq!(config.lamports, (128 + 283) * 4);
         assert_eq!(config.owner, params().program_id);
         let record = find(&accounts, &bridge::BMM_BLOCKS_ID);
         assert_eq!(record.data, vec![0u8; bridge::BLOCK_RECORD_LEN]);
@@ -833,7 +829,6 @@ mod tests {
         assert_eq!(config.bundle_sealed_height, 470);
         assert_eq!(config.bundle_m6id, [6u8; 32]);
         assert_eq!(config.bundle_sealed_slot, 0);
-        assert_eq!(config.bundle_min_slots, 4_000);
     }
 
     #[test]
@@ -864,7 +859,6 @@ mod tests {
         let config = config_of(&accounts(&params(), None, &[]).unwrap());
         assert_eq!(config.vault_supply, SUPPLY);
         assert_eq!(config.float_lamports, 1_000_000 + 120_000);
-        assert_eq!(config.bundle_min_slots, 4_000);
     }
 
     fn a_token_account(byte: u8, lamports: u64, len: usize) -> Account {

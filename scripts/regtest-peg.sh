@@ -131,7 +131,7 @@ step "the Solana chain"
 # and the credits start after it.
 BMM_START="$(btc getblockcount)"
 NETWORK=regtest LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$BMM_START" \
-  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 \
+  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" \
   ORACLE_LAMPORTS=2000000 BOOTSTRAP_LAMPORTS=2000000 \
   BMM_SKIP_BLOCKS=2 \
   SIDECHAIN_SLOT="$SLOT" BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" \
@@ -677,7 +677,7 @@ step "migration: an open withdrawal, then the chain stops"
 # The peg closes the paid record once the BMM root holds its payment.
 records() {
   rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\",\"dataSlice\":{\"offset\":0,\"length\":0}}]" \
-    | python3 -c 'import json,sys; print(sum(1 for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 291))'
+    | python3 -c 'import json,sys; print(sum(1 for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 283))'
 }
 for _ in $(seq 1 60); do
   [ "$(records)" = 0 ] && break
@@ -695,7 +695,7 @@ OPEN_ADDRESS="$(new_address)"
 books_close
 OPEN_INDEX=$(( $(bridge_value "withdrawals") - 1 ))
 OPEN_RECORD="$(rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]" \
-  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 291]')"
+  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 283]')"
 [ "$(printf '%s\n' "$OPEN_RECORD" | grep -c .)" = 1 ] || fail "the chain holds these withdrawal records: $OPEN_RECORD"
 # A halted node casts no vote, so its `confirmed` stays behind. The cursor
 # reads `processed`, as the migration does.
@@ -744,7 +744,7 @@ grep -q "takes the answer of its first run" "$ROOT/validator-halted.log" \
 echo "PASS: the halted node replayed from the genesis through the settles of the dropped eCash blocks"
 OLD_RPC="$SOLANA_URL" LEDGER="$ROOT/ledger-new" KEYS="$ROOT/keys" STATE="$ROOT/state.json" \
   ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" NETWORK=regtest DAEMON="$D" \
-  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 BMM_SKIP_BLOCKS=2 \
+  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BMM_SKIP_BLOCKS=2 \
   bash "$REPO/scripts/migrate-genesis.sh" | tee "$ROOT/migrate.log"
 kill "$HALTED_PID"
 wait "$HALTED_PID" 2>/dev/null || true
@@ -781,7 +781,7 @@ printf '%s\n' "$CURSOR_BEFORE"
 [ "$(lamports_of "$DOWN_PUBKEY")" = "$DOWN_BEFORE" ] || fail "the second balance did not carry over"
 echo "PASS: the balances carried over: $USER_BEFORE and $DOWN_BEFORE lamports"
 NEW_RECORD="$(rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]" \
-  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 291]')"
+  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 283]')"
 [ "$NEW_RECORD" = "$OPEN_RECORD" ] || fail "the open withdrawal record did not carry over"
 echo "PASS: open withdrawal $OPEN_INDEX carried over byte for byte"
 books_close
