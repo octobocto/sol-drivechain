@@ -11,8 +11,8 @@
 network_depths() {
   local d lag n k l
   case "${NETWORK:-}" in
-    ecash) d=12 lag=100 n=6 k=3 l=12 ;;
-    betanet | regtest) d=6 lag=100 n=6 k=2 l=6 ;;
+    ecash) d=12 lag=36 n=6 k=3 l=12 ;;
+    betanet | regtest) d=6 lag=18 n=6 k=2 l=6 ;;
     alphanet | mainnet | testnet | signet) d="" lag="" n="" k="" l="" ;;
     *)
       echo "error: set NETWORK to ecash, betanet, alphanet, mainnet, testnet, signet, or regtest" >&2
