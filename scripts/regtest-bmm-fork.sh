@@ -905,5 +905,49 @@ wait_credited M "$H10"
 [ "$(lamports_on M "$TARGET")" = 0 ] || fail "the new branch holds the dropped deposit"
 pass "the reorg dropped the credit at slot $OLD10_SLOT; a checkpoint to it at eCash height $Z10 failed rule 3; both nodes rooted slot $S10 on a branch without it, which credited the new eCash height $H10 with no deposit"
 
+# ---------------------------------------------------------------------------
+step "12. a pair for a bank that no node holds restarts each node at most once"
+MARK_M=$(lines M) MARK_H=$(lines H)
+mine "$L"
+wait_log M "fallback true" "$MARK_M" 60
+wait_log H "fallback true" "$MARK_H" 60
+sleep 5
+ROOT12="$(last_root M)"
+read -r FAKE_BANK FAKE_PAYEE FAKE_COMMITMENT < <(python3 -c '
+import hashlib, os
+ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58(raw):
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = ALPHABET[r] + out
+    return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + out
+bank, payee = os.urandom(32), os.urandom(32)
+print(b58(bank), b58(payee), hashlib.sha256(bank + payee).hexdigest())
+')
+H12=$(($(tip) + 1))
+START_M=$(lines M) START_H=$(lines H)
+d publish-pair --solana-rpc-url "$(url_of M)" --height "$H12" --block "$FAKE_BANK" --payee "$FAKE_PAYEE" >/dev/null
+d bid-bmm "${E[@]}" --commitment "$FAKE_COMMITMENT" --sats 1000 >/dev/null
+mine 1
+[ "$(tip)" = "$H12" ] || fail "the fake commitment did not land at eCash height $H12"
+mine "$K"
+sleep 30
+mine "$L"
+for _ in $(seq 1 600); do
+  [ "$(last_root M)" -gt "$ROOT12" ] && break
+  sleep 1
+done
+[ "$(last_root M)" -gt "$ROOT12" ] || fail "the stake votes stopped at root $ROOT12 after the fake pair"
+sleep 30
+for node in "M $START_M" "H $START_H"; do
+  # shellcheck disable=SC2086
+  set -- $node
+  restarts="$(log_since "$1" "$2" | grep -ac "the validator stopped with exit code 75" || true)"
+  [ "$restarts" -le 1 ] || fail "the fake pair restarted node $1 $restarts times"
+done
+pass "the fake pair at eCash height $H12 restarted each node at most once, and the stake root went from $ROOT12 to $(last_root M)"
+
 echo
-echo "PASS: BMM checkpoints select the fork and move the root in all eleven cases."
+echo "PASS: BMM checkpoints select the fork and move the root in all twelve cases."
