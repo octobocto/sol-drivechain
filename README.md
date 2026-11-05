@@ -399,7 +399,11 @@ change the value.
   fallback. `finalized` stays at the last BMM root. A read at
   `finalized` then fails, because the node no longer holds the exact state
   of that slot. When checkpoints come back and name another branch, BMM still
-  overrules the stake roots with a restart.
+  overrules the stake roots with a restart. While the proof of a restart or
+  of a vouched checkpoint is open, the stake votes move no root, so a node
+  that restarted cannot root its old branch again before the bank arrives.
+  Near the end of the leader schedule of the root, the stake votes still
+  move the root.
 - **Join.** A node that starts from a snapshot shows no `finalized` block
   until it moves its root to a BMM checkpoint itself. A tie never moves the
   root.
