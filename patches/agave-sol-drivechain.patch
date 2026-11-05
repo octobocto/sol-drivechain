@@ -5199,10 +5199,10 @@ index 0000000..248a0d1
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..2067c53
+index 0000000..20df244
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2452 @@
+@@ -0,0 +1,2498 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -5905,7 +5905,25 @@ index 0000000..2067c53
 +        })
 +        .map(|checkpoint| checkpoint.height)
 +        .collect();
-+    let split_height = *theirs.iter().min()?;
++    let ours_above = |height: u64| {
++        checkpoints
++            .iter()
++            .filter(|checkpoint| {
++                checkpoint.height > height
++                    && known.contains(&checkpoint.bank_hash)
++                    && !lost.contains(&checkpoint.bank_hash)
++            })
++            .count()
++    };
++    let mut heights = theirs.clone();
++    heights.sort_unstable();
++    // An old unknown checkpoint, such as a lost tie that the state file no
++    // longer names, must not pull the split below our own checkpoints.
++    let split_height = heights
++        .iter()
++        .enumerate()
++        .find(|(index, height)| heights.len().saturating_sub(*index) > ours_above(**height))
++        .map(|(_, height)| *height)?;
 +    let below_split = |anchor: &&Anchor| anchor.height < split_height;
 +    let anchor = anchors
 +        .iter()
@@ -5924,16 +5942,8 @@ index 0000000..2067c53
 +    if anchor.slot >= root {
 +        return None;
 +    }
-+    let ours = checkpoints
-+        .iter()
-+        .filter(|checkpoint| {
-+            checkpoint.height > split_height
-+                && known.contains(&checkpoint.bank_hash)
-+                && !lost.contains(&checkpoint.bank_hash)
-+        })
-+        .count();
-+    let trigger_height = *theirs.iter().max()?;
-+    (theirs.len() > ours && trigger_height > saved.handled_height).then_some(Restart {
++    let trigger_height = *heights.last()?;
++    (trigger_height > saved.handled_height).then_some(Restart {
 +        anchor,
 +        trigger_height,
 +    })
@@ -7151,6 +7161,42 @@ index 0000000..2067c53
 +                PARAMS
 +            ),
 +            None
++        );
++    }
++
++    #[test]
++    fn a_stale_unknown_checkpoint_below_our_checkpoints_does_not_hide_a_newer_branch() {
++        let stale = Checkpoint {
++            height: 99,
++            block_hash: block(99),
++            bank_hash: [0xdd; 32],
++        };
++        let checkpoints = [
++            checkpoint(98, 3),
++            stale,
++            checkpoint(100, 5),
++            checkpoint(101, 7),
++            unknown(103),
++        ];
++        let saved = Saved {
++            base: Some(base(0, 0)),
++            ..Saved::default()
++        };
++        assert_eq!(
++            restart(
++                10,
++                &split(),
++                &checkpoints,
++                106,
++                &saved,
++                &[ancestor(3), ancestor(5), ancestor(7)],
++                u64::MAX,
++                PARAMS
++            ),
++            Some(Restart {
++                anchor: anchor(101, 7),
++                trigger_height: 103,
++            })
 +        );
 +    }
 +
