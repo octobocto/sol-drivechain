@@ -290,9 +290,6 @@ moves the cursor to H + 1:
   that, any settle of the height moves past it and pays nothing. Each skip
   starts a new grace, so a leader cannot skip a row of heights in a backlog
   and take their fees.
-- A commitment that no pair matches, more than 4032 blocks below
-  `credited_height`, moves the cursor at once and pays nothing. The
-  validators drop the pairs of that height.
 
 The fees that a height does not pay stay in the treasury, and the next
 payee takes them. The `bmm` loop settles every height, the empty ones too. The

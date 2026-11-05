@@ -1310,8 +1310,7 @@ pub fn next_settle(
 /// The settles from the cursor `next` up, at most `SETTLE_STEPS`, as each
 /// one moves the cursor by one. A commitment without a pair can skip once
 /// `credited_height` reaches its height plus `skip_blocks` and `grace_passed`
-/// holds for the cursor, or when it is below the pair window. It stops at
-/// the first wait.
+/// holds for the cursor. It stops at the first wait.
 #[allow(clippy::too_many_arguments)]
 pub async fn plan_settles<F, Fut>(
     next: u64,
@@ -1340,10 +1339,7 @@ where
             confirmations,
             block,
             pairs,
-            (credited_height >= height.saturating_add(skip_blocks)
-                && grace_passed
-                && height == next)
-                || bridge::pair_too_old(height, credited_height),
+            credited_height >= height.saturating_add(skip_blocks) && grace_passed && height == next,
             sender,
         );
         if step == SettleStep::Wait {
@@ -2469,49 +2465,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cursor_below_the_pair_window_skips_each_height_without_the_skip_blocks() {
+    async fn a_cursor_far_below_the_credits_skips_only_after_the_grace_slots() {
         let sender = Pubkey::new_from_array([8u8; 32]);
         let credited_height = 10_000u64;
-        let tip_height = credited_height + 6;
-        let mut next = credited_height - 2 * bridge::PAIR_WINDOW;
-        let mut rounds = 0;
-        loop {
-            let plan = plan_settles(
+        let next = 100;
+        let plan = |grace_passed| {
+            plan_settles(
                 next,
-                tip_height,
+                credited_height + 6,
                 6,
                 &[],
-                u64::MAX,
+                6,
                 credited_height,
-                false,
+                grace_passed,
                 sender,
                 |height| async move {
                     let hash = BlockHash::from_byte_array([height as u8; 32]);
                     Ok(Some((hash, Some([5u8; 32]))))
                 },
             )
-            .await
-            .unwrap();
-            if plan.is_empty() {
-                break;
-            }
-            for (height, step) in &plan {
-                assert_eq!(*height, next);
-                assert!(
-                    matches!(step, SettleStep::Send { solana_block, .. } if *solana_block == [0u8; 32])
-                );
-                next += 1;
-            }
-            rounds += 1;
-        }
+        };
+        assert!(plan(false).await.unwrap().is_empty());
+        let skipped = plan(true).await.unwrap();
         assert_eq!(
-            next,
-            credited_height - bridge::PAIR_WINDOW,
-            "a recent commitment waits"
-        );
-        assert_eq!(
-            rounds,
-            (bridge::PAIR_WINDOW as usize).div_ceil(SETTLE_STEPS)
+            skipped
+                .iter()
+                .map(|(height, _)| *height)
+                .collect::<Vec<_>>(),
+            [next]
         );
     }
 
