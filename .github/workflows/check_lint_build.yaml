@@ -60,3 +60,12 @@ jobs:
 
       - name: Test the daemon
         run: cargo test --manifest-path daemon/Cargo.toml --all-targets
+
+  systemd-units:
+    name: Sandbox of the systemd units
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start each unit with a probe
+        run: sudo bash scripts/test-systemd-units.sh

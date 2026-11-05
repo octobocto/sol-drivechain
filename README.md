@@ -484,6 +484,13 @@ bundle paid before `bundle_min_slots` after its seal, about 18 days on eCash.
 So it closes at most one bundle in that time. Keep the enforcer on the same
 host as the daemon, because its gRPC has no TLS.
 
+The units in `genesis/systemd` run as root inside a systemd sandbox. The
+validator answers RPC from the world, so it sees only its own identity and
+vote keys. The BMM daemon sees only the identity key. The peg sees the oracle
+key and its bundle file, and no other secret key. Neither daemon holds a
+capability or writes outside its own files. `scripts/test-systemd-units.sh`
+proves each rule on a disposable host.
+
 No key controls BMM. The coinbase commits to the payee, the pair names it, and
 any user can send the settle that pays it.
 
