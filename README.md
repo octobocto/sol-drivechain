@@ -318,9 +318,9 @@ only makes blocks.
 | Treasury | Every fee goes to the treasury, not to the leader. |
 | Vote fee | A simple vote pays no signature fee only when its vote account holds at least 0.1% of the epoch stake and its authorized voter signs it. Every other tx pays. Alpenglow stays off, so votes are txs. |
 | `sol-drivechain-bmm` | A view of the active eCash chain, filled from the local enforcer. |
-| Settle check | For each tx with a top-level `settle_bmm(H, M, S)`, the bank asks the view. It passes only when M is the active block at H. A leader needs N + 1 blocks on top, and replay needs N. |
-| Credit check | For each tx with a top-level `credit_deposits(H, M, ...)`, the bank asks the view for the deposits of M, after D confirmations. |
-| Paid check | For each tx with a top-level `bundle_paid(through, H, M, M6ID)`, the bank asks the view whether M, the active block at H, holds a Succeeded event for the M6ID. A leader needs K + 1 blocks on top, and replay needs K. |
+| Settle check | For each tx with a top-level `settle_bmm(H, M, S)`, the bank asks the view. It passes only when M is the active block at H. A leader needs N + 2 blocks on top, and replay needs N. |
+| Credit check | For each tx with a top-level `credit_deposits(H, M, ...)`, the bank asks the view for the deposits of M, after D confirmations. A leader needs two more. |
+| Paid check | For each tx with a top-level `bundle_paid(through, H, M, M6ID)`, the bank asks the view whether M, the active block at H, holds a Succeeded event for the M6ID. A leader needs K + 2 blocks on top, and replay needs K. |
 | Answers | The runtime builds `BmmAnswer`, `DepositAnswer`, and `BmmPaid` for the tx, the same way as the instructions sysvar. No tx can write them. |
 | Block record | The runtime writes the last block of each 32 slots and its credits into `BmmB1ocks…`. |
 | Pairs | `bmmPublishPairs` and `bmmGetPairs` on the RPC, the `bmm-pairs` file, and the push to and the pull from the staked peers. |
@@ -330,24 +330,16 @@ only makes blocks.
 | Flags | `--bmm-enforcer-url` on the validator. `--bmm-sidechain-slot`, `--bmm-confirmations`, `--bmm-root-depth`, and `--bmm-fallback-blocks` on `solana-genesis`. |
 
 A settle or a credit that the bridge refuses from its config alone runs at
-once, fails, and pays its fee. A "not ready" settle or credit waits in the
-leader queue for at most 30 seconds, with at most 4 txs per fee payer. Only
-a fee payer that holds the fee gets a place in the queue. A
-question that no new eCash block can answer leaves the queue at once. On
-replay, the questions of one slot wait 10 seconds in all for a late eCash
-block, and then the block is dead. The slots of one leader in one epoch wait
-60 seconds in all. A question for the block one past the view still waits
-up to 3 seconds per slot when the leader used its 60 seconds, and up to 15
-seconds in all for one leader in one epoch. While the
-enforcer does not answer, the
-replay waits and marks no block dead. A leader needs one more block than
-replay, so a healthy node never waits.
+once, fails, and pays its fee. A leader drops a "not ready" settle or credit,
+and the daemon sends it again in its next round, 2 seconds later. On replay,
+the questions of one slot wait 10 seconds in all for a late eCash block, and
+then the block is dead. The slots of one leader in one epoch wait 60 seconds
+in all. While the enforcer does not answer, the replay waits and marks no
+block dead. A leader needs two more blocks than replay, so a node that is up
+to two blocks behind its leader never waits.
 
 A replay of a slot of the ledger at the start takes the answer from
-`bmm-answers`, not from the enforcer, when this node ran that block before. Each
-kept answer holds the bank hash of its block. A replay takes it only while the
-ledger holds that bank hash for the slot. A purge of the block also drops the
-hash, so a new block at the slot asks the enforcer. An eCash reorg deeper than N or D after that run can remove the eCash
+`bmm-answers`, not from the enforcer, when this node ran that block before. An eCash reorg deeper than N or D after that run can remove the eCash
 block that a settle or a credit names. Without the kept answer, a restart or a
 replay from the genesis marks that slot dead. A slot that comes after the start
 always asks the enforcer, so no new block can use a kept answer. A node that
@@ -365,9 +357,9 @@ payout.
 
 | Value | Where | Betanet and regtest | eCash | What it does |
 |---|---|---|---|---|
-| D | `deposit_confirmations` in the bridge config, from the genesis | 6 | 12 | A credit waits for D eCash confirmations. |
+| D | `deposit_confirmations` in the bridge config, from the genesis | 6 | 12 | A replay takes a credit after D eCash confirmations, and a leader after D + 2. |
 | lag | `deposit_lag` in the bridge config, from the genesis | 18 | 36 | A checkpoint at eCash height H counts only when its bank credited every deposit through H - lag. It also bounds how old a checkpoint bank can be, so the root lags at most lag + D + K blocks. |
-| N | `BmmParams` in the genesis, and `bmm --confirmations` | 6 | 6 | A settle waits for N + 1 eCash blocks on top. |
+| N | `BmmParams` in the genesis, and `bmm --confirmations` | 6 | 6 | A leader takes a settle with N + 2 eCash blocks on top, and replay with N. |
 | K | `BmmParams` in the genesis | 2 | 3 | A checkpoint becomes the root after K eCash confirmations. |
 | L | `BmmParams` in the genesis | 6 | 12 | After L eCash blocks without a checkpoint, the stake votes move the root. |
 | epoch | `slots_per_epoch` in the genesis | 432000 | 432000 | A node drops each block more than half an epoch above its root. |
@@ -400,9 +392,9 @@ An existing chain cannot change the value.
 - **Fallback.** After L eCash blocks without a checkpoint, the stake votes
   move the root. Only the first checkpoint of each bank at or above the root
   counts for L, so repeated commitments to the root bank do not stop the
-  fallback. `finalized` stays at the last BMM root. A read at
-  `finalized` then fails, because the node no longer holds the exact state
-  of that slot. When checkpoints come back and name another branch, BMM still
+  fallback. `finalized` stays at the last BMM root. Each read at
+  `finalized` then fails, because the node no longer holds the state of
+  that slot. When checkpoints come back and name another branch, BMM still
   overrules the stake roots with a restart. After a restart, the stake votes
   move no root until a bank of the BMM branch arrives or the next eCash block
   comes. A hold that brings no bank blocks a new hold for one block, so fake
@@ -432,10 +424,8 @@ A later checkpoint for the bank of an anchor out of the block record does not
 count, and it does not stop the fallback. The node cannot check the credits of
 that bank.
 
-An eCash reorg deeper than D can remove a credited deposit. Every checkpoint on
-a block after that credit then fails rule 3. Honest bidders commit to a branch
-without the credit, and rule 6 moves all nodes to it. No leader builds on a
-bank whose credits the active eCash chain dropped.
+eCash does not reorg deeper than D, so a credited deposit stays on the active
+chain. Rule 3 still refuses a checkpoint whose bank credited a dropped block.
 
 ## Join the chain
 
@@ -586,7 +576,7 @@ own Solana chain, then it claims a slot, pegs in, and pegs out. Last, a second
 validator joins, and a BMM loop bids until a win settles and pays the
 treasury. More stages prove the hard cases:
 
-- A settle for a block that is not N + 1 deep never lands.
+- A settle for a block that is not N + 2 deep never lands.
 - A settle for a block that a reorg dropped never lands.
 - The loop settles the new block at that height after the reorg.
 - Both validators run after a reorg deeper than N that drops settled eCash
@@ -604,8 +594,7 @@ treasury. More stages prove the hard cases:
 `scripts/regtest-bmm-fork.sh` proves the fork choice with two staked
 validators in network namespaces: the root, a switch, a pending checkpoint, a
 tie, the fallback and its restart, a restart from disk, a commitment without a
-pair, a withheld pair, a censoring stake majority, and a deep eCash reorg that
-drops a credit.
+pair, a withheld pair, and a censoring stake majority.
 
 It never touches a chain that already runs on the host.
 
