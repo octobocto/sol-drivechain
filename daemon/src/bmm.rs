@@ -183,11 +183,11 @@ pub fn bid_sats(
 }
 
 /// True when a leader accepts a settle of `height` at eCash tip `tip_height`:
-/// it needs N + 1 blocks on top.
+/// it needs N + 2 blocks on top.
 pub fn settle_is_ready(height: u64, tip_height: u64, confirmations: u64) -> bool {
     height
         .checked_add(confirmations)
-        .and_then(|needed| needed.checked_add(1))
+        .and_then(|needed| needed.checked_add(2))
         .is_some_and(|needed| tip_height >= needed)
 }
 
@@ -1795,8 +1795,8 @@ mod tests {
 
     #[test]
     fn a_settle_waits_for_n_plus_one_blocks_on_top() {
-        assert!(!settle_is_ready(100, 106, 6));
-        assert!(settle_is_ready(100, 107, 6));
+        assert!(!settle_is_ready(100, 107, 6));
+        assert!(settle_is_ready(100, 108, 6));
     }
 
     #[test]
@@ -2344,7 +2344,7 @@ mod tests {
         assert_eq!(
             next_settle(
                 100,
-                106,
+                107,
                 6,
                 Some((hash, Some(won.commitment()))),
                 &[won],
@@ -2357,7 +2357,7 @@ mod tests {
         assert_eq!(
             next_settle(
                 100,
-                107,
+                108,
                 6,
                 Some((hash, Some(won.commitment()))),
                 &[won],
@@ -2371,7 +2371,7 @@ mod tests {
             }
         );
         assert_eq!(
-            next_settle(100, 107, 6, Some((hash, None)), &[], false, sender),
+            next_settle(100, 108, 6, Some((hash, None)), &[], false, sender),
             SettleStep::Send {
                 block_hash: hash,
                 solana_block: [0u8; 32],
@@ -2380,7 +2380,7 @@ mod tests {
             "an empty height settles"
         );
         assert_eq!(
-            next_settle(100, 107, 6, None, &[won], false, sender),
+            next_settle(100, 108, 6, None, &[won], false, sender),
             SettleStep::Wait
         );
     }
@@ -2422,7 +2422,7 @@ mod tests {
         }
         assert_eq!(
             next,
-            tip_height - 6,
+            tip_height - 7,
             "every height up to the deepest ready one settled"
         );
         assert!(rounds >= (3 * MAX_WALK as usize) / SETTLE_STEPS);
