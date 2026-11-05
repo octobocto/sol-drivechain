@@ -24,7 +24,9 @@
 #    flags `--bmm-sidechain-slot`, `--bmm-confirmations`, `--bmm-root-depth`,
 #    and `--bmm-fallback-blocks`.
 # 7. BMM checkpoints select the fork and move the root. After L eCash blocks
-#    without a commitment, the stake votes move the root. A branch that splits
+#    without a commitment, the stake votes move the root. They also move it
+#    when the banks come within half an epoch of the end of the leader
+#    schedule of the root. A branch that splits
 #    behind the root and holds more checkpoints stops the validator with exit
 #    code 75, and the next start loads an older snapshot. A checkpoint for a
 #    bank that this node does not hold counts only when a staked peer with
