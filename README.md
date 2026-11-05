@@ -163,9 +163,8 @@ as eCash pays it.
 ## How a withdrawal works
 
 1. A user calls `withdraw` with a Bitcoin script pubkey and a fee of at least
-   1000 sats × (1 + w / 100), where w is the count of records that wait for a
-   seal. A flood of records costs more with each record. It burns the lamports into the vault and writes a record. The
-   script must be a byte-exact P2PKH, P2SH, P2WPKH, P2WSH, or P2TR template.
+   1000 sats. It burns the lamports into the vault and writes a record. A
+   flood of records can delay the payouts. The script must be a byte-exact P2PKH, P2SH, P2WPKH, P2WSH, or P2TR template.
    The enforcer reads any other output as a treasury or a deposit, and then
    it refuses the whole M6.
 2. When no bundle is live, the oracle sends `seal_bundle(through, M6ID)`. It
