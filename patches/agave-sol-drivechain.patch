@@ -8446,10 +8446,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..300cde2
+index 0000000..ec65a70
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2210 @@
+@@ -0,0 +1,2267 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -8663,6 +8663,10 @@ index 0000000..300cde2
 +/// least this long in all, also when the leader used its `LEADER_REPLAY_WAIT`.
 +/// So a node one block behind does not fail such a slot at once.
 +pub const BOUNDARY_WAIT: Duration = Duration::from_secs(3);
++
++/// The `BOUNDARY_WAIT` of all replayed slots of one leader in one epoch, so a
++/// leader cannot make each of its blocks wait `BOUNDARY_WAIT`.
++pub const LEADER_BOUNDARY_WAIT: Duration = Duration::from_secs(15);
 +
 +/// The size of the `BmmAnswer` data: height, block hash, found, commitment,
 +/// Solana block, recorded, credited height, credits active.
@@ -9257,6 +9261,8 @@ index 0000000..300cde2
 +    leader_budgets: HashMap<([u8; 32], u64), Duration>,
 +    /// The `BOUNDARY_WAIT` that each replayed slot has left.
 +    boundary_budgets: HashMap<u64, Duration>,
++    /// The `LEADER_BOUNDARY_WAIT` that each leader has left in an epoch.
++    leader_boundary_budgets: HashMap<([u8; 32], u64), Duration>,
 +    /// The last time that a backfill started or added older blocks.
 +    backfill_progress: Option<Instant>,
 +}
@@ -9370,13 +9376,27 @@ index 0000000..300cde2
 +            self.leader_budgets
 +                .retain(|(_, epoch), _| Some(*epoch) == newest);
 +        }
++        if self.leader_boundary_budgets.len() >= MAX_BUDGETS {
++            let newest = self
++                .leader_boundary_budgets
++                .keys()
++                .map(|(_, epoch)| *epoch)
++                .max();
++            self.leader_boundary_budgets
++                .retain(|(_, epoch), _| Some(*epoch) == newest);
++        }
 +        let slot_left = *self.budgets.entry(slot).or_insert(REPLAY_WAIT);
 +        let leader_left = *self
 +            .leader_budgets
 +            .entry(leader)
 +            .or_insert(LEADER_REPLAY_WAIT);
 +        if next {
-+            let boundary_left = *self.boundary_budgets.entry(slot).or_insert(BOUNDARY_WAIT);
++            let boundary_left = (*self.boundary_budgets.entry(slot).or_insert(BOUNDARY_WAIT)).min(
++                *self
++                    .leader_boundary_budgets
++                    .entry(leader)
++                    .or_insert(LEADER_BOUNDARY_WAIT),
++            );
 +            return slot_left.min(leader_left.max(boundary_left));
 +        }
 +        slot_left.min(leader_left)
@@ -9389,8 +9409,13 @@ index 0000000..300cde2
 +        if let Some(left) = self.leader_budgets.get_mut(&leader) {
 +            *left = left.saturating_sub(spent);
 +        }
-+        if let Some(left) = self.boundary_budgets.get_mut(&slot).filter(|_| next) {
-+            *left = left.saturating_sub(spent);
++        if next {
++            if let Some(left) = self.boundary_budgets.get_mut(&slot) {
++                *left = left.saturating_sub(spent);
++            }
++            if let Some(left) = self.leader_boundary_budgets.get_mut(&leader) {
++                *left = left.saturating_sub(spent);
++            }
 +        }
 +    }
 +
@@ -10531,6 +10556,38 @@ index 0000000..300cde2
 +            Lookup::NotYet
 +        );
 +        assert!(start.elapsed() < Duration::from_secs(1));
++    }
++
++    #[test]
++    fn a_leader_with_no_boundary_wait_left_gets_not_yet_at_once_one_past_the_view() {
++        let view = view_with_leader_wait(19, Duration::ZERO);
++        view.state
++            .lock()
++            .unwrap()
++            .leader_boundary_budgets
++            .insert(([19; 32], 0), Duration::ZERO);
++        let start = Instant::now();
++        assert_eq!(view.hash_at(110, 0, replay(19)), Lookup::NotYet);
++        assert!(start.elapsed() < Duration::from_millis(500));
++    }
++
++    #[test]
++    fn the_boundary_waits_of_one_leader_share_one_budget() {
++        let view = view_with_leader_wait(20, Duration::ZERO);
++        view.state
++            .lock()
++            .unwrap()
++            .leader_boundary_budgets
++            .insert(([20; 32], 0), Duration::from_millis(300));
++        let start = Instant::now();
++        assert_eq!(view.hash_at(110, 0, replay(20)), Lookup::NotYet);
++        assert!(start.elapsed() >= Duration::from_millis(300));
++        assert!(start.elapsed() < Duration::from_secs(1));
++        let state = view.state.lock().unwrap();
++        assert_eq!(
++            state.leader_boundary_budgets.get(&([20; 32], 0)),
++            Some(&Duration::ZERO)
++        );
 +    }
 +
 +    #[test]
