@@ -137,8 +137,8 @@ pub mod bridge {
     /// valid checkpoint gets the whole treasury. A height with no
     /// commitment, or a checkpoint that its own pair proves invalid, moves
     /// the cursor with no payout. A commitment that no pair matches moves it
-    /// only after `bmm_skip_slots` without a settle, or at once when its
-    /// height is below the pair window.
+    /// only when the credits reach `bmm_skip_blocks` above its height, or at
+    /// once when its height is below the pair window.
     pub fn settle_bmm(
         ctx: Context<SettleBmm>,
         height: u64,
@@ -182,10 +182,11 @@ pub mod bridge {
                 if pair_too_old(height, config.credited_height) {
                     msg!("eCash height {} is below the pair window", height);
                 } else {
-                    let ripe = config
-                        .bmm_next_since_slot
-                        .saturating_add(config.bmm_skip_slots);
-                    require_gte!(slot, ripe, BridgeError::PairDoesNotMatch);
+                    require_gte!(
+                        config.credited_height,
+                        height.saturating_add(config.bmm_skip_blocks),
+                        BridgeError::PairDoesNotMatch
+                    );
                     msg!("eCash height {} waited too long for its pair", height);
                 }
                 false
@@ -833,9 +834,9 @@ pub struct Config {
     pub bundle_sealed_slot: u64,
     /// The fewest slots between a seal and its `bundle_paid`.
     pub bundle_min_slots: u64,
-    /// A commitment that no pair matches can settle with no payout after
-    /// this many slots without a settle.
-    pub bmm_skip_slots: u64,
+    /// A commitment at eCash height H that no pair matches can settle with no
+    /// payout once `credited_height` reaches H + `bmm_skip_blocks`.
+    pub bmm_skip_blocks: u64,
     /// The slot of the newest settle, or of the genesis.
     pub bmm_next_since_slot: u64,
 }

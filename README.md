@@ -274,9 +274,11 @@ moves the cursor to H + 1:
 - A height with no commitment pays nothing.
 - A pair that proves its own checkpoint invalid pays nothing: its block is
   not in the block record, or it fails rule 3.
-- A commitment that no pair matches holds the cursor for `bmm_skip_slots`,
-  about one hour (`BMM_SKIP_SLOTS` in `build-genesis.sh`). After that, any
-  settle of the height moves past it and pays nothing.
+- A commitment at height H that no pair matches holds the cursor until
+  `credited_height` reaches H + `bmm_skip_blocks`, 6 eCash blocks
+  (`BMM_SKIP_BLOCKS` in `build-genesis.sh`). After that, any settle of the
+  height moves past it and pays nothing. Each validator checks the credits
+  against eCash, so a row of such heights skips at once.
 - A commitment that no pair matches, more than 4032 blocks below
   `credited_height`, moves the cursor at once and pays nothing. The
   validators drop the pairs of that height.

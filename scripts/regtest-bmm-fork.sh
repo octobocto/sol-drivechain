@@ -28,8 +28,9 @@ DEPOSIT_D="${DEPOSIT_D:-2}"
 LAG="${DEPOSIT_LAG:-5}"
 # N, the eCash blocks on top of a commitment before its settle.
 N="${BMM_CONFIRMATIONS:-$K}"
-# A commitment with no known pair blocks the BMM cursor this many slots.
-BMM_SKIP_SLOTS="${BMM_SKIP_SLOTS:-25}"
+# A commitment with no known pair blocks the BMM cursor until the credits
+# pass its height by this many eCash blocks.
+BMM_SKIP_BLOCKS="${BMM_SKIP_BLOCKS:-2}"
 MEMORY_MAX="${MEMORY_MAX:-3G}"
 NS_E="${NS_PREFIX:-bmm}E"
 NS_M="${NS_PREFIX:-bmm}M"
@@ -277,7 +278,7 @@ settle() {
 
 # Heights settle in order, so the cursor walks up to a height first. An
 # empty height settles at once, and a commitment with no known pair settles
-# with no payout after BMM_SKIP_SLOTS.
+# with no payout once the credits pass it by BMM_SKIP_BLOCKS.
 settle_through() {
   local height=$1 next
   for _ in $(seq 1 400); do
@@ -455,7 +456,7 @@ PAYEE="$M_ID"
 "$D" genesis --program-id "$PROGRAM_ID" \
   --oracle "$("$SOLANA_KEYGEN" pubkey "$ROOT/oracle.json")" \
   --oracle-lamports 1000000000 --float-lamports 0 --bundle-min-slots 0 \
-  --bmm-skip-slots "$BMM_SKIP_SLOTS" \
+  --bmm-skip-blocks "$BMM_SKIP_BLOCKS" \
   --lamports-per-byte-year "$LAMPORTS_PER_BYTE_YEAR" --ecash-start-height "$(tip)" \
   --deposit-confirmations "$DEPOSIT_D" --deposit-lag "$LAG" \
   --out "$ROOT/primordial.yaml" >/dev/null

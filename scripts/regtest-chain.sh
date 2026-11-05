@@ -201,7 +201,7 @@ up() {
   echo "== the Solana chain"
   if [ ! -d "$ROOT/ledger" ]; then
     NETWORK=regtest LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" \
-      ECASH_START_HEIGHT="$(btc getblockcount)" BUNDLE_MIN_SLOTS=0 BMM_SKIP_SLOTS=25 \
+      ECASH_START_HEIGHT="$(btc getblockcount)" BUNDLE_MIN_SLOTS=0 BMM_SKIP_BLOCKS=2 \
       SIDECHAIN_SLOT="$SLOT" BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" \
       bash "$REPO/genesis/build-genesis.sh" >/dev/null
   fi

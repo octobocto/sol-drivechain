@@ -72,8 +72,9 @@ STATE="${STATE:-}"
 # bundle after 6049 blocks, about 9 million slots.
 BUNDLE_MIN_SLOTS="${BUNDLE_MIN_SLOTS:-4000000}"
 # Heights settle in order. A commitment with no known pair blocks the cursor
-# this many slots, about one hour, and then any sender moves past it.
-BMM_SKIP_SLOTS="${BMM_SKIP_SLOTS:-9000}"
+# until the credits pass its height by this many eCash blocks, about one hour,
+# and then any sender moves past it.
+BMM_SKIP_BLOCKS="${BMM_SKIP_BLOCKS:-6}"
 
 # These lamports carry no Bitcoin behind them. The bridge counts them as
 # float, and no withdrawal lands until gifts to the vault back all of it.
@@ -192,7 +193,7 @@ fi
 "$DAEMON" genesis --program-id "$PROGRAM_ID" --vault-sol "$VAULT_SOL" \
   --oracle "$("$SOLANA_KEYGEN" pubkey "$KEYS/oracle.json")" --oracle-lamports "$ORACLE_LAMPORTS" \
   --float-lamports "$FLOAT_LAMPORTS" --bundle-min-slots "$BUNDLE_MIN_SLOTS" \
-  --bmm-skip-slots "$BMM_SKIP_SLOTS" \
+  --bmm-skip-blocks "$BMM_SKIP_BLOCKS" \
   --bootstrap-vote "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-vote.json")" \
   --bootstrap-stake "$("$SOLANA_KEYGEN" pubkey "$KEYS/validator-stake.json")" \
   --lamports-per-byte-year "$LAMPORTS_PER_BYTE_YEAR" \
