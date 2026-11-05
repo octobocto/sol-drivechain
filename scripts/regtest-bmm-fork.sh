@@ -928,7 +928,7 @@ print(b58(bank), b58(payee), hashlib.sha256(bank + payee).hexdigest())
 ')
 H12=$(($(tip) + 1))
 START_M=$(lines M) START_H=$(lines H)
-d publish-pair --solana-rpc-url "$(url_of M)" --height "$H12" --block "$FAKE_BANK" --payee "$FAKE_PAYEE" >/dev/null
+in_ns "$NS_M" "$D" publish-pair --solana-rpc-url "$(url_of M)" --height "$H12" --block "$FAKE_BANK" --payee "$FAKE_PAYEE" >/dev/null
 d bid-bmm "${E[@]}" --commitment "$FAKE_COMMITMENT" --sats 1000 >/dev/null
 mine 1
 [ "$(tip)" = "$H12" ] || fail "the fake commitment did not land at eCash height $H12"
