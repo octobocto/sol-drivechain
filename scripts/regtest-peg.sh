@@ -359,12 +359,14 @@ echo "the treasury holds $TREASURY_BEFORE lamports of fees and reserve"
 # A bid offers a part of the fee income, so the chain must earn fees. Ten
 # transfers pay 100 lamports, which is 10 satoshis.
 ORACLE_PUBKEY="$("$SOLANA_KEYGEN" pubkey "$ROOT/keys/oracle.json")"
-# Each transfer takes another amount, so two of them under one blockhash are
-# not the same tx.
+# Each transfer of each call takes another amount, so two calls under one
+# blockhash never send the same tx.
+EARN_ROUND=0
 earn_fees() {
+  EARN_ROUND=$((EARN_ROUND + 1))
   for index in $(seq 0 9); do
     "$SOLANA" -u "$SOLANA_URL" transfer --keypair "$USER_KEY" "$ORACLE_PUBKEY" \
-      "0.00000100$index" --no-wait >/dev/null
+      "$(printf '0.%09d' $((1000 + EARN_ROUND * 10 + index)))" --no-wait >/dev/null
   done
 }
 
