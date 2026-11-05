@@ -51,10 +51,6 @@ pub enum EnforcerError {
     NoBlockAtHeight(u32),
     #[error("the enforcer does not know block {0}")]
     BlockNotFound(BlockHash),
-    #[error("the wallet scan of the enforcer took longer than the limit")]
-    ScanTimeout,
-    #[error("the bid request took longer than its deadline, and its outcome is unknown")]
-    BidDeadline,
     #[error("the enforcer sent a commitment of {0} bytes, not 32")]
     BadCommitmentLength(usize),
 }
@@ -260,68 +256,6 @@ pub struct Enforcer {
     mining: MiningServiceClient<Channel>,
     wallet: WalletServiceClient<Channel>,
     sidechain_id: u32,
-    scans: std::sync::Arc<ScanGate>,
-}
-
-/// The longest wait of a bid for one wallet scan. The scan goes on after
-/// that, and the gate holds its mark until it ends or reaches
-/// `FULL_SCAN_DEADLINE`.
-pub const FULL_SCAN_WAIT: std::time::Duration = std::time::Duration::from_secs(40);
-
-/// The longest time of one wallet scan. A stuck scan ends there, so its
-/// mark never stops the bids.
-pub const FULL_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Runs `scan` for at most `deadline` and then clears `mark`.
-pub async fn scan_marked(
-    mark: ScanMark,
-    deadline: std::time::Duration,
-    scan: impl std::future::Future<Output = Result<()>>,
-) -> Result<()> {
-    let _mark = mark;
-    tokio::time::timeout(deadline, scan)
-        .await
-        .unwrap_or(Err(EnforcerError::ScanTimeout))
-}
-
-/// Lets one wallet scan run at a time, and at most one for each eCash tip.
-#[derive(Default)]
-pub struct ScanGate {
-    in_flight: std::sync::atomic::AtomicBool,
-    last_tip: std::sync::Mutex<Option<BlockHash>>,
-}
-
-/// The mark of a running scan. Its drop clears the mark.
-pub struct ScanMark(std::sync::Arc<ScanGate>);
-
-impl Drop for ScanMark {
-    fn drop(&mut self) {
-        self.0
-            .in_flight
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl ScanGate {
-    /// The right to scan for `tip`, or `None` while a scan runs or after a
-    /// scan for the same tip.
-    pub fn try_begin(self: &std::sync::Arc<Self>, tip: BlockHash) -> Option<ScanMark> {
-        let mut last = self.last_tip.lock().ok()?;
-        if *last == Some(tip)
-            || self
-                .in_flight
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return None;
-        }
-        *last = Some(tip);
-        Some(ScanMark(std::sync::Arc::clone(self)))
-    }
-
-    /// True while a scan runs.
-    pub fn in_flight(&self) -> bool {
-        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
-    }
 }
 
 impl Enforcer {
@@ -335,13 +269,7 @@ impl Enforcer {
             mining: MiningServiceClient::new(channel.clone()),
             wallet: WalletServiceClient::new(channel),
             sidechain_id,
-            scans: std::sync::Arc::default(),
         })
-    }
-
-    /// True while a wallet scan of this client runs.
-    pub fn scan_in_flight(&self) -> bool {
-        self.scans.in_flight()
     }
 
     pub fn sidechain_id(&self) -> u32 {
@@ -815,38 +743,6 @@ impl Enforcer {
         Ok(commitment)
     }
 
-    /// Sends a BIP301 BMM request. It pays `bid_sats` to the miner of the
-    /// block after `tip`, and only if that coinbase holds `h_star`. A wallet
-    /// that a reorg left with a spent coin scans the chain again, and the
-    /// request goes out one more time.
-    pub async fn create_bmm_request(
-        &mut self,
-        bid_sats: u64,
-        tip: (BlockHash, u32),
-        h_star: &[u8; 32],
-    ) -> Result<Txid> {
-        let deadline = tokio::time::Instant::now() + BID_DEADLINE;
-        let sender = self.clone();
-        let send = || {
-            let mut sender = sender.clone();
-            let h_star = *h_star;
-            async move { sender.send_bmm_request(bid_sats, tip, &h_star).await }
-        };
-        let gate = std::sync::Arc::clone(&self.scans);
-        let scanner = self.clone();
-        let scan = move || async move {
-            let Some(mark) = gate.try_begin(tip.0) else {
-                return Err(EnforcerError::ScanTimeout);
-            };
-            let mut scanner = scanner;
-            let task = tokio::spawn(async move {
-                scan_marked(mark, FULL_SCAN_DEADLINE, scanner.full_scan()).await
-            });
-            task.await.unwrap_or(Err(EnforcerError::ScanTimeout))
-        };
-        bid_with_rescan(deadline, send, scan).await
-    }
-
     /// Scans the whole chain for the enforcer wallet, so it drops the coins
     /// that a reorg spent.
     pub async fn full_scan(&mut self) -> Result<()> {
@@ -860,7 +756,9 @@ impl Enforcer {
         Ok(())
     }
 
-    async fn send_bmm_request(
+    /// Sends a BIP301 BMM request. It pays `bid_sats` to the miner of the
+    /// block after `tip`, and only if that coinbase holds `h_star`.
+    pub async fn create_bmm_request(
         &mut self,
         bid_sats: u64,
         tip: (BlockHash, u32),
@@ -1185,65 +1083,6 @@ pub(crate) async fn peg_data_from(
     Ok(events)
 }
 
-/// True when the node refused a tx of the enforcer wallet because an input
-/// is missing or spent: the wallet still holds a coin that a reorg spent.
-pub fn spends_a_gone_coin(error: &EnforcerError) -> bool {
-    matches!(
-        error,
-        EnforcerError::Call { source, .. }
-            if source.message().contains("bad-txns-inputs-missingorspent")
-    )
-}
-
-/// The longest time of one bid: the request, a wallet scan, and the resend.
-pub const BID_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Sends a bid with `send`. After a stale-coin refusal it runs `scan` and
-/// sends once more. A request past `deadline` has an unknown outcome. A scan
-/// past it, or past `FULL_SCAN_WAIT`, keeps the refusal, because no new tx
-/// went out.
-pub async fn bid_with_rescan<S, SF, C, CF>(
-    deadline: tokio::time::Instant,
-    mut send: S,
-    scan: C,
-) -> Result<Txid>
-where
-    S: FnMut() -> SF,
-    SF: std::future::Future<Output = Result<Txid>>,
-    C: FnOnce() -> CF,
-    CF: std::future::Future<Output = Result<()>>,
-{
-    let first = tokio::time::timeout_at(deadline, send())
-        .await
-        .map_err(|_| EnforcerError::BidDeadline)?;
-    match first {
-        Err(error) if spends_a_gone_coin(&error) => {
-            tracing::warn!(%error, "the enforcer wallet holds a spent coin, so it scans again");
-            let wait = deadline.min(tokio::time::Instant::now() + FULL_SCAN_WAIT);
-            let scanned = tokio::time::timeout_at(wait, scan())
-                .await
-                .unwrap_or(Err(EnforcerError::ScanTimeout));
-            after_scan(error, scanned)?;
-            tokio::time::timeout_at(deadline, send())
-                .await
-                .map_err(|_| EnforcerError::BidDeadline)?
-        }
-        result => result,
-    }
-}
-
-/// The outcome of a stale-coin refusal after the wallet scan. A failed scan
-/// sent no new tx, so the refusal stays, and the next round can bid again.
-pub fn after_scan(refusal: EnforcerError, scanned: Result<()>) -> Result<()> {
-    match scanned {
-        Ok(()) => Ok(()),
-        Err(scan) => {
-            tracing::warn!(error = %scan, "the wallet scan failed, and the bid stays refused");
-            Err(refusal)
-        }
-    }
-}
-
 /// True when the bid tx spends a coin that the active chain does not hold.
 /// Every node on that chain refuses it, so a new bid cannot pay twice. A
 /// policy refusal can differ between nodes, so it does not count.
@@ -1565,24 +1404,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_spent_input_reads_as_a_gone_coin() {
-        let stale = EnforcerError::Call {
-            call: "CreateBmmCriticalDataTransaction",
-            source: tonic::Status::unknown(
-                "error creating BMM request: failed to broadcast BMM request tx via RPC: \
-                 ErrorObject { code: ServerError(-25), message: \"bad-txns-inputs-missingorspent\" }",
-            ),
-        };
-        assert!(spends_a_gone_coin(&stale));
-        let other = EnforcerError::Call {
-            call: "CreateBmmCriticalDataTransaction",
-            source: tonic::Status::unknown("insufficient funds"),
-        };
-        assert!(!spends_a_gone_coin(&other));
-        assert!(!spends_a_gone_coin(&EnforcerError::MissingField("txid")));
-    }
-
-    #[test]
     fn only_a_clear_refusal_counts_as_a_rejected_bid() {
         let refused = |text: &str| EnforcerError::Call {
             call: "CreateBmmCriticalDataTransaction",
@@ -1591,6 +1412,7 @@ mod tests {
         assert!(bid_rejected(&refused(
             "ErrorObject { code: ServerError(-25), message: \"bad-txns-inputs-missingorspent\" }"
         )));
+        assert!(bid_rejected(&refused("ServerError(-25) missing-inputs")));
         assert!(!bid_rejected(&refused(
             "ServerError(-26) min relay fee not met"
         )));
@@ -1605,117 +1427,7 @@ mod tests {
             call: "CreateBmmCriticalDataTransaction",
             source: tonic::Status::deadline_exceeded("timeout"),
         }));
-        assert!(!bid_rejected(&EnforcerError::ScanTimeout));
-    }
-
-    #[test]
-    fn a_failed_scan_keeps_the_refusal() {
-        let refusal = || EnforcerError::Call {
-            call: "CreateBmmCriticalDataTransaction",
-            source: tonic::Status::unknown("bad-txns-inputs-missingorspent"),
-        };
-        assert!(after_scan(refusal(), Ok(())).is_ok());
-        for scan in [
-            EnforcerError::ScanTimeout,
-            EnforcerError::Call {
-                call: "FullScan",
-                source: tonic::Status::aborted("a scan runs"),
-            },
-        ] {
-            let kept = after_scan(refusal(), Err(scan)).unwrap_err();
-            assert!(bid_rejected(&kept), "{kept}");
-        }
-    }
-
-    fn a_stale_refusal() -> EnforcerError {
-        EnforcerError::Call {
-            call: "CreateBmmCriticalDataTransaction",
-            source: tonic::Status::unknown("bad-txns-inputs-missingorspent"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_stuck_request_is_unknown_and_a_stuck_scan_keeps_the_refusal() {
-        let soon = || tokio::time::Instant::now() + std::time::Duration::from_millis(50);
-        let txid = Txid::from_byte_array([3u8; 32]);
-
-        let stuck = bid_with_rescan(soon(), std::future::pending::<Result<Txid>>, || async {
-            Ok(())
-        })
-        .await;
-        assert!(matches!(stuck, Err(EnforcerError::BidDeadline)));
-        assert!(!bid_rejected(&stuck.unwrap_err()));
-
-        let sends = std::sync::atomic::AtomicUsize::new(0);
-        let scan_stuck = bid_with_rescan(
-            soon(),
-            || {
-                sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async { Err(a_stale_refusal()) }
-            },
-            std::future::pending::<Result<()>>,
-        )
-        .await
-        .unwrap_err();
-        assert!(bid_rejected(&scan_stuck), "{scan_stuck}");
-        assert_eq!(
-            sends.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "no resend"
-        );
-
-        let mut first = true;
-        let resent = bid_with_rescan(
-            soon(),
-            || {
-                let answer = if first {
-                    Err(a_stale_refusal())
-                } else {
-                    Ok(txid)
-                };
-                first = false;
-                async move { answer }
-            },
-            || async { Ok(()) },
-        )
-        .await;
-        assert_eq!(resent.unwrap(), txid);
-    }
-
-    #[test]
-    fn one_scan_runs_at_a_time_and_once_for_each_tip() {
-        let gate = std::sync::Arc::new(ScanGate::default());
-        let tip = BlockHash::from_byte_array([1u8; 32]);
-        let first = gate.try_begin(tip);
-        assert!(first.is_some());
-        assert!(gate.in_flight());
-        assert!(
-            gate.try_begin(BlockHash::from_byte_array([2u8; 32]))
-                .is_none(),
-            "a scan runs"
-        );
-        drop(first);
-        assert!(!gate.in_flight(), "the end of the scan clears the mark");
-        assert!(gate.try_begin(tip).is_none(), "the tip was scanned");
-        assert!(gate
-            .try_begin(BlockHash::from_byte_array([2u8; 32]))
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn a_stuck_scan_ends_at_its_deadline_and_clears_the_mark() {
-        let gate = std::sync::Arc::new(ScanGate::default());
-        let mark = gate
-            .try_begin(BlockHash::from_byte_array([1u8; 32]))
-            .unwrap();
-        let deadline = std::time::Duration::from_millis(50);
-        let task = tokio::spawn(scan_marked(mark, deadline, std::future::pending()));
-        let ended = tokio::time::timeout(deadline * 20, task)
-            .await
-            .expect("the scan ends at its deadline")
-            .unwrap();
-        assert!(matches!(ended, Err(EnforcerError::ScanTimeout)));
-        assert!(!gate.in_flight());
+        assert!(!bid_rejected(&EnforcerError::MissingField("txid")));
     }
 
     #[test]

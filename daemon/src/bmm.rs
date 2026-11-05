@@ -975,8 +975,7 @@ async fn round(
         .lock()
         .await
         .forget_fees_below(tip_height.saturating_sub(settings.confirmations + 1));
-    // The settles and the pairs go first, so a slow bid or a wallet scan
-    // never holds them back.
+    // The settles and the pairs go first, so a slow bid never holds them back.
     let settled = settle(live, settings, identity, tip).await;
     // The settles can take long, and a bid must name the newest tip.
     let tip = enforcer.tip().await?;
@@ -1010,8 +1009,6 @@ pub enum Bid {
     Rejected,
     /// The bid tx may have gone out, and its answer was lost.
     Unknown,
-    /// A wallet scan runs, so the bid waits for a later round.
-    Busy,
 }
 
 /// Keeps and publishes the pair of a bid before the bid goes out. A bid with
@@ -1179,10 +1176,6 @@ async fn bid(
         tracing::debug!(height, "the fees of one block give no bid");
         return Ok(Bid::Declined);
     }
-    if enforcer.scan_in_flight() {
-        tracing::info!(height, "a wallet scan runs, so the bid waits");
-        return Ok(Bid::Busy);
-    }
     keep_pair(memory, &live.rpc, pair).await;
     match enforcer
         .create_bmm_request(bid, tip, &pair.commitment())
@@ -1202,7 +1195,17 @@ async fn bid(
             Ok(Bid::Declined)
         }
         Err(error) if crate::enforcer::bid_rejected(&error) => {
-            tracing::warn!(%error, height, "the node refused the bid, and the next round bids again");
+            tracing::warn!(
+                %error,
+                height,
+                "the node refused the bid, so the wallet scans the chain, and the next round bids again"
+            );
+            let mut scanner = enforcer.clone();
+            tokio::spawn(async move {
+                if let Err(error) = scanner.full_scan().await {
+                    tracing::error!(%error, "the wallet scan failed");
+                }
+            });
             Ok(Bid::Rejected)
         }
         Err(error) => {
@@ -1224,10 +1227,7 @@ pub fn bids_for(no_bid: bool, last_bid_tip: Option<BlockHash>, tip: BlockHash) -
 /// passes rule 3 yet, the node refused the bid tx, or the round failed before
 /// any bid tx. A bid whose outcome is unknown gets no second try.
 pub fn bids_again(result: &Result<Bid, BmmError>) -> bool {
-    matches!(
-        result,
-        Ok(Bid::NoBlock | Bid::Rejected | Bid::Busy) | Err(_)
-    )
+    matches!(result, Ok(Bid::NoBlock | Bid::Rejected) | Err(_))
 }
 
 /// True when a failed round must stop the loop. The enforcer and the Solana
@@ -1634,7 +1634,6 @@ mod tests {
         assert!(!bids_again(&Ok(Bid::Unknown)));
         let kept = memory.lock().await.pairs_to_publish(400, 505, 6);
         assert_eq!(kept, vec![pair]);
-        assert!(bids_again(&Ok(Bid::Busy)), "a running scan delays the bid");
     }
 
     #[test]
