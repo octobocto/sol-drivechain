@@ -264,8 +264,25 @@ pub struct Enforcer {
 }
 
 /// The longest wait of a bid for one wallet scan. The scan goes on after
-/// that, and the gate holds its mark until it ends.
+/// that, and the gate holds its mark until it ends or reaches
+/// `FULL_SCAN_DEADLINE`.
 pub const FULL_SCAN_WAIT: std::time::Duration = std::time::Duration::from_secs(40);
+
+/// The longest time of one wallet scan. A stuck scan ends there, so its
+/// mark never stops the bids.
+pub const FULL_SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Runs `scan` for at most `deadline` and then clears `mark`.
+pub async fn scan_marked(
+    mark: ScanMark,
+    deadline: std::time::Duration,
+    scan: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let _mark = mark;
+    tokio::time::timeout(deadline, scan)
+        .await
+        .unwrap_or(Err(EnforcerError::ScanTimeout))
+}
 
 /// Lets one wallet scan run at a time, and at most one for each eCash tip.
 #[derive(Default)]
@@ -823,8 +840,7 @@ impl Enforcer {
             };
             let mut scanner = scanner;
             let task = tokio::spawn(async move {
-                let _mark = mark;
-                scanner.full_scan().await
+                scan_marked(mark, FULL_SCAN_DEADLINE, scanner.full_scan()).await
             });
             task.await.unwrap_or(Err(EnforcerError::ScanTimeout))
         };
@@ -1684,6 +1700,22 @@ mod tests {
         assert!(gate
             .try_begin(BlockHash::from_byte_array([2u8; 32]))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_stuck_scan_ends_at_its_deadline_and_clears_the_mark() {
+        let gate = std::sync::Arc::new(ScanGate::default());
+        let mark = gate
+            .try_begin(BlockHash::from_byte_array([1u8; 32]))
+            .unwrap();
+        let deadline = std::time::Duration::from_millis(50);
+        let task = tokio::spawn(scan_marked(mark, deadline, std::future::pending()));
+        let ended = tokio::time::timeout(deadline * 20, task)
+            .await
+            .expect("the scan ends at its deadline")
+            .unwrap();
+        assert!(matches!(ended, Err(EnforcerError::ScanTimeout)));
+        assert!(!gate.in_flight());
     }
 
     #[test]
