@@ -75,6 +75,15 @@ pub enum GenesisError {
         pegged: u64,
         supply: u64,
     },
+    #[error(
+        "the state file holds the live bundle of records {paid_through} to {bundled_through} \
+         with a zero M6ID, so no payment could ever close it. Export the state again with this \
+         daemon"
+    )]
+    NoLiveM6id {
+        paid_through: u64,
+        bundled_through: u64,
+    },
     #[error("`{0}` in the state file is not a Solana pubkey")]
     BadPubkey(String),
     #[error("the account `{0}` in the state file is not base64")]
@@ -255,6 +264,12 @@ pub fn accounts(
 
     if let Some(state) = state {
         let cursor = &state.cursor;
+        if cursor.bundled_through > cursor.paid_through && cursor.bundle_m6id == [0u8; 32] {
+            return Err(GenesisError::NoLiveM6id {
+                paid_through: cursor.paid_through,
+                bundled_through: cursor.bundled_through,
+            });
+        }
         config.deposit_high_water = cursor.deposit_high_water;
         config.pegged_lamports = cursor.pegged_lamports;
         config.withdrawal_count = cursor.withdrawal_count;
@@ -1094,6 +1109,21 @@ mod tests {
         assert_eq!(parse_yaml(&yaml(&program)).unwrap(), program);
         let odd = yaml(&written[..1]).replace("executable: false", "executable: maybe");
         assert!(parse_yaml(&odd).is_err());
+    }
+
+    #[test]
+    fn a_live_bundle_without_an_m6id_fails() {
+        let mut state = a_state();
+        state.cursor.bundle_m6id = [0u8; 32];
+        assert!(matches!(
+            accounts(&params(), Some(&state), &[]),
+            Err(GenesisError::NoLiveM6id {
+                paid_through: 1,
+                bundled_through: 2
+            })
+        ));
+        state.cursor.bundled_through = state.cursor.paid_through;
+        assert!(accounts(&params(), Some(&state), &[]).is_ok());
     }
 
     #[test]
