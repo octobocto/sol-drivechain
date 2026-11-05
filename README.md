@@ -363,7 +363,7 @@ payout.
 | Value | Where | Betanet and regtest | eCash | What it does |
 |---|---|---|---|---|
 | D | `deposit_confirmations` in the bridge config, from the genesis | 6 | 12 | A credit waits for D eCash confirmations. |
-| lag | `deposit_lag` in the bridge config, from the genesis | 100 | 100 | A checkpoint at eCash height H counts only when its bank credited every deposit through H - lag. |
+| lag | `deposit_lag` in the bridge config, from the genesis | 18 | 36 | A checkpoint at eCash height H counts only when its bank credited every deposit through H - lag. It also bounds how old a checkpoint bank can be, so the root lags at most lag + D + K blocks. |
 | N | `BmmParams` in the genesis, and `bmm --confirmations` | 6 | 6 | A settle waits for N + 1 eCash blocks on top. |
 | K | `BmmParams` in the genesis | 2 | 3 | A checkpoint becomes the root after K eCash confirmations. |
 | L | `BmmParams` in the genesis | 6 | 12 | After L eCash blocks without a checkpoint, the stake votes move the root. |
@@ -382,7 +382,8 @@ validator reads the same genesis, so every validator uses the same values.
 days. A node drops each block more than half an epoch above its root, and the
 leader schedule ends one epoch after the root. A bidder that wins every
 auction can name old banks that still pass rule 3, so the root can lag up to
-lag + D + K eCash blocks, about 19 hours on eCash. Half an epoch is 24 hours.
+lag + D + K eCash blocks, 51 blocks or about 8.5 hours on eCash. Half an epoch
+is 24 hours.
 An existing chain cannot change the value.
 
 ## Finality
