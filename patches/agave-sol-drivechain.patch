@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 96da5bb..388831f 100644
+index 96da5bb..3336c74 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -279,6 +279,7 @@ name = "agave-reserved-account-keys"
@@ -18,7 +18,7 @@ index 96da5bb..388831f 100644
   "solana-account 4.3.1",
   "solana-account-decoder",
   "solana-accounts-db",
-@@ -6978,6 +6980,27 @@ dependencies = [
+@@ -6978,6 +6980,23 @@ dependencies = [
   "sha1",
  ]
  
@@ -31,12 +31,8 @@ index 96da5bb..388831f 100644
 + "log",
 + "prost 0.14.4",
 + "serde_json",
-+ "solana-epoch-schedule",
-+ "solana-keypair",
 + "solana-pubkey 4.2.0",
 + "solana-sha256-hasher",
-+ "solana-signature",
-+ "solana-signer",
 + "thiserror 2.0.18",
 + "tokio",
 + "tonic",
@@ -46,7 +42,7 @@ index 96da5bb..388831f 100644
  [[package]]
  name = "solana-account"
  version = "3.4.0"
-@@ -8074,6 +8097,7 @@ dependencies = [
+@@ -8074,6 +8093,7 @@ dependencies = [
   "shaq",
   "signal-hook",
   "slab",
@@ -54,7 +50,7 @@ index 96da5bb..388831f 100644
   "solana-account 4.3.1",
   "solana-accounts-db",
   "solana-address-lookup-table-interface",
-@@ -8515,6 +8539,10 @@ version = "4.2.2"
+@@ -8515,6 +8535,10 @@ version = "4.2.2"
  dependencies = [
   "agave-feature-set",
   "solana-fee-structure",
@@ -65,7 +61,7 @@ index 96da5bb..388831f 100644
   "solana-svm-transaction",
  ]
  
-@@ -8607,6 +8635,7 @@ dependencies = [
+@@ -8607,6 +8631,7 @@ dependencies = [
   "serde",
   "serde_json",
   "serde_yaml",
@@ -73,7 +69,7 @@ index 96da5bb..388831f 100644
   "solana-account 4.3.1",
   "solana-bls-signatures",
   "solana-borsh",
-@@ -9082,6 +9111,7 @@ dependencies = [
+@@ -9082,6 +9107,7 @@ dependencies = [
   "rocksdb",
   "scopeguard",
   "serde",
@@ -81,7 +77,7 @@ index 96da5bb..388831f 100644
   "solana-account 4.3.1",
   "solana-account-decoder",
   "solana-accounts-db",
-@@ -9999,6 +10029,7 @@ dependencies = [
+@@ -9999,6 +10025,7 @@ dependencies = [
   "serde_json",
   "serial_test",
   "soketto",
@@ -89,7 +85,7 @@ index 96da5bb..388831f 100644
   "solana-account 4.3.1",
   "solana-account-decoder",
   "solana-accounts-db",
-@@ -10266,6 +10297,7 @@ dependencies = [
+@@ -10266,6 +10293,7 @@ dependencies = [
   "crossbeam-channel",
   "crossbeam-utils",
   "dashmap",
@@ -97,7 +93,7 @@ index 96da5bb..388831f 100644
   "imbl",
   "itertools 0.14.0",
   "libc",
-@@ -10287,6 +10319,7 @@ dependencies = [
+@@ -10287,6 +10315,7 @@ dependencies = [
   "serde_with",
   "shuttle",
   "smallvec",
@@ -257,10 +253,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..9f74034
+index 0000000..44fe65c
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,667 @@
+@@ -0,0 +1,510 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -275,7 +271,6 @@ index 0000000..9f74034
 +            Restart, Saved,
 +        },
 +        pairs::{PAIR_WINDOW, pairs},
-+        peers::peers,
 +        recorded_blocks, view,
 +    },
 +    solana_account::ReadableAccount,
@@ -297,10 +292,12 @@ index 0000000..9f74034
 +    ledger: PathBuf,
 +    archives: Option<PathBuf>,
 +    saved: Saved,
-+    key: Option<(u64, u64, u64, Slot, usize, Slot)>,
++    key: Option<(u64, u64, Slot, usize, Slot)>,
 +    banks: Vec<ForkBank>,
 +    checkpoints: Vec<Checkpoint>,
-+    vouched: Vec<Checkpoint>,
++    /// Checkpoints whose bank this node does not hold. They count only for a
++    /// restart, and the replay after it decides.
++    absent: Vec<Checkpoint>,
 +    unmatched: Vec<u64>,
 +    tip_height: u64,
 +    choice: Choice,
@@ -311,7 +308,6 @@ index 0000000..9f74034
 +    rejected: HashSet<(u64, BankHash)>,
 +    ancestors: Vec<RecordedBlock>,
 +    credited_tip: u64,
-+    schedule_ends: bool,
 +}
 +
 +impl BmmForkChoice {
@@ -371,7 +367,7 @@ index 0000000..9f74034
 +            key: None,
 +            banks: Vec::new(),
 +            checkpoints: Vec::new(),
-+            vouched: Vec::new(),
++            absent: Vec::new(),
 +            unmatched: Vec::new(),
 +            tip_height: 0,
 +            choice: Choice::default(),
@@ -382,7 +378,6 @@ index 0000000..9f74034
 +            rejected: HashSet::new(),
 +            ancestors: Vec::new(),
 +            credited_tip: 0,
-+            schedule_ends: false,
 +        })
 +    }
 +
@@ -396,27 +391,9 @@ index 0000000..9f74034
 +            .map(|bank| bank.slot())
 +            .max()
 +            .unwrap_or(root);
-+        let schedule_ends = frozen_banks
-+            .iter()
-+            .find(|bank| bank.slot() == root)
-+            .is_some_and(|bank| {
-+                fork_choice::leader_schedule_ends(root, highest, bank.epoch_schedule())
-+            });
-+        if schedule_ends != self.schedule_ends {
-+            if schedule_ends {
-+                warn!(
-+                    "BMM: bank {highest} is near the end of the leader schedule of root {root}, \
-+                     so the stake votes move the root"
-+                );
-+            } else {
-+                info!("BMM: root {root} gives a leader schedule past bank {highest} again");
-+            }
-+            self.schedule_ends = schedule_ends;
-+        }
 +        let key = (
 +            view().generation(),
 +            pairs().generation(),
-+            peers().generation(),
 +            root,
 +            frozen_banks.len(),
 +            highest,
@@ -435,7 +412,7 @@ index 0000000..9f74034
 +            info!("BMM: the commitment at eCash height {height} has no published pair");
 +        }
 +        self.unmatched = unmatched;
-+        if self.key.is_none_or(|old| old.3 != root) {
++        if self.key.is_none_or(|old| old.2 != root) {
 +            self.ancestors = frozen_banks
 +                .iter()
 +                .find(|bank| bank.slot() == root)
@@ -472,7 +449,6 @@ index 0000000..9f74034
 +            view().block_at(height).map(|block| block.hash)
 +        });
 +        let screened = fork_choice::screen(&checkpoints, &deposits, &below_root);
-+        self.share_banks(&screened.absent, &below_root, tip_height);
 +        for (checkpoint, rejection) in &screened.rejected {
 +            if self
 +                .rejected
@@ -528,32 +504,7 @@ index 0000000..9f74034
 +            }
 +            self.dropped = dropped;
 +        }
-+        let staked = frozen_banks
-+            .iter()
-+            .find(|bank| bank.slot() == root)
-+            .map(|bank| bank.current_epoch_staked_nodes())
-+            .unwrap_or_default();
-+        let vouched = fork_choice::vouched(
-+            &screened.absent,
-+            |bank_hash| peers().attesters(bank_hash),
-+            |node| {
-+                staked
-+                    .get(&Pubkey::new_from_array(*node))
-+                    .copied()
-+                    .unwrap_or_default()
-+            },
-+            staked.values().sum(),
-+            &self.saved,
-+            tip_height,
-+        );
-+        if vouched != self.vouched {
-+            info!(
-+                "BMM: staked peers hold the banks of {} of {} absent checkpoints",
-+                vouched.len(),
-+                screened.absent.len()
-+            );
-+        }
-+        self.vouched = vouched;
++        self.absent = screened.absent;
 +        self.checkpoints = screened.counted;
 +        self.tip_height = tip_height;
 +        let mut choice = fork_choice::choose(
@@ -563,30 +514,11 @@ index 0000000..9f74034
 +            tip_height,
 +            fork_choice::params(),
 +        );
-+        fork_choice::hold_fallback_for_proof(&mut choice, &self.saved);
-+        // A checkpoint whose bank trusted staked peers hold can still arrive
-+        // here, so it stops the fallback as a pending one does.
-+        let stopping = fork_choice::stop_fallback(
-+            &mut choice,
++        choice.fallback &= !fork_choice::pending_stops_fallback(
 +            &screened.pending,
-+            &self.vouched,
 +            tip_height,
 +            fork_choice::params(),
 +        );
-+        if !stopping.is_empty() {
-+            let mut saved = self.saved.clone();
-+            if fork_choice::open_proof(
-+                &mut saved,
-+                &stopping,
-+                |bank_hash| peers().attesters(bank_hash),
-+                tip_height,
-+            ) {
-+                match saved.store(&self.ledger) {
-+                    Ok(()) => self.saved = saved,
-+                    Err(error) => error!("cannot write the BMM fork choice state: {error}"),
-+                }
-+            }
-+        }
 +        if choice.head != self.choice.head
 +            || choice.fallback != self.choice.fallback
 +            || choice.tied != self.choice.tied
@@ -598,52 +530,6 @@ index 0000000..9f74034
 +            );
 +        }
 +        self.choice = choice;
-+    }
-+
-+    /// Tells the peer sync which banks this node holds and which it wants,
-+    /// and settles the open proof.
-+    fn share_banks(&mut self, absent: &[Checkpoint], below_root: &BelowRoot, tip_height: u64) {
-+        let known: HashMap<BankHash, Slot> = self
-+            .banks
-+            .iter()
-+            .map(|bank| (bank.hash, bank.slot))
-+            .chain(
-+                self.ancestors
-+                    .iter()
-+                    .map(|block| (block.bank_hash, block.slot)),
-+            )
-+            .chain(
-+                self.saved
-+                    .anchors
-+                    .iter()
-+                    .map(|anchor| (anchor.bank_hash, anchor.slot)),
-+            )
-+            .collect();
-+        let mut wanted: Vec<&Checkpoint> = absent.iter().collect();
-+        wanted.sort_by_key(|checkpoint| checkpoint.height);
-+        peers().set_wanted(
-+            wanted
-+                .iter()
-+                .map(|checkpoint| checkpoint.bank_hash)
-+                .collect(),
-+        );
-+        let mut saved = self.saved.clone();
-+        let holds =
-+            |bank_hash: &BankHash| known.contains_key(bank_hash) || below_root.holds(bank_hash);
-+        if fork_choice::settle_proof(&mut saved, holds, tip_height) {
-+            if saved.proof.is_none() && saved.distrusted.len() > self.saved.distrusted.len() {
-+                warn!(
-+                    "BMM: no bank that the peers of the proof named arrived, so this node \
-+                     distrusts {} peers",
-+                    saved.distrusted.len() - self.saved.distrusted.len()
-+                );
-+            }
-+            match saved.store(&self.ledger) {
-+                Ok(()) => self.saved = saved,
-+                Err(error) => error!("cannot write the BMM fork choice state: {error}"),
-+            }
-+        }
-+        peers().set_known(known);
 +    }
 +
 +    /// The deposit credits of each frozen bank, checked against the active
@@ -673,9 +559,9 @@ index 0000000..9f74034
 +    }
 +
 +    /// True when the stake votes move the root, because no checkpoint came for
-+    /// the fallback span or the leader schedule of the root comes to its end.
++    /// the fallback span.
 +    pub(crate) fn tower_roots(&self) -> bool {
-+        self.choice.fallback || self.schedule_ends
++        self.choice.fallback
 +    }
 +
 +    /// The bank to build on and vote on, when it is not `stock`: the heaviest
@@ -735,7 +621,7 @@ index 0000000..9f74034
 +        let candidates: Vec<Checkpoint> = self
 +            .checkpoints
 +            .iter()
-+            .chain(self.vouched.iter())
++            .chain(self.absent.iter())
 +            .copied()
 +            .collect();
 +        let restart = fork_choice::restart(
@@ -786,21 +672,6 @@ index 0000000..9f74034
 +        let mut saved = self.saved.clone();
 +        saved.handled_height = restart.trigger_height;
 +        saved.restart_to = Some(restart.anchor.slot);
-+        let named: Vec<Checkpoint> = self
-+            .vouched
-+            .iter()
-+            .filter(|checkpoint| {
-+                checkpoint.height > restart.anchor.height
-+                    && checkpoint.height <= restart.trigger_height
-+            })
-+            .copied()
-+            .collect();
-+        fork_choice::open_proof(
-+            &mut saved,
-+            &named,
-+            |bank_hash| peers().attesters(bank_hash),
-+            self.tip_height,
-+        );
 +        saved.store(&self.ledger)?;
 +        self.saved = saved;
 +        Ok(Some(restart))
@@ -856,7 +727,7 @@ index 0000000..9f74034
 +
 +#[cfg(test)]
 +mod tests {
-+    use {super::*, sol_drivechain_bmm::fork_choice::Anchor, solana_leader_schedule::SlotLeader};
++    use {super::*, sol_drivechain_bmm::fork_choice::Anchor};
 +
 +    fn bmm_with(choice: Choice) -> BmmForkChoice {
 +        BmmForkChoice {
@@ -866,7 +737,7 @@ index 0000000..9f74034
 +            key: None,
 +            banks: Vec::new(),
 +            checkpoints: Vec::new(),
-+            vouched: Vec::new(),
++            absent: Vec::new(),
 +            unmatched: Vec::new(),
 +            tip_height: 100,
 +            choice,
@@ -877,7 +748,6 @@ index 0000000..9f74034
 +            rejected: HashSet::new(),
 +            ancestors: Vec::new(),
 +            credited_tip: 0,
-+            schedule_ends: false,
 +        }
 +    }
 +
@@ -895,37 +765,6 @@ index 0000000..9f74034
 +        });
 +        assert!(bmm.take_new_root(10).is_err());
 +        assert_ne!(fork_choice::final_root(), 777_777);
-+    }
-+
-+    #[test]
-+    fn the_stake_votes_move_the_root_near_the_end_of_the_leader_schedule() {
-+        let mut genesis =
-+            solana_runtime::genesis_utils::create_genesis_config(1_000_000).genesis_config;
-+        genesis.epoch_schedule = solana_epoch_schedule::EpochSchedule::custom(8192, 8192, false);
-+        let (root, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis);
-+        let child = |slot| {
-+            Bank::new_from_parent_with_bank_forks(
-+                &bank_forks,
-+                root.clone(),
-+                SlotLeader::default(),
-+                slot,
-+            )
-+        };
-+        let (before, at) = (child(12_286), child(12_287));
-+        let mut bmm = bmm_with(Choice::default());
-+        bmm.saved.proof = Some(fork_choice::Proof {
-+            bank_hashes: vec![[0xee; 32]],
-+            nodes: Vec::new(),
-+            deadline_height: u64::MAX,
-+        });
-+        for (banks, tower_roots) in [
-+            (vec![root.clone(), before.clone()], false),
-+            (vec![root.clone(), before.clone(), at], true),
-+            (vec![root.clone(), before], false),
-+        ] {
-+            bmm.update(0, &banks);
-+            assert_eq!(bmm.tower_roots(), tower_roots, "{} banks", banks.len());
-+        }
 +    }
 +}
 diff --git a/core/src/commitment_service.rs b/core/src/commitment_service.rs
@@ -1715,7 +1554,7 @@ index dbc053b..ed34d7f 100644
  solana-account-decoder = { workspace = true }
  solana-accounts-db = { workspace = true }
 diff --git a/rpc/src/rpc.rs b/rpc/src/rpc.rs
-index 7bf84a0..2819e8e 100644
+index 7bf84a0..6e24572 100644
 --- a/rpc/src/rpc.rs
 +++ b/rpc/src/rpc.rs
 @@ -146,6 +146,67 @@ fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
@@ -2163,7 +2002,7 @@ index 7bf84a0..2819e8e 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -2825,10 +2975,134 @@ pub mod rpc_minimal {
+@@ -2825,10 +2975,85 @@ pub mod rpc_minimal {
              options: Option<RpcLeaderScheduleConfigWrapper>,
              config: Option<RpcLeaderScheduleConfig>,
          ) -> Result<Option<RpcLeaderSchedule>>;
@@ -2185,16 +2024,6 @@ index 7bf84a0..2819e8e 100644
 +            meta: Self::Metadata,
 +            from_height: u64,
 +        ) -> Result<Vec<(u64, String, String)>>;
-+
-+        /// sol-drivechain: for each bank hash in base58, the slot of the bank
-+        /// when this node holds it, or null. At most `MAX_WANTED` hashes.
-+        #[rpc(meta, name = "bmmKnownBanks")]
-+        fn bmm_known_banks(
-+            &self,
-+            meta: Self::Metadata,
-+            bank_hashes: Vec<String>,
-+            nonce: String,
-+        ) -> Result<(Vec<Option<u64>>, u64, String)>;
      }
  
 +    /// sol-drivechain: the most pairs in one `bmmGetPairs` reply.
@@ -2256,49 +2085,10 @@ index 7bf84a0..2819e8e 100644
 +                .collect())
 +        }
 +
-+        fn bmm_known_banks(
-+            &self,
-+            meta: Self::Metadata,
-+            bank_hashes: Vec<String>,
-+            nonce: String,
-+        ) -> Result<(Vec<Option<u64>>, u64, String)> {
-+            use sol_drivechain_bmm::peers::{MAX_WANTED, known_banks_message, peers};
-+            if bank_hashes.len() > MAX_WANTED {
-+                return Err(Error::invalid_params("too many bank hashes"));
-+            }
-+            let parse = |text: &str| {
-+                Pubkey::from_str(text)
-+                    .map(|key| key.to_bytes())
-+                    .map_err(|_| Error::invalid_params(format!("{text} is not base58 of 32 bytes")))
-+            };
-+            let nonce = parse(&nonce)?;
-+            let bank_hashes = bank_hashes
-+                .iter()
-+                .map(|text| parse(text))
-+                .collect::<Result<Vec<_>>>()?;
-+            let slots: Vec<Option<u64>> = bank_hashes
-+                .iter()
-+                .map(|bank_hash| peers().known_slot(bank_hash))
-+                .collect();
-+            let timestamp = std::time::SystemTime::now()
-+                .duration_since(std::time::UNIX_EPOCH)
-+                .map_err(|_| Error::internal_error())?
-+                .as_secs();
-+            let keypair = meta.cluster_info.keypair();
-+            let message = known_banks_message(
-+                &keypair.pubkey().to_bytes(),
-+                &bank_hashes,
-+                &slots,
-+                &nonce,
-+                timestamp,
-+            );
-+            Ok((slots, timestamp, keypair.sign_message(&message).to_string()))
-+        }
-+
          type Metadata = JsonRpcRequestProcessor;
  
          fn get_balance(
-@@ -2968,7 +3242,7 @@ pub mod rpc_minimal {
+@@ -2968,7 +3193,7 @@ pub mod rpc_minimal {
                  let _ = verify_pubkey(identity)?;
              }
  
@@ -2307,7 +2097,7 @@ index 7bf84a0..2819e8e 100644
              let slot = slot.unwrap_or_else(|| bank.slot());
              let epoch = bank.epoch_schedule().get_epoch(slot);
  
-@@ -3064,7 +3338,7 @@ pub mod rpc_bank {
+@@ -3064,7 +3289,7 @@ pub mod rpc_bank {
              if data_len as u64 > solana_system_interface::MAX_PERMITTED_DATA_LENGTH {
                  return Err(Error::invalid_request());
              }
@@ -2316,7 +2106,7 @@ index 7bf84a0..2819e8e 100644
          }
  
          fn get_inflation_governor(
-@@ -3073,7 +3347,7 @@ pub mod rpc_bank {
+@@ -3073,7 +3298,7 @@ pub mod rpc_bank {
              commitment: Option<CommitmentConfig>,
          ) -> Result<RpcInflationGovernor> {
              debug!("get_inflation_governor rpc request received");
@@ -2325,7 +2115,7 @@ index 7bf84a0..2819e8e 100644
          }
  
          fn get_inflation_rate(&self, meta: Self::Metadata) -> Result<RpcInflationRate> {
-@@ -3139,7 +3413,7 @@ pub mod rpc_bank {
+@@ -3139,7 +3364,7 @@ pub mod rpc_bank {
                  None
              };
  
@@ -2334,7 +2124,7 @@ index 7bf84a0..2819e8e 100644
              let (first_slot, last_slot) = match config.range {
                  None => (
                      bank.epoch_schedule().get_first_slot_in_epoch(bank.epoch()),
-@@ -3815,7 +4089,7 @@ pub mod rpc_full {
+@@ -3815,7 +4040,7 @@ pub mod rpc_full {
              let pubkey = verify_pubkey(&pubkey_str)?;
  
              let config = config.unwrap_or_default();
@@ -2343,7 +2133,7 @@ index 7bf84a0..2819e8e 100644
  
              let blockhash = if let Some(blockhash) = config.recent_blockhash {
                  verify_hash(&blockhash)?
-@@ -3886,7 +4160,7 @@ pub mod rpc_full {
+@@ -3886,7 +4111,7 @@ pub mod rpc_full {
              } else {
                  preflight_commitment.map(|commitment| CommitmentConfig { commitment })
              };
@@ -2352,7 +2142,7 @@ index 7bf84a0..2819e8e 100644
                  commitment: preflight_commitment,
                  min_context_slot,
              })?;
-@@ -4032,7 +4306,7 @@ pub mod rpc_full {
+@@ -4032,7 +4257,7 @@ pub mod rpc_full {
              let (_, mut unsanitized_tx) =
                  decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
  
@@ -2361,7 +2151,7 @@ index 7bf84a0..2819e8e 100644
                  commitment,
                  min_context_slot,
              })?;
-@@ -4328,7 +4602,7 @@ pub mod rpc_full {
+@@ -4328,7 +4553,7 @@ pub mod rpc_full {
                  data,
                  TransactionBinaryEncoding::Base64,
              )?;
@@ -2370,7 +2160,7 @@ index 7bf84a0..2819e8e 100644
              let sanitized_versioned_message = SanitizedVersionedMessage::try_from(message)
                  .map_err(|err| {
                      Error::invalid_params(format!("invalid transaction message: {err}"))
-@@ -5152,6 +5426,120 @@ pub mod tests {
+@@ -5152,6 +5377,120 @@ pub mod tests {
          }
      }
  
@@ -3937,10 +3727,10 @@ index c4ae164..62ff1dd 100644
      }
 diff --git a/sol-drivechain-bmm/Cargo.toml b/sol-drivechain-bmm/Cargo.toml
 new file mode 100644
-index 0000000..082853e
+index 0000000..a75986f
 --- /dev/null
 +++ b/sol-drivechain-bmm/Cargo.toml
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,30 @@
 +[package]
 +name = "sol-drivechain-bmm"
 +description = "The eCash view that lets the SOL drivechain settle BMM wins"
@@ -3954,7 +3744,7 @@ index 0000000..082853e
 +
 +[features]
 +# The enforcer client. Only the validator binary starts the poller.
-+poller = ["dep:hex", "dep:log", "dep:prost", "dep:serde_json", "dep:solana-signature", "dep:thiserror", "dep:tokio", "dep:tonic", "dep:tonic-prost"]
++poller = ["dep:hex", "dep:log", "dep:prost", "dep:serde_json", "dep:thiserror", "dep:tokio", "dep:tonic", "dep:tonic-prost"]
 +
 +[dependencies]
 +bs58 = { workspace = true, features = ["alloc"] }
@@ -3962,18 +3752,12 @@ index 0000000..082853e
 +log = { workspace = true, optional = true }
 +prost = { workspace = true, optional = true }
 +serde_json = { workspace = true, optional = true }
-+solana-epoch-schedule = { workspace = true }
 +solana-pubkey = { workspace = true, features = ["curve25519"] }
 +solana-sha256-hasher = { workspace = true }
-+solana-signature = { workspace = true, features = ["verify"], optional = true }
 +thiserror = { workspace = true, optional = true }
 +tokio = { workspace = true, features = ["rt", "time"], optional = true }
 +tonic = { workspace = true, features = ["transport"], optional = true }
 +tonic-prost = { workspace = true, optional = true }
-+
-+[dev-dependencies]
-+solana-keypair = { workspace = true }
-+solana-signer = { workspace = true }
 +
 +[lints]
 +workspace = true
@@ -5415,10 +5199,10 @@ index 0000000..248a0d1
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..d9293d3
+index 0000000..2067c53
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2903 @@
+@@ -0,0 +1,2452 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -5430,11 +5214,9 @@ index 0000000..d9293d3
 +//! newest checkpoint on the winning branch with `root_depth` eCash blocks on
 +//! top.
 +//! When no checkpoint comes for `fallback_blocks` eCash blocks, the root
-+//! follows the stake votes again. The stake votes also move the root when the
-+//! banks come near the end of the leader schedule of the root. A checkpoint
-+//! for an absent bank stops the fallback and asks for a restart only when a
-+//! trusted staked peer holds its bank. A commitment without a pair is not a
-+//! checkpoint.
++//! follows the stake votes again. A checkpoint for an absent bank never
++//! stops the fallback, but it counts for a restart, and the replay after the
++//! restart decides. A commitment without a pair is not a checkpoint.
 +//!
 +//! A checkpoint at eCash height H counts only when the bridge config of its
 +//! bank credited every deposit through H - lag, and the active eCash chain
@@ -5443,8 +5225,7 @@ index 0000000..d9293d3
 +//! dropped never counts, and no leader builds on it.
 +
 +use {
-+    crate::{BlockHash, Credits, RecordAnswer, RecordedBlock, peers::NodeId},
-+    solana_epoch_schedule::EpochSchedule,
++    crate::{BlockHash, Credits, RecordAnswer, RecordedBlock},
 +    std::{
 +        collections::{HashMap, HashSet},
 +        fs,
@@ -5723,74 +5504,6 @@ index 0000000..d9293d3
 +    }
 +}
 +
-+/// True when bank `highest` is in the last half epoch of the leader schedule
-+/// that root `root` gives. The stake votes must then move the root, because
-+/// no leader exists past that schedule.
-+pub fn leader_schedule_ends(root: Slot, highest: Slot, schedule: &EpochSchedule) -> bool {
-+    let epoch = schedule.get_leader_schedule_epoch(root);
-+    let margin = schedule.get_slots_in_epoch(epoch) / 2;
-+    highest
-+        >= schedule
-+            .get_last_slot_in_epoch(epoch)
-+            .saturating_sub(margin)
-+}
-+
-+/// Stops the fallback while a pending or a vouched checkpoint came less than
-+/// `fallback_blocks` eCash blocks ago. It never changes the root move.
-+/// Returns the vouched checkpoints that stopped the fallback, so their peers
-+/// must prove them with `open_proof`.
-+pub fn stop_fallback(
-+    choice: &mut Choice,
-+    pending: &[u64],
-+    vouched: &[Checkpoint],
-+    tip_height: u64,
-+    params: Params,
-+) -> Vec<Checkpoint> {
-+    if !choice.fallback {
-+        return Vec::new();
-+    }
-+    if pending_stops_fallback(pending, tip_height, params) {
-+        choice.fallback = false;
-+        return Vec::new();
-+    }
-+    let stopping: Vec<Checkpoint> = vouched
-+        .iter()
-+        .filter(|checkpoint| tip_height.saturating_sub(checkpoint.height) < params.fallback_blocks)
-+        .copied()
-+        .collect();
-+    choice.fallback = stopping.is_empty();
-+    stopping
-+}
-+
-+/// Puts the banks of `named` and their peers into the open proof. A peer of
-+/// the proof vouches for nothing else, and when none of the banks arrives by
-+/// the deadline, `settle_proof` distrusts it. True when `saved` changed.
-+pub fn open_proof(
-+    saved: &mut Saved,
-+    named: &[Checkpoint],
-+    attesters: impl Fn(&BankHash) -> Vec<NodeId>,
-+    tip_height: u64,
-+) -> bool {
-+    let mut proof = saved.proof.clone().unwrap_or(Proof {
-+        bank_hashes: Vec::new(),
-+        nodes: Vec::new(),
-+        deadline_height: tip_height.saturating_add(PROOF_BLOCKS),
-+    });
-+    for checkpoint in named {
-+        if !proof.bank_hashes.contains(&checkpoint.bank_hash) {
-+            proof.bank_hashes.push(checkpoint.bank_hash);
-+        }
-+        for node in attesters(&checkpoint.bank_hash) {
-+            if !proof.nodes.contains(&node) {
-+                proof.nodes.push(node);
-+            }
-+        }
-+    }
-+    let changed = saved.proof.as_ref() != Some(&proof);
-+    saved.proof = Some(proof);
-+    changed
-+}
-+
 +/// The deposit credits of a bank, checked against the active eCash chain.
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 +pub enum Deposits {
@@ -6011,110 +5724,6 @@ index 0000000..d9293d3
 +    pending
 +        .iter()
 +        .any(|height| tip_height.saturating_sub(*height) < params.fallback_blocks)
-+}
-+
-+/// A node that said it holds a bank, and the eCash height until which this
-+/// node does not believe it.
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+pub struct Distrust {
-+    pub node: NodeId,
-+    pub until_height: u64,
-+}
-+
-+/// The banks that a restart or a stopped fallback named, and the nodes that
-+/// said they hold them. When none of the banks arrives by `deadline_height`,
-+/// this node distrusts those nodes.
-+#[derive(Clone, Debug, PartialEq, Eq)]
-+pub struct Proof {
-+    pub bank_hashes: Vec<BankHash>,
-+    pub nodes: Vec<NodeId>,
-+    pub deadline_height: u64,
-+}
-+
-+/// The eCash blocks after a proof opens in which one of its banks must arrive.
-+pub const PROOF_BLOCKS: u64 = 12;
-+
-+/// A node whose proof brought no bank does not count for this many eCash
-+/// blocks.
-+pub const DISTRUST_BLOCKS: u64 = 1008;
-+
-+/// A peer with less than this part of the epoch stake vouches for nothing. It
-+/// bounds the peers that can cause a restart until a restart fetches the
-+/// vouched blocks first.
-+pub const MIN_VOUCH_STAKE_PARTS: u64 = 1_000;
-+
-+/// The absent checkpoints whose bank a staked peer holds, when that peer has
-+/// at least 1/`MIN_VOUCH_STAKE_PARTS` of `total_stake`. `stake` gives the epoch
-+/// stake of a node. A peer in
-+/// `distrusted` does not count, and a peer in the open proof counts only for
-+/// the banks of that proof.
-+pub fn vouched(
-+    absent: &[Checkpoint],
-+    attesters: impl Fn(&BankHash) -> Vec<NodeId>,
-+    stake: impl Fn(&NodeId) -> u64,
-+    total_stake: u64,
-+    saved: &Saved,
-+    tip_height: u64,
-+) -> Vec<Checkpoint> {
-+    // A node of the open proof still counts for the banks of that proof.
-+    let doubted = |node: &NodeId, bank_hash: &BankHash| {
-+        saved.proof.as_ref().is_some_and(|proof| {
-+            proof.nodes.contains(node) && !proof.bank_hashes.contains(bank_hash)
-+        }) || saved
-+            .distrusted
-+            .iter()
-+            .any(|distrust| &distrust.node == node && distrust.until_height > tip_height)
-+    };
-+    absent
-+        .iter()
-+        .filter(|checkpoint| {
-+            attesters(&checkpoint.bank_hash).iter().any(|node| {
-+                let stake = u128::from(stake(node));
-+                !doubted(node, &checkpoint.bank_hash)
-+                    && stake > 0
-+                    && stake.saturating_mul(u128::from(MIN_VOUCH_STAKE_PARTS))
-+                        >= u128::from(total_stake)
-+            })
-+        })
-+        .copied()
-+        .collect()
-+}
-+
-+/// Settles the open proof: a bank of the proof that this node now holds
-+/// closes it, and a passed deadline makes its nodes distrusted. True when
-+/// `saved` changed.
-+pub fn settle_proof(saved: &mut Saved, holds: impl Fn(&BankHash) -> bool, tip_height: u64) -> bool {
-+    let Some(proof) = &saved.proof else {
-+        return false;
-+    };
-+    if proof.bank_hashes.iter().any(holds) {
-+        saved.proof = None;
-+        return true;
-+    }
-+    if tip_height < proof.deadline_height {
-+        return false;
-+    }
-+    let until_height = tip_height.saturating_add(DISTRUST_BLOCKS);
-+    let nodes = proof.nodes.clone();
-+    saved
-+        .distrusted
-+        .retain(|distrust| distrust.until_height > tip_height && !nodes.contains(&distrust.node));
-+    saved.distrusted.extend(
-+        nodes
-+            .into_iter()
-+            .map(|node| Distrust { node, until_height }),
-+    );
-+    saved.proof = None;
-+    true
-+}
-+
-+/// Stops the fallback while a proof is open. After a restart, the banks that
-+/// its peers named must arrive, or the deadline must pass, before the stake
-+/// votes move the root again.
-+pub fn hold_fallback_for_proof(choice: &mut Choice, saved: &Saved) {
-+    if saved.proof.is_some() {
-+        choice.fallback = false;
-+    }
 +}
 +
 +/// The bank to build on in place of `candidate`, when the path from
@@ -6453,9 +6062,6 @@ index 0000000..d9293d3
 +    pub handled_height: u64,
 +    /// The next start must load a snapshot at or below this slot.
 +    pub restart_to: Option<Slot>,
-+    /// The banks of the open proof, until one of them arrives.
-+    pub proof: Option<Proof>,
-+    pub distrusted: Vec<Distrust>,
 +}
 +
 +impl Saved {
@@ -6520,28 +6126,6 @@ index 0000000..d9293d3
 +        if let Some(slot) = self.restart_to {
 +            text.push_str(&format!("restart {slot}\n"));
 +        }
-+        if let Some(proof) = &self.proof {
-+            let list = |items: &[[u8; 32]]| {
-+                if items.is_empty() {
-+                    "-".to_owned()
-+                } else {
-+                    items.iter().map(to_hex).collect::<Vec<_>>().join(",")
-+                }
-+            };
-+            text.push_str(&format!(
-+                "proof {} {} {}\n",
-+                proof.deadline_height,
-+                list(&proof.bank_hashes),
-+                list(&proof.nodes)
-+            ));
-+        }
-+        for distrust in &self.distrusted {
-+            text.push_str(&format!(
-+                "distrust {} {}\n",
-+                to_hex(&distrust.node),
-+                distrust.until_height
-+            ));
-+        }
 +        text
 +    }
 +
@@ -6581,23 +6165,8 @@ index 0000000..d9293d3
 +                }
 +                ["handled", height] => saved.handled_height = height.parse().ok()?,
 +                ["restart", slot] => saved.restart_to = Some(slot.parse().ok()?),
-+                ["proof", deadline_height, bank_hashes, nodes] => {
-+                    let list = |text: &str| -> Option<Vec<[u8; 32]>> {
-+                        if text == "-" {
-+                            return Some(Vec::new());
-+                        }
-+                        text.split(',').map(from_hex).collect()
-+                    };
-+                    saved.proof = Some(Proof {
-+                        bank_hashes: list(bank_hashes)?,
-+                        nodes: list(nodes)?,
-+                        deadline_height: deadline_height.parse().ok()?,
-+                    })
-+                }
-+                ["distrust", node, until_height] => saved.distrusted.push(Distrust {
-+                    node: from_hex(node)?,
-+                    until_height: until_height.parse().ok()?,
-+                }),
++                // State files from older versions hold these lines.
++                ["proof", ..] | ["distrust", ..] => {}
 +                _ => return None,
 +            }
 +        }
@@ -7017,20 +6586,13 @@ index 0000000..d9293d3
 +                checkpoints.push(checkpoint(201, 64));
 +            }
 +            let screened = screen_root(&checkpoints, &ancestors, &saved);
-+            let vouched = vouched_by_staked(&screened.absent, |_| vec![node(1)], &saved, 206);
 +            let mut choice = choose(96, &banks, &screened.counted, 206, PARAMS);
-+            let pending: Vec<_> = screened
-+                .pending
-+                .iter()
-+                .copied()
-+                .chain(vouched.iter().map(|checkpoint| checkpoint.height))
-+                .collect();
-+            choice.fallback &= !pending_stops_fallback(&pending, 206, PARAMS);
++            choice.fallback &= !pending_stops_fallback(&screened.pending, 206, PARAMS);
 +            assert!(choice.fallback);
 +            let candidates: Vec<_> = screened
 +                .counted
 +                .iter()
-+                .chain(vouched.iter())
++                .chain(screened.absent.iter())
 +                .copied()
 +                .collect();
 +            assert_eq!(
@@ -7127,90 +6689,6 @@ index 0000000..d9293d3
 +        assert!(choose(10, &split(), &screened.counted, 105, PARAMS).fallback);
 +    }
 +
-+    fn node(byte: u8) -> NodeId {
-+        [byte; 32]
-+    }
-+
-+    /// `vouched` when each attester holds stake.
-+    fn vouched_by_staked(
-+        absent: &[Checkpoint],
-+        attesters: impl Fn(&BankHash) -> Vec<NodeId>,
-+        saved: &Saved,
-+        tip_height: u64,
-+    ) -> Vec<Checkpoint> {
-+        vouched(absent, attesters, |_| 1, 1, saved, tip_height)
-+    }
-+
-+    #[test]
-+    fn only_trusted_attesters_with_a_thousandth_of_the_stake_vouch() {
-+        let absent = [unknown(100)];
-+        let stake = |node: &NodeId| u64::from(node[0]);
-+        let held_by = |nodes: Vec<NodeId>| move |_: &BankHash| nodes.clone();
-+        let saved = Saved::default();
-+        let vouch = |nodes: Vec<NodeId>, saved: &Saved| {
-+            vouched(&absent, held_by(nodes), stake, 100_000, saved, 100)
-+        };
-+        assert!(vouch(vec![node(99)], &saved).is_empty());
-+        assert!(vouch(vec![node(50), node(60)], &saved).is_empty());
-+        assert_eq!(vouch(vec![node(100)], &saved), vec![unknown(100)]);
-+        let distrusted = Saved {
-+            distrusted: vec![Distrust {
-+                node: node(100),
-+                until_height: 150,
-+            }],
-+            ..Saved::default()
-+        };
-+        assert!(vouch(vec![node(100)], &distrusted).is_empty());
-+    }
-+
-+    #[test]
-+    fn only_a_checkpoint_that_a_trusted_peer_holds_is_vouched() {
-+        let absent = [unknown(100)];
-+        let held_by = |nodes: Vec<NodeId>| move |_: &BankHash| nodes.clone();
-+        assert!(vouched_by_staked(&absent, held_by(vec![]), &Saved::default(), 100).is_empty());
-+        assert_eq!(
-+            vouched_by_staked(&absent, held_by(vec![node(1)]), &Saved::default(), 100),
-+            vec![unknown(100)]
-+        );
-+        let on_hold = Saved {
-+            proof: Some(Proof {
-+                bank_hashes: vec![[0xaa; 32]],
-+                nodes: vec![node(1)],
-+                deadline_height: 200,
-+            }),
-+            ..Saved::default()
-+        };
-+        assert!(vouched_by_staked(&absent, held_by(vec![node(1)]), &on_hold, 100).is_empty());
-+        let awaited = Saved {
-+            proof: Some(Proof {
-+                bank_hashes: vec![[0xee; 32]],
-+                nodes: vec![node(1)],
-+                deadline_height: 200,
-+            }),
-+            ..Saved::default()
-+        };
-+        assert_eq!(
-+            vouched_by_staked(&absent, held_by(vec![node(1)]), &awaited, 100),
-+            vec![unknown(100)]
-+        );
-+        assert_eq!(
-+            vouched_by_staked(&absent, held_by(vec![node(1), node(2)]), &on_hold, 100),
-+            vec![unknown(100)]
-+        );
-+        let distrusted = Saved {
-+            distrusted: vec![Distrust {
-+                node: node(1),
-+                until_height: 150,
-+            }],
-+            ..Saved::default()
-+        };
-+        assert!(vouched_by_staked(&absent, held_by(vec![node(1)]), &distrusted, 100).is_empty());
-+        assert_eq!(
-+            vouched_by_staked(&absent, held_by(vec![node(1)]), &distrusted, 150),
-+            vec![unknown(100)]
-+        );
-+    }
-+
 +    #[test]
 +    fn repeated_checkpoints_for_an_anchor_out_of_the_record_never_stop_the_fallback() {
 +        let banks = tree(&[(96, 0), (97, 96)]);
@@ -7222,24 +6700,13 @@ index 0000000..d9293d3
 +            credited_block: block(150),
 +            part_block: [0; 32],
 +        }];
-+        let mut saved = Saved {
++        let saved = Saved {
 +            anchors: vec![anchor(100, 32)],
-+            proof: Some(Proof {
-+                bank_hashes: vec![hash(32)],
-+                nodes: vec![node(1)],
-+                deadline_height: 300,
-+            }),
 +            ..Saved::default()
 +        };
 +        let below_root = BelowRoot::new(&saved.anchors, &record, Some(100), |height| {
 +            Some(block(height))
 +        });
-+        assert!(settle_proof(
-+            &mut saved,
-+            |bank_hash| below_root.holds(bank_hash),
-+            206
-+        ));
-+        assert_eq!(saved.proof, None);
 +        for tip_height in [206, 212, 218] {
 +            let old_bank = Checkpoint {
 +                height: tip_height,
@@ -7249,66 +6716,14 @@ index 0000000..d9293d3
 +            let screened = screen(&[old_bank], &deposits, &below_root);
 +            assert!(screened.absent.is_empty());
 +            assert_eq!(screened.rejected, vec![(old_bank, Rejection::OutOfRecord)]);
-+            let vouched =
-+                vouched_by_staked(&screened.absent, |_| vec![node(1)], &saved, tip_height);
-+            assert!(vouched.is_empty());
-+            let mut choice = choose(96, &banks, &screened.counted, tip_height, PARAMS);
-+            assert!(
-+                stop_fallback(&mut choice, &screened.pending, &vouched, tip_height, PARAMS)
-+                    .is_empty()
-+            );
++            let choice = choose(96, &banks, &screened.counted, tip_height, PARAMS);
 +            assert!(choice.fallback);
-+            assert_eq!(saved.proof, None);
++            assert!(!pending_stops_fallback(
++                &screened.pending,
++                tip_height,
++                PARAMS
++            ));
 +        }
-+    }
-+
-+    #[test]
-+    fn a_restart_that_brings_its_bank_closes_the_proof() {
-+        let mut saved = Saved {
-+            proof: Some(Proof {
-+                bank_hashes: vec![[0xee; 32]],
-+                nodes: vec![node(1)],
-+                deadline_height: 120,
-+            }),
-+            ..Saved::default()
-+        };
-+        assert!(!settle_proof(&mut saved, |_| false, 110));
-+        assert!(saved.proof.is_some());
-+        assert!(settle_proof(
-+            &mut saved,
-+            |bank_hash| bank_hash == &[0xee; 32],
-+            111
-+        ));
-+        assert_eq!(saved, Saved::default());
-+    }
-+
-+    #[test]
-+    fn a_restart_that_brings_no_bank_distrusts_its_nodes() {
-+        let mut saved = Saved {
-+            proof: Some(Proof {
-+                bank_hashes: vec![[0xee; 32]],
-+                nodes: vec![node(1), node(2)],
-+                deadline_height: 120,
-+            }),
-+            ..Saved::default()
-+        };
-+        assert!(settle_proof(&mut saved, |_| false, 120));
-+        assert_eq!(saved.proof, None);
-+        assert_eq!(
-+            saved.distrusted,
-+            vec![
-+                Distrust {
-+                    node: node(1),
-+                    until_height: 120 + DISTRUST_BLOCKS
-+                },
-+                Distrust {
-+                    node: node(2),
-+                    until_height: 120 + DISTRUST_BLOCKS
-+                },
-+            ]
-+        );
-+        let after = vouched_by_staked(&[unknown(130)], |_| vec![node(1)], &saved, 130);
-+        assert!(after.is_empty());
 +    }
 +
 +    #[test]
@@ -7483,52 +6898,6 @@ index 0000000..d9293d3
 +    }
 +
 +    #[test]
-+    fn a_vouched_checkpoint_never_holds_the_root() {
-+        let banks = tree(&[(10, 0), (11, 10), (12, 10)]);
-+        let checkpoints = [checkpoint(100, 11)];
-+        let mut vouching = choose(10, &banks, &checkpoints, 102, PARAMS);
-+        let mut other = vouching.clone();
-+        stop_fallback(&mut vouching, &[], &[fake(101)], 102, PARAMS);
-+        stop_fallback(&mut other, &[], &[], 102, PARAMS);
-+        assert_eq!(vouching.new_root, Some(11));
-+        assert_eq!(vouching, other);
-+    }
-+
-+    #[test]
-+    fn a_vouched_checkpoint_stops_the_fallback_only_until_the_proof_ends() {
-+        let liar = |_: &BankHash| vec![node(7)];
-+        let banks = tree(&[(11, 0), (12, 11), (13, 12)]);
-+        let checkpoints = [checkpoint(100, 11)];
-+        let mut saved = saved(&[anchor(100, 11)], &[], 0);
-+        let first = 110;
-+        let deadline = first + PROOF_BLOCKS;
-+        for tip in first..deadline + PARAMS.fallback_blocks {
-+            let absent: Vec<Checkpoint> = (first - 1..tip).map(fake).collect();
-+            let named = vouched_by_staked(&absent, liar, &saved, tip);
-+            assert!(named.len() <= 1, "the liar names a second bank");
-+            let mut choice = choose(11, &banks, &checkpoints, tip, PARAMS);
-+            assert!(choice.fallback);
-+            let stopping = stop_fallback(&mut choice, &[], &named, tip, PARAMS);
-+            if !stopping.is_empty() {
-+                assert_eq!(open_proof(&mut saved, &stopping, liar, tip), tip == first);
-+            }
-+            assert_eq!(
-+                choice.fallback,
-+                tip >= first - 1 + PARAMS.fallback_blocks,
-+                "fallback at tip {tip}"
-+            );
-+            settle_proof(&mut saved, |_| false, tip);
-+        }
-+        assert_eq!(saved.proof, None);
-+        assert!(
-+            saved
-+                .distrusted
-+                .iter()
-+                .any(|distrust| distrust.node == node(7))
-+        );
-+    }
-+
-+    #[test]
 +    fn a_tie_that_lasts_l_blocks_falls_back_and_roots_nothing() {
 +        let checkpoints = [checkpoint(100, 12), checkpoint(101, 13)];
 +        let choice = choose(
@@ -7666,10 +7035,13 @@ index 0000000..d9293d3
 +    fn a_pending_checkpoint_stops_the_fallback() {
 +        let checkpoints = [checkpoint(90, 11)];
 +        for (tip_height, fallback) in [(105, false), (110, true)] {
-+            let mut choice = choose(10, &split(), &checkpoints, tip_height, PARAMS);
++            let choice = choose(10, &split(), &checkpoints, tip_height, PARAMS);
 +            assert!(choice.fallback);
-+            stop_fallback(&mut choice, &[104], &[], tip_height, PARAMS);
-+            assert_eq!(choice.fallback, fallback, "tip {tip_height}");
++            assert_eq!(
++                choice.fallback && !pending_stops_fallback(&[104], tip_height, PARAMS),
++                fallback,
++                "tip {tip_height}"
++            );
 +        }
 +    }
 +
@@ -7701,43 +7073,6 @@ index 0000000..d9293d3
 +        assert!(choose(12, &banks, &checkpoints, 107, PARAMS).fallback);
 +    }
 +
-+    fn schedule_ends(schedule: &EpochSchedule, root: Slot, highest: Slot) -> bool {
-+        leader_schedule_ends(root, highest, schedule)
-+    }
-+
-+    #[test]
-+    fn a_betanet_epoch_of_8192_slots_ends_the_schedule_4096_slots_early() {
-+        let schedule = EpochSchedule::custom(8192, 8192, false);
-+        assert!(!schedule_ends(&schedule, 0, 12_286));
-+        assert!(schedule_ends(&schedule, 0, 12_287));
-+        let root = 19 * 8192 + 5;
-+        let last_of_epoch_20 = 21 * 8192 - 1;
-+        assert!(!schedule_ends(&schedule, root, last_of_epoch_20 - 4097));
-+        assert!(schedule_ends(&schedule, root, last_of_epoch_20 - 4096));
-+        assert!(schedule_ends(&schedule, root, last_of_epoch_20));
-+        assert!(!schedule_ends(&schedule, 20 * 8192, last_of_epoch_20));
-+    }
-+
-+    #[test]
-+    fn an_epoch_of_432000_slots_ends_the_schedule_216000_slots_early() {
-+        let schedule = EpochSchedule::without_warmup();
-+        assert_eq!(schedule.slots_per_epoch, 432_000);
-+        assert!(!schedule_ends(&schedule, 0, 647_998));
-+        assert!(schedule_ends(&schedule, 0, 647_999));
-+        assert!(!schedule_ends(&schedule, 432_000, 1_079_998));
-+        assert!(schedule_ends(&schedule, 432_000, 1_079_999));
-+    }
-+
-+    #[test]
-+    fn a_warmup_epoch_ends_the_schedule_half_its_slots_early() {
-+        let schedule = EpochSchedule::custom(8192, 8192, true);
-+        assert_eq!(schedule.get_leader_schedule_epoch(0), 1);
-+        assert_eq!(schedule.get_last_slot_in_epoch(1), 95);
-+        assert!(!schedule_ends(&schedule, 0, 62));
-+        assert!(schedule_ends(&schedule, 0, 63));
-+        assert!(!schedule_ends(&schedule, 0, 0));
-+    }
-+
 +    #[test]
 +    fn no_restart_while_the_root_is_the_newest_anchor() {
 +        let checkpoints = [checkpoint(100, 10), unknown(101), unknown(102)];
@@ -7759,40 +7094,6 @@ index 0000000..d9293d3
 +    }
 +
 +    #[test]
-+    fn a_vouch_with_little_stake_causes_no_restart() {
-+        let anchors = [anchor(100, 5)];
-+        let absent = [unknown(101), unknown(102)];
-+        let restart_with = |stakes: &'static [(u8, u64)]| {
-+            let stake = |node: &NodeId| {
-+                stakes
-+                    .iter()
-+                    .find(|(byte, _)| node[0] == *byte)
-+                    .map_or(0, |(_, stake)| *stake)
-+            };
-+            let attesters = |_: &BankHash| stakes.iter().map(|(byte, _)| node(*byte)).collect();
-+            let mut checkpoints = vec![checkpoint(100, 5)];
-+            checkpoints.extend(vouched(
-+                &absent,
-+                attesters,
-+                stake,
-+                1_000_000,
-+                &Saved::default(),
-+                105,
-+            ));
-+            restart_at(&checkpoints, 105, &anchors, &[], 0)
-+        };
-+        assert_eq!(restart_with(&[(1, 999)]), None);
-+        assert_eq!(restart_with(&[(1, 999), (2, 999)]), None);
-+        assert_eq!(
-+            restart_with(&[(1, 250_000)]),
-+            Some(Restart {
-+                anchor: anchor(100, 5),
-+                trigger_height: 102,
-+            })
-+        );
-+    }
-+
-+    #[test]
 +    fn a_restart_waits_for_k_blocks_on_the_unknown_checkpoints() {
 +        let checkpoints = [checkpoint(100, 5), unknown(101), unknown(102)];
 +        let anchors = [anchor(100, 5)];
@@ -7804,6 +7105,53 @@ index 0000000..d9293d3
 +        let checkpoints = [checkpoint(100, 5), unknown(101), checkpoint(102, 12)];
 +        let anchors = [anchor(100, 5)];
 +        assert_eq!(restart_at(&checkpoints, 105, &anchors, &[], 0), None);
++    }
++
++    #[test]
++    fn a_checkpoint_for_an_unknown_bank_never_stops_the_fallback_but_counts_for_a_restart() {
++        let banks = tree(&[(96, 0)]);
++        let saved = saved(&[anchor(100, 32)], &[], 0);
++        let fake = unknown(203);
++        let screened = screen_root(&[fake], &[], &saved);
++        assert_eq!(screened.absent, vec![fake]);
++        assert!(screened.pending.is_empty());
++        let mut choice = choose(96, &banks, &screened.counted, 204, PARAMS);
++        choice.fallback &= !pending_stops_fallback(&screened.pending, 204, PARAMS);
++        assert!(choice.fallback);
++        let after_k = 203 + PARAMS.root_depth;
++        assert_eq!(
++            restart(
++                96,
++                &banks,
++                &screened.absent,
++                after_k,
++                &saved,
++                &[],
++                u64::MAX,
++                PARAMS
++            ),
++            Some(Restart {
++                anchor: anchor(100, 32),
++                trigger_height: 203,
++            })
++        );
++        let handled = Saved {
++            handled_height: 203,
++            ..saved
++        };
++        assert_eq!(
++            restart(
++                96,
++                &banks,
++                &screened.absent,
++                after_k,
++                &handled,
++                &[],
++                u64::MAX,
++                PARAMS
++            ),
++            None
++        );
 +    }
 +
 +    #[test]
@@ -8229,19 +7577,29 @@ index 0000000..d9293d3
 +            base: Some(base(3, 90)),
 +            handled_height: 102,
 +            restart_to: Some(5),
-+            proof: Some(Proof {
-+                bank_hashes: vec![[0xee; 32], [0xef; 32]],
-+                nodes: vec![],
-+                deadline_height: 114,
-+            }),
-+            distrusted: vec![Distrust {
-+                node: [3; 32],
-+                until_height: 1110,
-+            }],
 +        };
 +        saved.store(&dir).unwrap();
 +        assert_eq!(Saved::load(&dir).unwrap(), saved);
 +        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_state_file_with_old_proof_lines_still_loads() {
++        let text = format!(
++            "anchor 5 {} 100 {}\nhandled 102\nproof 114 {} -\ndistrust {} 1110\n",
++            to_hex(&hash(5)),
++            to_hex(&block(100)),
++            to_hex(&[0xee; 32]),
++            to_hex(&[3; 32])
++        );
++        assert_eq!(
++            Saved::parse(&text),
++            Some(Saved {
++                anchors: vec![anchor(100, 5)],
++                handled_height: 102,
++                ..Saved::default()
++            })
++        );
 +    }
 +
 +    #[test]
@@ -8295,31 +7653,6 @@ index 0000000..d9293d3
 +        );
 +        assert!(dir.join("genesis.tar.bz2").exists());
 +        fs::remove_dir_all(&dir).unwrap();
-+    }
-+
-+    #[test]
-+    fn an_open_proof_holds_the_fallback_until_its_deadline() {
-+        let checkpoints = [checkpoint(100, 11)];
-+        let mut saved = Saved {
-+            proof: Some(Proof {
-+                bank_hashes: vec![[0xee; 32]],
-+                nodes: vec![node(1)],
-+                deadline_height: 120,
-+            }),
-+            ..Saved::default()
-+        };
-+        for tip_height in [110, 119] {
-+            let mut choice = choose(10, &split(), &checkpoints, tip_height, PARAMS);
-+            assert!(choice.fallback);
-+            assert!(!settle_proof(&mut saved, |_| false, tip_height));
-+            hold_fallback_for_proof(&mut choice, &saved);
-+            assert!(!choice.fallback, "the stake roots at tip {tip_height}");
-+        }
-+        let mut choice = choose(10, &split(), &checkpoints, 120, PARAMS);
-+        assert!(settle_proof(&mut saved, |_| false, 120));
-+        hold_fallback_for_proof(&mut choice, &saved);
-+        assert!(choice.fallback);
-+        assert_eq!(saved.distrusted.len(), 1);
 +    }
 +}
 diff --git a/sol-drivechain-bmm/src/held.rs b/sol-drivechain-bmm/src/held.rs
@@ -8446,10 +7779,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..ec65a70
+index 0000000..b89558a
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2267 @@
+@@ -0,0 +1,2266 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -8468,7 +7801,6 @@ index 0000000..ec65a70
 +pub mod fork_choice;
 +pub mod held;
 +pub mod pairs;
-+pub mod peers;
 +#[cfg(feature = "poller")]
 +mod poller;
 +#[cfg(feature = "poller")]
@@ -11441,229 +10773,6 @@ index 0000000..aa0b90d
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +}
-diff --git a/sol-drivechain-bmm/src/peers.rs b/sol-drivechain-bmm/src/peers.rs
-new file mode 100644
-index 0000000..83b113c
---- /dev/null
-+++ b/sol-drivechain-bmm/src/peers.rs
-@@ -0,0 +1,217 @@
-+//! What this validator and its staked peers know about the banks of BMM
-+//! checkpoints. A checkpoint for a bank that this node does not hold counts
-+//! toward a restart only when a staked peer says that it holds that bank.
-+
-+use {
-+    crate::fork_choice::{BankHash, Slot},
-+    std::{
-+        collections::{HashMap, HashSet},
-+        sync::{Mutex, OnceLock},
-+    },
-+};
-+
-+/// A node identity.
-+pub type NodeId = [u8; 32];
-+
-+/// The most banks that one question to a peer names.
-+pub const MAX_WANTED: usize = 64;
-+
-+/// A reply to `bmmKnownBanks` holds at most this old a time, in seconds.
-+pub const MAX_REPLY_AGE: u64 = 60;
-+
-+/// The bytes that a node signs in a reply to `bmmKnownBanks`: the node, the
-+/// asked banks, its slots, the nonce of the asker, and the time in seconds.
-+pub fn known_banks_message(
-+    node: &NodeId,
-+    bank_hashes: &[BankHash],
-+    slots: &[Option<Slot>],
-+    nonce: &[u8; 32],
-+    timestamp: u64,
-+) -> Vec<u8> {
-+    let mut message = b"sol-drivechain bmmKnownBanks v1".to_vec();
-+    message.extend_from_slice(node);
-+    message.extend_from_slice(nonce);
-+    message.extend_from_slice(&timestamp.to_le_bytes());
-+    message.extend_from_slice(&(bank_hashes.len() as u64).to_le_bytes());
-+    for (bank_hash, slot) in bank_hashes.iter().zip(slots) {
-+        message.extend_from_slice(bank_hash);
-+        match slot {
-+            Some(slot) => {
-+                message.push(1);
-+                message.extend_from_slice(&slot.to_le_bytes());
-+            }
-+            None => message.push(0),
-+        }
-+    }
-+    message
-+}
-+
-+#[derive(Default)]
-+struct State {
-+    known: HashMap<BankHash, Slot>,
-+    wanted: Vec<BankHash>,
-+    attested: HashMap<BankHash, HashSet<NodeId>>,
-+    generation: u64,
-+}
-+
-+#[derive(Default)]
-+pub struct Peers {
-+    state: Mutex<State>,
-+}
-+
-+/// The bank knowledge that the fork choice, the RPC, and the peer sync share.
-+pub fn peers() -> &'static Peers {
-+    static PEERS: OnceLock<Peers> = OnceLock::new();
-+    PEERS.get_or_init(Peers::default)
-+}
-+
-+impl Peers {
-+    /// Sets the banks that this node holds: the frozen banks, the block
-+    /// record of the root, and the anchors.
-+    pub fn set_known(&self, known: HashMap<BankHash, Slot>) {
-+        self.state.lock().unwrap().known = known;
-+    }
-+
-+    /// The slot of a bank that this node holds.
-+    pub fn known_slot(&self, bank_hash: &BankHash) -> Option<Slot> {
-+        self.state.lock().unwrap().known.get(bank_hash).copied()
-+    }
-+
-+    /// Sets the banks of the checkpoints that this node does not hold, the
-+    /// newest last. It keeps the newest `MAX_WANTED`.
-+    pub fn set_wanted(&self, mut wanted: Vec<BankHash>) {
-+        let excess = wanted.len().saturating_sub(MAX_WANTED);
-+        wanted.drain(..excess);
-+        let mut state = self.state.lock().unwrap();
-+        state
-+            .attested
-+            .retain(|bank_hash, _| wanted.contains(bank_hash));
-+        state.wanted = wanted;
-+    }
-+
-+    pub fn wanted(&self) -> Vec<BankHash> {
-+        self.state.lock().unwrap().wanted.clone()
-+    }
-+
-+    /// Keeps that the staked peer `node` holds the bank `bank_hash`.
-+    pub fn attest(&self, bank_hash: &BankHash, node: NodeId) {
-+        let mut state = self.state.lock().unwrap();
-+        if state.wanted.contains(bank_hash)
-+            && state.attested.entry(*bank_hash).or_default().insert(node)
-+        {
-+            state.generation = state.generation.wrapping_add(1);
-+        }
-+    }
-+
-+    /// Forgets that `node` holds `bank_hash`, after it said that it does not.
-+    pub fn withdraw(&self, bank_hash: &BankHash, node: &NodeId) {
-+        let mut state = self.state.lock().unwrap();
-+        if state
-+            .attested
-+            .get_mut(bank_hash)
-+            .is_some_and(|nodes| nodes.remove(node))
-+        {
-+            state.generation = state.generation.wrapping_add(1);
-+        }
-+    }
-+
-+    /// Drops the attestations of every node outside `staked`, the peers
-+    /// that hold stake now.
-+    pub fn retain_nodes(&self, staked: &HashSet<NodeId>) {
-+        let mut state = self.state.lock().unwrap();
-+        let mut removed = false;
-+        for nodes in state.attested.values_mut() {
-+            let before = nodes.len();
-+            nodes.retain(|node| staked.contains(node));
-+            removed |= nodes.len() != before;
-+        }
-+        if removed {
-+            state.generation = state.generation.wrapping_add(1);
-+        }
-+    }
-+
-+    /// A number that changes at each new or withdrawn attestation.
-+    pub fn generation(&self) -> u64 {
-+        self.state.lock().unwrap().generation
-+    }
-+
-+    /// The staked peers that hold the bank `bank_hash`.
-+    pub fn attesters(&self, bank_hash: &BankHash) -> Vec<NodeId> {
-+        let state = self.state.lock().unwrap();
-+        let mut nodes: Vec<NodeId> = state
-+            .attested
-+            .get(bank_hash)
-+            .map(|nodes| nodes.iter().copied().collect())
-+            .unwrap_or_default();
-+        nodes.sort_unstable();
-+        nodes
-+    }
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+
-+    #[test]
-+    fn only_a_wanted_bank_takes_an_attestation() {
-+        let peers = Peers::default();
-+        peers.attest(&[1; 32], [9; 32]);
-+        assert!(peers.attesters(&[1; 32]).is_empty());
-+        peers.set_wanted(vec![[1; 32]]);
-+        let before = peers.generation();
-+        peers.attest(&[1; 32], [9; 32]);
-+        peers.attest(&[1; 32], [9; 32]);
-+        assert_eq!(peers.attesters(&[1; 32]), vec![[9; 32]]);
-+        assert_eq!(peers.generation(), before.wrapping_add(1));
-+        peers.set_wanted(vec![[2; 32]]);
-+        assert!(peers.attesters(&[1; 32]).is_empty());
-+    }
-+
-+    #[test]
-+    fn a_peer_that_no_longer_holds_a_bank_stops_counting() {
-+        let peers = Peers::default();
-+        peers.set_wanted(vec![[1; 32]]);
-+        peers.attest(&[1; 32], [9; 32]);
-+        peers.attest(&[1; 32], [8; 32]);
-+        let before = peers.generation();
-+        peers.withdraw(&[1; 32], &[9; 32]);
-+        assert_eq!(peers.attesters(&[1; 32]), vec![[8; 32]]);
-+        assert_ne!(peers.generation(), before);
-+        let after = peers.generation();
-+        peers.withdraw(&[1; 32], &[9; 32]);
-+        assert_eq!(peers.generation(), after);
-+    }
-+
-+    #[test]
-+    fn a_peer_without_stake_stops_counting() {
-+        let peers = Peers::default();
-+        peers.set_wanted(vec![[1; 32]]);
-+        peers.attest(&[1; 32], [9; 32]);
-+        peers.attest(&[1; 32], [8; 32]);
-+        let before = peers.generation();
-+        peers.retain_nodes(&HashSet::from([[8; 32]]));
-+        assert_eq!(peers.attesters(&[1; 32]), vec![[8; 32]]);
-+        assert_ne!(peers.generation(), before);
-+        let after = peers.generation();
-+        peers.retain_nodes(&HashSet::from([[8; 32]]));
-+        assert_eq!(peers.generation(), after);
-+    }
-+
-+    #[test]
-+    fn the_wanted_list_keeps_the_newest() {
-+        let peers = Peers::default();
-+        let wanted: Vec<BankHash> = (0..=MAX_WANTED as u8).map(|byte| [byte; 32]).collect();
-+        peers.set_wanted(wanted);
-+        let kept = peers.wanted();
-+        assert_eq!(kept.len(), MAX_WANTED);
-+        assert_eq!(kept.first(), Some(&[1; 32]));
-+    }
-+
-+    #[test]
-+    fn the_known_banks_give_their_slots() {
-+        let peers = Peers::default();
-+        peers.set_known(HashMap::from([([3; 32], 30)]));
-+        assert_eq!(peers.known_slot(&[3; 32]), Some(30));
-+        assert_eq!(peers.known_slot(&[4; 32]), None);
-+    }
-+}
 diff --git a/sol-drivechain-bmm/src/poller.rs b/sol-drivechain-bmm/src/poller.rs
 new file mode 100644
 index 0000000..92b4529
@@ -12092,19 +11201,17 @@ index 0000000..92b4529
 +}
 diff --git a/sol-drivechain-bmm/src/push.rs b/sol-drivechain-bmm/src/push.rs
 new file mode 100644
-index 0000000..29064d0
+index 0000000..e945047
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/push.rs
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,416 @@
 +//! Shares the pairs with the staked validators. The push sends the pairs of
 +//! this node to the RPC of each staked peer. The pull reads the pairs of each
-+//! staked peer, so a node that no peer can reach still gets them, and it asks
-+//! the peers which wanted banks they hold.
++//! staked peer, so a node that no peer can reach still gets them.
 +
 +use {
 +    crate::{
 +        pairs::{Pair, pairs},
-+        peers::{MAX_REPLY_AGE, NodeId, known_banks_message, peers},
 +        view,
 +    },
 +    serde_json::Value,
@@ -12114,7 +11221,7 @@ index 0000000..29064d0
 +        net::{SocketAddr, TcpStream},
 +        sync::{
 +            Arc, Mutex,
-+            atomic::{AtomicBool, AtomicU64, Ordering},
++            atomic::{AtomicBool, Ordering},
 +        },
 +        thread::JoinHandle,
 +        time::{Duration, Instant},
@@ -12176,7 +11283,6 @@ index 0000000..29064d0
 +                    continue;
 +                }
 +                let targets = staked_peers();
-+                peers().retain_nodes(&targets.iter().map(|(node, _)| node.to_bytes()).collect());
 +                if push {
 +                    let recent = pairs().from_height(floor);
 +                    if !recent.is_empty() {
@@ -12191,8 +11297,7 @@ index 0000000..29064d0
 +                    sent_at = Instant::now();
 +                }
 +                if pull {
-+                    let wanted = peers().wanted();
-+                    for_each_peer(&targets, |peer| pull_from(peer, floor, &wanted));
++                    for_each_peer(&targets, |peer| pull_from(peer, floor));
 +                    pulled_at = Some(Instant::now());
 +                }
 +            }
@@ -12216,7 +11321,7 @@ index 0000000..29064d0
 +    });
 +}
 +
-+fn pull_from((node, address): &Peer, floor: u64, wanted: &[[u8; 32]]) {
++fn pull_from((node, address): &Peer, floor: u64) {
 +    match call(*address, &get_pairs_body(floor), MAX_PULL_REPLY)
 +        .and_then(|reply| parse_pairs(&reply))
 +    {
@@ -12228,29 +11333,6 @@ index 0000000..29064d0
 +            }
 +        }
 +        Err(error) => log::debug!("cannot read the BMM pairs of {node} at {address}: {error}"),
-+    }
-+    if wanted.is_empty() {
-+        return;
-+    }
-+    let nonce = fresh_nonce();
-+    match call(*address, &known_banks_body(wanted, &nonce), MAX_PUSH_REPLY)
-+        .and_then(|reply| parse_known_banks(&reply, &node.to_bytes(), wanted, &nonce, unix_now()?))
-+    {
-+        Ok(known) => {
-+            let mut held = 0usize;
-+            for (bank_hash, slot) in wanted.iter().zip(known) {
-+                if slot.is_some() {
-+                    peers().attest(bank_hash, node.to_bytes());
-+                    held = held.saturating_add(1);
-+                } else {
-+                    peers().withdraw(bank_hash, &node.to_bytes());
-+                }
-+            }
-+            if held > 0 {
-+                log::info!("{node} holds {held} of {} wanted BMM banks", wanted.len());
-+            }
-+        }
-+        Err(error) => log::info!("cannot ask {node} at {address} for BMM banks: {error}"),
 +    }
 +}
 +
@@ -12275,41 +11357,6 @@ index 0000000..29064d0
 +
 +fn get_pairs_body(floor: u64) -> String {
 +    format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"bmmGetPairs\",\"params\":[{floor}]}}")
-+}
-+
-+fn known_banks_body(wanted: &[[u8; 32]], nonce: &[u8; 32]) -> String {
-+    let list: Vec<String> = wanted
-+        .iter()
-+        .map(|bank_hash| format!("\"{}\"", Pubkey::new_from_array(*bank_hash)))
-+        .collect();
-+    format!(
-+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"bmmKnownBanks\",\"params\":[[{}],\"{}\"]}}",
-+        list.join(","),
-+        Pubkey::new_from_array(*nonce)
-+    )
-+}
-+
-+/// A nonce that no earlier question of this process used.
-+fn fresh_nonce() -> [u8; 32] {
-+    static COUNTER: AtomicU64 = AtomicU64::new(0);
-+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-+    let nanos = std::time::SystemTime::now()
-+        .duration_since(std::time::UNIX_EPOCH)
-+        .map(|since| since.as_nanos())
-+        .unwrap_or_default();
-+    solana_sha256_hasher::hashv(&[
-+        &nanos.to_le_bytes(),
-+        &count.to_le_bytes(),
-+        &std::process::id().to_le_bytes(),
-+    ])
-+    .to_bytes()
-+}
-+
-+fn unix_now() -> io::Result<u64> {
-+    std::time::SystemTime::now()
-+        .duration_since(std::time::UNIX_EPOCH)
-+        .map(|since| since.as_secs())
-+        .map_err(|_| invalid("the clock is before 1970"))
 +}
 +
 +fn invalid(what: &str) -> io::Error {
@@ -12347,46 +11394,6 @@ index 0000000..29064d0
 +            ))
 +        })
 +        .collect()
-+}
-+
-+/// The slots of a `bmmKnownBanks` reply, one per asked bank. The reply must
-+/// carry a signature of `node` over the asked banks, the slots, `nonce`, and
-+/// a time within `MAX_REPLY_AGE` seconds of `now`.
-+fn parse_known_banks(
-+    reply: &[u8],
-+    node: &NodeId,
-+    asked: &[[u8; 32]],
-+    nonce: &[u8; 32],
-+    now: u64,
-+) -> io::Result<Vec<Option<u64>>> {
-+    let result = result_of(reply)?;
-+    let [slots, timestamp, signature] = result.as_array().map(Vec::as_slice).unwrap_or(&[]) else {
-+        return Err(invalid("no signed reply"));
-+    };
-+    let list = slots.as_array().ok_or_else(|| invalid("no list"))?;
-+    if list.len() != asked.len() {
-+        return Err(invalid("wrong length"));
-+    }
-+    let slots = list
-+        .iter()
-+        .map(|slot| match slot {
-+            Value::Null => Ok(None),
-+            slot => slot.as_u64().map(Some).ok_or_else(|| invalid("bad slot")),
-+        })
-+        .collect::<io::Result<Vec<_>>>()?;
-+    let timestamp = timestamp.as_u64().ok_or_else(|| invalid("bad time"))?;
-+    if timestamp.abs_diff(now) > MAX_REPLY_AGE {
-+        return Err(invalid("the reply is too old"));
-+    }
-+    let signature: [u8; 64] = signature
-+        .as_str()
-+        .and_then(crate::decode_base58::<64>)
-+        .ok_or_else(|| invalid("bad signature"))?;
-+    let message = known_banks_message(node, asked, &slots, nonce, timestamp);
-+    if !solana_signature::Signature::from(signature).verify(node, &message) {
-+        return Err(invalid("the signature does not match the node"));
-+    }
-+    Ok(slots)
 +}
 +
 +fn remaining(deadline: Instant) -> io::Result<Duration> {
@@ -12605,82 +11612,13 @@ index 0000000..29064d0
 +        assert!(parse_pairs(br#"{"result":[[105,"x","y"]]}"#).is_err());
 +    }
 +
-+    fn signed_reply(
-+        keypair: &solana_keypair::Keypair,
-+        asked: &[[u8; 32]],
-+        slots: &[Option<u64>],
-+        nonce: &[u8; 32],
-+        timestamp: u64,
-+    ) -> Vec<u8> {
-+        use solana_signer::Signer;
-+        let node = keypair.pubkey().to_bytes();
-+        let signature =
-+            keypair.sign_message(&known_banks_message(&node, asked, slots, nonce, timestamp));
-+        let slots: Vec<String> = slots
-+            .iter()
-+            .map(|slot| slot.map_or("null".to_owned(), |slot| slot.to_string()))
-+            .collect();
-+        format!(
-+            r#"{{"result":[[{}],{timestamp},"{signature}"]}}"#,
-+            slots.join(",")
-+        )
-+        .into_bytes()
-+    }
-+
-+    #[test]
-+    fn a_signed_known_banks_reply_gives_one_slot_per_bank() {
-+        use solana_signer::Signer;
-+        let keypair = solana_keypair::Keypair::new();
-+        let node = keypair.pubkey().to_bytes();
-+        let asked = [[1; 32], [2; 32]];
-+        let reply = signed_reply(&keypair, &asked, &[Some(7), None], &[5; 32], 1_000);
-+        assert_eq!(
-+            parse_known_banks(&reply, &node, &asked, &[5; 32], 1_010).unwrap(),
-+            vec![Some(7), None]
-+        );
-+    }
-+
-+    #[test]
-+    fn a_forged_known_banks_reply_is_refused() {
-+        use solana_signer::Signer;
-+        let node = solana_keypair::Keypair::new().pubkey().to_bytes();
-+        let forger = solana_keypair::Keypair::new();
-+        let asked = [[1; 32]];
-+        let reply = signed_reply(&forger, &asked, &[Some(7)], &[5; 32], 1_000);
-+        assert!(parse_known_banks(&reply, &node, &asked, &[5; 32], 1_000).is_err());
-+        assert!(parse_known_banks(br#"{"result":[7]}"#, &node, &asked, &[5; 32], 1_000).is_err());
-+    }
-+
 +    #[test]
 +    fn a_reply_with_a_huge_field_fails_fast() {
 +        let huge = "z".repeat(3_000_000);
 +        let reply = format!(r#"{{"result":[[105,"{huge}","{huge}"]]}}"#);
 +        let start = Instant::now();
 +        assert!(parse_pairs(reply.as_bytes()).is_err());
-+        let signed = format!(r#"{{"result":[[7],1000,"{huge}"]}}"#);
-+        assert!(
-+            parse_known_banks(signed.as_bytes(), &[1; 32], &[[1; 32]], &[5; 32], 1_000).is_err()
-+        );
 +        assert!(start.elapsed() < Duration::from_secs(2));
-+    }
-+
-+    #[test]
-+    fn an_old_known_banks_reply_is_refused() {
-+        use solana_signer::Signer;
-+        let keypair = solana_keypair::Keypair::new();
-+        let node = keypair.pubkey().to_bytes();
-+        let asked = [[1; 32]];
-+        let reply = signed_reply(&keypair, &asked, &[Some(7)], &[5; 32], 1_000);
-+        assert!(parse_known_banks(&reply, &node, &asked, &[6; 32], 1_000).is_err());
-+        assert!(
-+            parse_known_banks(&reply, &node, &asked, &[5; 32], 1_000 + MAX_REPLY_AGE + 1).is_err()
-+        );
-+        assert!(parse_known_banks(&reply, &node, &[[2; 32]], &[5; 32], 1_000).is_err());
-+    }
-+
-+    #[test]
-+    fn each_question_takes_a_new_nonce() {
-+        assert_ne!(fresh_nonce(), fresh_nonce());
 +    }
 +}
 diff --git a/svm/src/account_loader.rs b/svm/src/account_loader.rs

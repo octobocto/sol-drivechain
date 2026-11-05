@@ -320,9 +320,9 @@ only makes blocks.
 | Paid check | For each tx with a top-level `bundle_paid(through, H, M, M6ID)`, the bank asks the view whether M, the active block at H, holds a Succeeded event for the M6ID. A leader needs K + 1 blocks on top, and replay needs K. |
 | Answers | The runtime builds `BmmAnswer`, `DepositAnswer`, and `BmmPaid` for the tx, the same way as the instructions sysvar. No tx can write them. |
 | Block record | The runtime writes the last block of each 32 slots and its credits into `BmmB1ocks…`. |
-| Pairs | `bmmPublishPairs`, `bmmGetPairs`, and `bmmKnownBanks` on the RPC, the `bmm-pairs` file, and the push to and the pull from the staked peers. A peer signs each `bmmKnownBanks` reply with its node key over the asked banks, the slots, a nonce of the asker, and the time. |
+| Pairs | `bmmPublishPairs` and `bmmGetPairs` on the RPC, the `bmm-pairs` file, and the push to and the pull from the staked peers. |
 | Kept answers | The `bmm-answers` file keeps the answer of each settle and credit that the node ran. |
-| Fork choice | Checkpoints select the branch and move the root. A checkpoint for a bank that this node does not hold counts only when a staked peer with at least 0.1% of the epoch stake holds that bank. The 0.1% floor is an interim guard until a restart fetches the vouched blocks first. The RPC `finalized` commitment is the newest root that BMM moved. |
+| Fork choice | Checkpoints select the branch and move the root. A checkpoint counts for the fork choice only after this node replayed its bank. A checkpoint for a bank that this node does not hold counts only for a restart, and the replay after the restart decides. The RPC `finalized` commitment is the newest root that BMM moved. |
 | Values | The genesis account `BmmParams…` holds the sidechain slot, N, K, and L. No tx can write it. |
 | Flags | `--bmm-enforcer-url` on the validator. `--bmm-sidechain-slot`, `--bmm-confirmations`, `--bmm-root-depth`, and `--bmm-fallback-blocks` on `solana-genesis`. |
 
@@ -334,7 +334,8 @@ question that no new eCash block can answer leaves the queue at once. On
 replay, the questions of one slot wait 10 seconds in all for a late eCash
 block, and then the block is dead. The slots of one leader in one epoch wait
 60 seconds in all. A question for the block one past the view still waits
-at least 3 seconds per slot when the leader used its 60 seconds. While the
+up to 3 seconds per slot when the leader used its 60 seconds, and up to 15
+seconds in all for one leader in one epoch. While the
 enforcer does not answer, the
 replay waits and marks no block dead. A leader needs one more block than
 replay, so a healthy node never waits.
@@ -366,7 +367,7 @@ payout.
 | N | `BmmParams` in the genesis, and `bmm --confirmations` | 6 | 6 | A settle waits for N + 1 eCash blocks on top. |
 | K | `BmmParams` in the genesis | 2 | 3 | A checkpoint becomes the root after K eCash confirmations. |
 | L | `BmmParams` in the genesis | 6 | 12 | After L eCash blocks without a checkpoint, the stake votes move the root. |
-| epoch | `slots_per_epoch` in the genesis | 8192 | 432000 | A validator leads only up to one epoch after its root. |
+| epoch | `slots_per_epoch` in the genesis | 432000 | 432000 | A node drops each block more than half an epoch above its root. |
 
 `genesis/depths.sh` holds this table. `build-genesis.sh` reads `NETWORK`
 and takes its values. A value in the
@@ -378,12 +379,11 @@ sidechain slot (`SIDECHAIN_SLOT`), N, K, and L into `BmmParams`. Every
 validator reads the same genesis, so every validator uses the same values.
 
 `build-genesis.sh` sets 432000 slots per epoch (`SLOTS_PER_EPOCH`), about 2
-days. A BMM root comes 30 to 120 minutes after its block. When the root falls a
-full epoch behind, the leader has no schedule and the chain stops. Betanet has
-8192 slots, about 55 minutes, and it stopped this way. So when the banks come
-within half an epoch of the end of the leader schedule of the root, the stake
-votes move the root, whatever the checkpoints say. An existing chain cannot
-change the value.
+days. A node drops each block more than half an epoch above its root, and the
+leader schedule ends one epoch after the root. A bidder that wins every
+auction can name old banks that still pass rule 3, so the root can lag up to
+lag + D + K eCash blocks, about 19 hours on eCash. Half an epoch is 24 hours.
+An existing chain cannot change the value.
 
 ## Finality
 
@@ -399,11 +399,8 @@ change the value.
   fallback. `finalized` stays at the last BMM root. A read at
   `finalized` then fails, because the node no longer holds the exact state
   of that slot. When checkpoints come back and name another branch, BMM still
-  overrules the stake roots with a restart. While the proof of a restart or
-  of a vouched checkpoint is open, the stake votes move no root, so a node
-  that restarted cannot root its old branch again before the bank arrives.
-  Near the end of the leader schedule of the root, the stake votes still
-  move the root.
+  overrules the stake roots with a restart. A checkpoint for a bank that
+  this node does not hold never stops the fallback.
 - **Join.** A node that starts from a snapshot shows no `finalized` block
   until it moves its root to a BMM checkpoint itself. A tie never moves the
   root.
