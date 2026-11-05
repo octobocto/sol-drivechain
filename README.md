@@ -372,9 +372,10 @@ validator reads the same genesis, so every validator uses the same values.
 `build-genesis.sh` sets 432000 slots per epoch (`SLOTS_PER_EPOCH`), about 2
 days. A BMM root comes 30 to 120 minutes after its block. When the root falls a
 full epoch behind, the leader has no schedule and the chain stops. Betanet has
-8192 slots, about 55 minutes, and it stopped this way. A later root does not
-start it again. A restart does, up to the end of the epoch after the newest
-root. An existing chain cannot change the value.
+8192 slots, about 55 minutes, and it stopped this way. So when the banks come
+within half an epoch of the end of the leader schedule of the root, the stake
+votes move the root, whatever the checkpoints say. An existing chain cannot
+change the value.
 
 ## Finality
 
@@ -385,7 +386,9 @@ root. An existing chain cannot change the value.
   checkpoint at K or more eCash confirmations. The RPC `finalized` commitment
   never passes it.
 - **Fallback.** After L eCash blocks without a checkpoint, the stake votes
-  move the root, but `finalized` stays at the last BMM root. A read at
+  move the root. Only the first checkpoint of each bank at or above the root
+  counts for L, so repeated commitments to the root bank do not stop the
+  fallback. `finalized` stays at the last BMM root. A read at
   `finalized` then fails, because the node no longer holds the exact state
   of that slot. When checkpoints come back and name another branch, BMM still
   overrules the stake roots with a restart.
