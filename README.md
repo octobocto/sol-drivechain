@@ -168,13 +168,18 @@ as eCash pays it.
    script must be a byte-exact P2PKH, P2SH, P2WPKH, P2WSH, or P2TR template.
    The enforcer reads any other output as a treasury or a deposit, and then
    it refuses the whole M6.
-2. When no bundle is live, the oracle sends `seal_bundle(through, M6ID)`. The
+2. When no bundle is live, the oracle sends `seal_bundle(through, M6ID)`. It
+   takes the records from `paid_through` up to the withdrawal count at
+   `finalized`, and it reads them at `finalized`. The
    live bundle is the records from `paid_through` to `bundled_through`, at
    most 1500, and the bridge keeps the M6ID of their blinded M6. One
    bundle is live at a time, and a record never leaves its bundle, so no two
    bundles that eCash can pay hold the same record.
 3. After the seal is `finalized`, the daemon builds the blinded M6 from the
-   records in index order and calls `ProposeWithdrawalBundle`. The same
+   records in index order and calls `ProposeWithdrawalBundle`. When its M6ID
+   is not the M6ID of the seal, the peg stops with an error. The deposit
+   credits stop with it, so the operator runs `credit` on its own until a
+   new genesis. The same
    records always give the same M6ID, so each daemon proposes the same bundle.
    The daemon sets the bundle policy to `KNOWN`.
 4. Each pass reads the history of the active eCash chain from the seal. A

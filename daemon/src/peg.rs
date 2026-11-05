@@ -75,6 +75,11 @@ pub enum PegError {
     BelowDropped { start: u64, dropped_through: u64 },
     #[error("the proposal file holds `{0}`, which is no M6ID")]
     BadM6id(String),
+    #[error(
+        "the finalized records of the live bundle give M6ID {built}, but the bridge sealed \
+         {sealed}. eCash never pays the sealed M6ID, so the peg stops until an operator acts"
+    )]
+    SealedM6idMismatch { built: Txid, sealed: Txid },
 }
 
 /// The record that `account` holds at `index`, if it is one: the program
@@ -374,7 +379,7 @@ pub async fn run(settings: Settings, oracle: Keypair) -> Result<(), PegError> {
     );
     let mut credit_enforcer = enforcer.clone();
     tokio::select! {
-        never = peg_loop(&mut enforcer, &rpc, &settings, &oracle, proposals) => match never {},
+        error = peg_loop(&mut enforcer, &rpc, &settings, &oracle, proposals) => Err(error),
         result = credit::run(
             &mut credit_enforcer,
             settings.solana_rpc_url.clone(),
@@ -395,13 +400,15 @@ struct Memory {
     scan: Option<Scan>,
 }
 
+/// Runs a pass at each tick. It returns only the error of a live bundle that
+/// eCash can never pay.
 async fn peg_loop(
     enforcer: &mut Enforcer,
     rpc: &RpcClient,
     settings: &Settings,
     oracle: &Keypair,
     proposals: crate::proposals::Proposals,
-) -> std::convert::Infallible {
+) -> PegError {
     let mut ticker = tokio::time::interval(settings.bundle_interval);
     let mut memory = Memory {
         proposals,
@@ -412,6 +419,7 @@ async fn peg_loop(
         ticker.tick().await;
         match pass(enforcer, rpc, settings, oracle, &mut memory).await {
             Ok(()) => (),
+            Err(error @ PegError::SealedM6idMismatch { .. }) => return error,
             Err(PegError::Rpc { source, .. }) if finalized_unavailable(&source) => {
                 tracing::warn!(
                     "the validator holds no BMM finalized state, so the peg waits for a BMM \
@@ -518,6 +526,13 @@ async fn pass(
             live_records(rpc, program_id, live.clone(), CommitmentConfig::finalized()).await?;
         let blinded = bundle_of(&records)?;
         let m6id = m6::m6id(&blinded);
+        let sealed = Txid::from_byte_array(finalized.bundle_m6id);
+        if m6id != sealed {
+            return Err(PegError::SealedM6idMismatch {
+                built: m6id,
+                sealed,
+            });
+        }
         let tip = enforcer.tip().await?;
         let scan = scan_bundle(
             enforcer,
@@ -536,24 +551,34 @@ async fn pass(
     match decide(&view) {
         Action::Wait => {}
         Action::Seal => {
+            // Records never change, so the root holds the same records as
+            // the followed branch.
             let start = processed.paid_through;
             let end = start
                 .saturating_add(bridge::MAX_BUNDLE_RECORDS)
-                .min(processed.withdrawal_count);
-            check_overlap(enforcer, &memory.proposals, start..end, None).await?;
-            let records =
-                live_records(rpc, program_id, start..end, CommitmentConfig::processed()).await?;
-            let m6id = m6::m6id(&bundle_of(&records)?);
-            send(
-                rpc,
-                oracle,
-                bridge::seal_bundle_ix(program_id, &oracle.pubkey(), end, &m6id.to_byte_array()),
-            )
-            .await?;
-            tracing::info!(
-                first = processed.bundled_through,
-                "the peg sealed the open records into a bundle"
-            );
+                .min(finalized.withdrawal_count);
+            if end > start {
+                check_overlap(enforcer, &memory.proposals, start..end, None).await?;
+                let records =
+                    live_records(rpc, program_id, start..end, CommitmentConfig::finalized())
+                        .await?;
+                let m6id = m6::m6id(&bundle_of(&records)?);
+                send(
+                    rpc,
+                    oracle,
+                    bridge::seal_bundle_ix(
+                        program_id,
+                        &oracle.pubkey(),
+                        end,
+                        &m6id.to_byte_array(),
+                    ),
+                )
+                .await?;
+                tracing::info!(
+                    first = start,
+                    "the peg sealed the open records into a bundle"
+                );
+            }
         }
         Action::Propose => {
             if let Some((blinded, m6id, live, _)) = bundle {
@@ -852,8 +877,10 @@ mod tests {
     struct Bank {
         mock: MockSender,
         config: Config,
+        finalized: Config,
         program_id: Pubkey,
         records: Vec<(Pubkey, Account)>,
+        finalized_records: Vec<(Pubkey, Account)>,
         sent: Arc<std::sync::Mutex<Vec<&'static str>>>,
         /// The data of each seal after its discriminator.
         sealed: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
@@ -877,12 +904,18 @@ mod tests {
             params: serde_json::Value,
         ) -> ClientResult<serde_json::Value> {
             let context = serde_json::json!({"slot": 1});
+            let finalized = params[1]["commitment"] == "finalized";
+            let (config, records) = if finalized {
+                (&self.finalized, &self.finalized_records)
+            } else {
+                (&self.config, &self.records)
+            };
             match request {
                 RpcRequest::GetAccountInfo => Ok(serde_json::json!({
                     "context": context,
                     "value": ui_account(&Account {
                         lamports: 1_000,
-                        data: self.config.encode(),
+                        data: config.encode(),
                         owner: self.program_id,
                         executable: false,
                         rent_epoch: 0,
@@ -894,7 +927,7 @@ mod tests {
                         .unwrap()
                         .iter()
                         .map(|key| {
-                            self.records
+                            records
                                 .iter()
                                 .find(|(at, _)| at.to_string() == key.as_str().unwrap())
                                 .map_or(serde_json::Value::Null, |(_, account)| ui_account(account))
@@ -960,32 +993,46 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_failed_close_does_not_stop_the_seal_of_the_m6id_of_the_records() {
-        let program_id = Pubkey::new_from_array([3u8; 32]);
-        let sent = Arc::default();
-        let sealed = Arc::default();
-        let records: Vec<WithdrawalRecord> =
-            (0..3).map(|index| a_record(index, 5_000, 1)).collect();
+    type Sent = Arc<std::sync::Mutex<Vec<&'static str>>>;
+    type Sealed = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+    fn record_accounts(program_id: Pubkey, records: &[WithdrawalRecord]) -> Vec<(Pubkey, Account)> {
+        records
+            .iter()
+            .map(|record| {
+                (
+                    bridge::withdrawal_pda(&program_id, record.index).0,
+                    a_record_account(program_id, record),
+                )
+            })
+            .collect()
+    }
+
+    /// A bank with `processed` and `finalized`, each a config and its records.
+    fn a_bank(
+        program_id: Pubkey,
+        processed: (Config, &[WithdrawalRecord]),
+        finalized: (Config, &[WithdrawalRecord]),
+    ) -> (RpcClient, Sent, Sealed) {
+        let sent = Sent::default();
+        let sealed = Sealed::default();
         let rpc = RpcClient::new_sender(
             Bank {
                 mock: MockSender::new("succeeds"),
-                config: a_config(3, 1, 1),
+                config: processed.0,
+                finalized: finalized.0,
                 program_id,
-                records: records
-                    .iter()
-                    .map(|record| {
-                        (
-                            bridge::withdrawal_pda(&program_id, record.index).0,
-                            a_record_account(program_id, record),
-                        )
-                    })
-                    .collect(),
+                records: record_accounts(program_id, processed.1),
+                finalized_records: record_accounts(program_id, finalized.1),
                 sent: Arc::clone(&sent),
                 sealed: Arc::clone(&sealed),
             },
             RpcClientConfig::with_commitment(CommitmentConfig::processed()),
         );
+        (rpc, sent, sealed)
+    }
+
+    fn a_settings(program_id: Pubkey, name: &str) -> Settings {
         let settings = Settings {
             network: crate::network::PegNetwork::Alphanet,
             enforcer_url: "http://127.0.0.1:1".to_owned(),
@@ -994,19 +1041,23 @@ mod tests {
             program_id,
             bundle_interval: Duration::from_secs(1),
             bundle_log: std::env::temp_dir().join(format!(
-                "sol-drivechain-peg-{}-close.json",
+                "sol-drivechain-peg-{}-{name}.json",
                 std::process::id()
             )),
             new_bundle_log: false,
         };
         let _ = std::fs::remove_file(&settings.bundle_log);
+        settings
+    }
+
+    async fn a_pass(rpc: &RpcClient, settings: &Settings) -> Result<(), PegError> {
         let mut enforcer = Enforcer::connect(settings.enforcer_url.clone(), 8)
             .await
             .unwrap();
-        let error = pass(
+        pass(
             &mut enforcer,
-            &rpc,
-            &settings,
+            rpc,
+            settings,
             &Keypair::new(),
             &mut Memory {
                 proposals: crate::proposals::Proposals::load(settings.bundle_log.clone()).unwrap(),
@@ -1015,7 +1066,18 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn a_failed_close_does_not_stop_the_seal_of_the_m6id_of_the_records() {
+        let program_id = Pubkey::new_from_array([3u8; 32]);
+        let records: Vec<WithdrawalRecord> =
+            (0..3).map(|index| a_record(index, 5_000, 1)).collect();
+        let config = a_config(3, 1, 1);
+        let (rpc, sent, sealed) = a_bank(program_id, (config, &records), (config, &records));
+        let error = a_pass(&rpc, &a_settings(program_id, "close"))
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             PegError::Rpc {
@@ -1029,6 +1091,72 @@ mod tests {
             *sealed.lock().unwrap(),
             [[&3u64.to_le_bytes()[..], &m6id.to_byte_array()].concat()]
         );
+    }
+
+    #[tokio::test]
+    async fn the_seal_takes_the_end_and_the_m6id_from_the_finalized_records() {
+        let program_id = Pubkey::new_from_array([3u8; 32]);
+        let followed: Vec<WithdrawalRecord> =
+            (0..3).map(|index| a_record(index, 6_000, 2)).collect();
+        let rooted: Vec<WithdrawalRecord> = (0..2).map(|index| a_record(index, 5_000, 1)).collect();
+        let (rpc, sent, sealed) = a_bank(
+            program_id,
+            (a_config(3, 1, 1), &followed),
+            (a_config(2, 1, 1), &rooted),
+        );
+        a_pass(&rpc, &a_settings(program_id, "finalized-seal"))
+            .await
+            .unwrap_err();
+        assert_eq!(sent.lock().unwrap().first(), Some(&"seal_bundle"));
+        let m6id = m6::m6id(&bundle_of(&rooted[1..]).unwrap());
+        assert_eq!(
+            *sealed.lock().unwrap(),
+            [[&2u64.to_le_bytes()[..], &m6id.to_byte_array()].concat()]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_seal_waits_until_the_root_holds_an_open_record() {
+        let program_id = Pubkey::new_from_array([3u8; 32]);
+        let records: Vec<WithdrawalRecord> =
+            (0..3).map(|index| a_record(index, 5_000, 1)).collect();
+        let (rpc, sent, sealed) = a_bank(
+            program_id,
+            (a_config(3, 1, 1), &records),
+            (a_config(1, 0, 0), &records[..1]),
+        );
+        a_pass(&rpc, &a_settings(program_id, "root-behind"))
+            .await
+            .unwrap_err();
+        assert_eq!(*sent.lock().unwrap(), ["close_record"]);
+        assert!(sealed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_bundle_of_another_m6id_stops_the_peg() {
+        let program_id = Pubkey::new_from_array([3u8; 32]);
+        let records: Vec<WithdrawalRecord> =
+            (0..3).map(|index| a_record(index, 5_000, 1)).collect();
+        let mut config = a_config(3, 1, 3);
+        config.bundle_m6id = [9u8; 32];
+        let (rpc, _, _) = a_bank(program_id, (config, &records), (config, &records));
+        let settings = a_settings(program_id, "m6id-mismatch");
+        let error = a_pass(&rpc, &settings).await.unwrap_err();
+        assert!(
+            matches!(error, PegError::SealedM6idMismatch { .. }),
+            "{error:?}"
+        );
+        let mut enforcer = Enforcer::connect(settings.enforcer_url.clone(), 8)
+            .await
+            .unwrap();
+        let proposals = crate::proposals::Proposals::load(settings.bundle_log.clone()).unwrap();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(10),
+            peg_loop(&mut enforcer, &rpc, &settings, &Keypair::new(), proposals),
+        )
+        .await
+        .expect("the loop stops");
+        assert!(matches!(stopped, PegError::SealedM6idMismatch { .. }));
     }
 
     #[test]
