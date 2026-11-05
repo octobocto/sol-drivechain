@@ -257,10 +257,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..6da85d7
+index 0000000..9f74034
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,667 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -563,6 +563,7 @@ index 0000000..6da85d7
 +            tip_height,
 +            fork_choice::params(),
 +        );
++        fork_choice::hold_fallback_for_proof(&mut choice, &self.saved);
 +        // A checkpoint whose bank trusted staked peers hold can still arrive
 +        // here, so it stops the fallback as a pending one does.
 +        let stopping = fork_choice::stop_fallback(
@@ -912,6 +913,11 @@ index 0000000..6da85d7
 +        };
 +        let (before, at) = (child(12_286), child(12_287));
 +        let mut bmm = bmm_with(Choice::default());
++        bmm.saved.proof = Some(fork_choice::Proof {
++            bank_hashes: vec![[0xee; 32]],
++            nodes: Vec::new(),
++            deadline_height: u64::MAX,
++        });
 +        for (banks, tower_roots) in [
 +            (vec![root.clone(), before.clone()], false),
 +            (vec![root.clone(), before.clone(), at], true),
@@ -5409,10 +5415,10 @@ index 0000000..248a0d1
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..e53d30a
+index 0000000..d9293d3
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2869 @@
+@@ -0,0 +1,2903 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -6100,6 +6106,15 @@ index 0000000..e53d30a
 +    );
 +    saved.proof = None;
 +    true
++}
++
++/// Stops the fallback while a proof is open. After a restart, the banks that
++/// its peers named must arrive, or the deadline must pass, before the stake
++/// votes move the root again.
++pub fn hold_fallback_for_proof(choice: &mut Choice, saved: &Saved) {
++    if saved.proof.is_some() {
++        choice.fallback = false;
++    }
 +}
 +
 +/// The bank to build on in place of `candidate`, when the path from
@@ -8280,6 +8295,31 @@ index 0000000..e53d30a
 +        );
 +        assert!(dir.join("genesis.tar.bz2").exists());
 +        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn an_open_proof_holds_the_fallback_until_its_deadline() {
++        let checkpoints = [checkpoint(100, 11)];
++        let mut saved = Saved {
++            proof: Some(Proof {
++                bank_hashes: vec![[0xee; 32]],
++                nodes: vec![node(1)],
++                deadline_height: 120,
++            }),
++            ..Saved::default()
++        };
++        for tip_height in [110, 119] {
++            let mut choice = choose(10, &split(), &checkpoints, tip_height, PARAMS);
++            assert!(choice.fallback);
++            assert!(!settle_proof(&mut saved, |_| false, tip_height));
++            hold_fallback_for_proof(&mut choice, &saved);
++            assert!(!choice.fallback, "the stake roots at tip {tip_height}");
++        }
++        let mut choice = choose(10, &split(), &checkpoints, 120, PARAMS);
++        assert!(settle_proof(&mut saved, |_| false, 120));
++        hold_fallback_for_proof(&mut choice, &saved);
++        assert!(choice.fallback);
++        assert_eq!(saved.distrusted.len(), 1);
 +    }
 +}
 diff --git a/sol-drivechain-bmm/src/held.rs b/sol-drivechain-bmm/src/held.rs

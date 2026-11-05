@@ -34,7 +34,8 @@
 #    interim guard until a restart fetches the vouched blocks first. Such a
 #    checkpoint never holds the root. When it stops the fallback or causes a
 #    restart, its peers must bring the bank within 12 eCash blocks, or this
-#    node distrusts them.
+#    node distrusts them. While that proof is open, the stake votes move no
+#    root, except near the end of the leader schedule of the root.
 #    The RPC `finalized` commitment is the newest root that BMM moved.
 # 8. A commitment h* counts only when a pair (bank hash, payee) with
 #    SHA-256(bank hash ‖ payee) = h* is known. The RPC method `bmmPublishPairs`
