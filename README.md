@@ -259,7 +259,7 @@ The rpc is JSON-RPC 2.0 over HTTP POST:
 
 | Method | Params | Result |
 |---|---|---|
-| `get_block_template` | none | `critical_hash` (h* in hex, the bytes of the M8), `block` (`prev_main_hash` as the explorers show it, `height` = tip + 1, `bank_hash`, `payee`, `slot`), and `fees_sats`, the bid that the fees allow, at most `--max-bid-sats`. The daemon publishes the pair before it answers. |
+| `get_block_template` | none | `critical_hash` (h* in hex, the bytes of the M8), `block` (`prev_main_hash` as the explorers show it, `height` = tip + 1, `bank_hash`, `payee`, `slot`), and `fees_sats`, the bid that the fees allow, at most `--max-bid-sats`. The daemon publishes the pair before it answers. When the validator refuses it because 16 pairs wait at that height, the daemon answers anyway and publishes the pair again after the eCash block. |
 | `connect_block` | `[block, main_block_hash]` | `true` when the active eCash block at `block.height` is `main_block_hash` and commits to the pair. |
 | `get_bmm_inclusions` | `[critical_hash]` | The active eCash blocks that carry `critical_hash`. |
 | `template_valid` | `[block]` | `true` while the block record holds the bank, and the bank passes rule 3. |

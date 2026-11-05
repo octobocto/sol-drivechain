@@ -225,6 +225,10 @@ const REMEMBERED_HEIGHTS: u64 = 1_000;
 /// (`MAX_UNCHECKED_PER_HEIGHT` in the validator patch).
 const MAX_PAIRS_PER_HEIGHT: usize = 16;
 
+/// The answer of a validator that holds the most unchecked pairs at the
+/// height of a pair (the `MAX_UNCHECKED_PER_HEIGHT` refusal in the patch).
+pub const FULL_HEIGHT_REFUSAL: &str = "refused: too many pairs wait at this height";
+
 /// The state that the loop and the BMM rpc share: the fee history, the bid of
 /// the current tip, and the own pairs by commitment.
 #[derive(Debug, Default)]
