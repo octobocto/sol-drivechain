@@ -195,11 +195,23 @@ impl<C: Chain> Server<C> {
     }
 
     /// The template for the next eCash block. Its pair goes to the validators
-    /// before the answer, so no commitment can win without its pair.
+    /// before the answer, or after the block when unchecked pairs fill its height.
     pub async fn get_block_template(&self) -> Result<Value, RpcError> {
         let tip = self.chain.tip().await?;
         let template = bmm::template(&*self.chain, &self.memory, &self.rules, tip).await?;
-        bmm::publish_one(&*self.chain, template.pair).await?;
+        match bmm::publish_one(&*self.chain, template.pair).await {
+            Ok(()) => {}
+            Err(BmmError::PairRefused { height, answers })
+                if answers == [bmm::FULL_HEIGHT_REFUSAL] =>
+            {
+                tracing::warn!(
+                    height,
+                    "unchecked pairs fill the height, so the BMM loop publishes the pair after the \
+                     eCash block"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
         self.memory.lock().await.remember(template.pair);
         Ok(json!({
             "critical_hash": crate::hex::encode(&template.pair.commitment()),
@@ -570,10 +582,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_pair_gives_no_template_and_stays_unknown() {
+    async fn a_pair_refused_for_a_full_height_gives_a_template_and_stays_known() {
         let server = server();
         server.chain.with(|fake| {
-            fake.answer = "refused: too many pairs wait at this height".to_owned();
+            fake.answer = bmm::FULL_HEIGHT_REFUSAL.to_owned();
+        });
+        let template = server.get_block_template().await.unwrap();
+        assert_eq!(template["block"], json!(block_json()));
+        assert_eq!(
+            server.memory.lock().await.pair(&pair().commitment()),
+            Some(pair())
+        );
+        assert_eq!(
+            server
+                .memory
+                .lock()
+                .await
+                .pairs_to_publish(90, u64::from(TIP_HEIGHT) + 1, 6),
+            [pair()],
+            "the BMM loop publishes the pair again after the eCash block"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pair_refused_for_another_reason_gives_no_template_and_stays_unknown() {
+        let server = server();
+        server.chain.with(|fake| {
+            fake.answer = "refused: the height is above the next eCash block".to_owned();
         });
         assert_eq!(
             server.get_block_template().await.unwrap_err().code,
