@@ -32,6 +32,10 @@ pub fn pair_too_old(height: u64, credited_height: u64) -> bool {
     height.saturating_add(PAIR_WINDOW) < credited_height
 }
 
+/// The slots that an unpaired commitment waits after the cursor reaches it.
+/// It must match `SKIP_GRACE_SLOTS` of the bridge program.
+pub const SKIP_GRACE_SLOTS: u64 = 300;
+
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";

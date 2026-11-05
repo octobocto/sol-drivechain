@@ -285,9 +285,11 @@ moves the cursor to H + 1:
   not in the block record, or it fails rule 3.
 - A commitment at height H that no pair matches holds the cursor until
   `credited_height` reaches H + `bmm_skip_blocks`, 6 eCash blocks
-  (`BMM_SKIP_BLOCKS` in `build-genesis.sh`). After that, any settle of the
-  height moves past it and pays nothing. Each validator checks the credits
-  against eCash, so a row of such heights skips at once.
+  (`BMM_SKIP_BLOCKS` in `build-genesis.sh`), and 300 slots, about 2
+  minutes, passed since the cursor reached H (`SKIP_GRACE_SLOTS`). After
+  that, any settle of the height moves past it and pays nothing. Each skip
+  starts a new grace, so a leader cannot skip a row of heights in a backlog
+  and take their fees.
 - A commitment that no pair matches, more than 4032 blocks below
   `credited_height`, moves the cursor at once and pays nothing. The
   validators drop the pairs of that height.
