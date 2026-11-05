@@ -8406,10 +8406,10 @@ index 0000000..ac46da6
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..8556251
+index 0000000..300cde2
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2213 @@
+@@ -0,0 +1,2210 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -9181,8 +9181,8 @@ index 0000000..8556251
 +
 +/// A lookup inside the view. `Ahead` names a block more than `MAX_AHEAD`
 +/// blocks past what the view can answer. `Mismatch` names another block than
-+/// the view holds with exactly `depth` blocks on top, which a reorg to a
-+/// chain one block longer can still change. `Backfill` waits for older blocks.
++/// the view holds, which an eCash reorg can still change. `Backfill` waits for
++/// older blocks.
 +/// `Next` names a block exactly one past what the view can answer.
 +enum Found<T> {
 +    Ready(T),
@@ -9280,8 +9280,6 @@ index 0000000..8556251
 +            Some(block) if missing == 0 => {
 +                if &block.hash == block_hash {
 +                    Found::Ready(block.clone())
-+                } else if tip_height.saturating_sub(height) > depth {
-+                    Found::Never
 +                } else {
 +                    Found::Mismatch
 +                }
@@ -10251,20 +10249,19 @@ index 0000000..8556251
 +    }
 +
 +    #[test]
-+    fn a_replay_gives_never_at_once_for_another_block_below_the_depth() {
-+        let view = BmmView::default();
-+        view.replace_from(&chain(100, 120, 0));
++    fn a_lagging_replay_waits_for_a_deep_reorg_to_the_named_block() {
++        let view = Arc::new(BmmView::default());
++        view.replace_from(&chain(90, 111, 0));
 +        view.mark_synced();
-+        let start = Instant::now();
-+        assert_eq!(
-+            view.answer(104, &hash(200), 6, 0, replay(14)),
-+            Lookup::Never
-+        );
-+        assert_eq!(
-+            view.deep_block(110, &hash(200), 6, 0, replay(14)),
-+            Lookup::Never
-+        );
-+        assert!(start.elapsed() < Duration::from_secs(1));
++        let writer = Arc::clone(&view);
++        let handle = std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(200));
++            writer.replace_from(&fork(104, 112, 50));
++            writer.mark_synced();
++        });
++        let found = view.deep_block(104, &hash(104 + 50), 6, 104, replay(7));
++        handle.join().unwrap();
++        assert!(matches!(found, Lookup::Ready(_)));
 +    }
 +
 +    #[test]
