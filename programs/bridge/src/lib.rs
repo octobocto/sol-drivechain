@@ -37,6 +37,9 @@ pub fn pair_too_old(height: u64, credited_height: u64) -> bool {
     height.saturating_add(PAIR_WINDOW) < credited_height
 }
 
+/// The slots, about 2 minutes, that an unpaired commitment waits after the cursor reaches it.
+pub const SKIP_GRACE_SLOTS: u64 = 300;
+
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";
@@ -140,8 +143,9 @@ pub mod bridge {
     /// valid checkpoint gets the whole treasury. A height with no
     /// commitment, or a checkpoint that its own pair proves invalid, moves
     /// the cursor with no payout. A commitment that no pair matches moves it
-    /// only when the credits reach `bmm_skip_blocks` above its height, or at
-    /// once when its height is below the pair window.
+    /// only when the credits reach `bmm_skip_blocks` above its height and
+    /// `SKIP_GRACE_SLOTS` passed since the cursor reached it, or at once when
+    /// its height is below the pair window.
     pub fn settle_bmm(
         ctx: Context<SettleBmm>,
         height: u64,
@@ -188,6 +192,11 @@ pub mod bridge {
                     require_gte!(
                         config.credited_height,
                         height.saturating_add(config.bmm_skip_blocks),
+                        BridgeError::PairDoesNotMatch
+                    );
+                    require_gte!(
+                        slot,
+                        config.bmm_next_since_slot.saturating_add(SKIP_GRACE_SLOTS),
                         BridgeError::PairDoesNotMatch
                     );
                     msg!("eCash height {} waited too long for its pair", height);

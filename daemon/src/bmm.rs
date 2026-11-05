@@ -1242,8 +1242,9 @@ pub fn next_settle(
 
 /// The settles from the cursor `next` up, at most `SETTLE_STEPS`, as each
 /// one moves the cursor by one. A commitment without a pair can skip once
-/// `credited_height` reaches its height plus `skip_blocks`, or when it is
-/// below the pair window. It stops at the first wait.
+/// `credited_height` reaches its height plus `skip_blocks` and `grace_passed`
+/// holds for the cursor, or when it is below the pair window. It stops at
+/// the first wait.
 #[allow(clippy::too_many_arguments)]
 pub async fn plan_settles<F, Fut>(
     next: u64,
@@ -1252,6 +1253,7 @@ pub async fn plan_settles<F, Fut>(
     pairs: &[Pair],
     skip_blocks: u64,
     credited_height: u64,
+    grace_passed: bool,
     sender: Pubkey,
     mut block_at: F,
 ) -> Result<Vec<(u64, SettleStep)>, BmmError>
@@ -1271,7 +1273,9 @@ where
             confirmations,
             block,
             pairs,
-            credited_height >= height.saturating_add(skip_blocks)
+            (credited_height >= height.saturating_add(skip_blocks)
+                && grace_passed
+                && height == next)
                 || bridge::pair_too_old(height, credited_height),
             sender,
         );
@@ -1308,6 +1312,10 @@ async fn settle(
             SETTLE_WALK_PAGES,
         )
         .await?;
+    let slot = rpc.get_slot().await.map_err(|source| BmmError::Rpc {
+        call: "getSlot",
+        source,
+    })?;
     let plan = plan_settles(
         config.bmm_next_height,
         tip_height,
@@ -1315,6 +1323,9 @@ async fn settle(
         &pairs,
         config.bmm_skip_blocks,
         config.credited_height,
+        slot >= config
+            .bmm_next_since_slot
+            .saturating_add(bridge::SKIP_GRACE_SLOTS),
         identity.pubkey(),
         |height| {
             let header = u32::try_from(height)
@@ -2247,6 +2258,7 @@ mod tests {
                 &[won],
                 6,
                 0,
+                true,
                 sender,
                 |height| async move {
                     let hash = BlockHash::from_byte_array([height as u8; 32]);
@@ -2275,21 +2287,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plan_skips_each_height_without_a_pair_that_the_credits_passed() {
+    async fn a_plan_skips_only_the_cursor_and_only_after_the_grace_slots() {
         let sender = Pubkey::new_from_array([8u8; 32]);
-        let plan = plan_settles(100, 200, 6, &[], 6, 110, sender, |height| async move {
-            let hash = BlockHash::from_byte_array([height as u8; 32]);
-            Ok(Some((hash, Some([5u8; 32]))))
-        })
-        .await
-        .unwrap();
+        let plan = |grace_passed| {
+            plan_settles(
+                100,
+                200,
+                6,
+                &[],
+                6,
+                110,
+                grace_passed,
+                sender,
+                |height| async move {
+                    let hash = BlockHash::from_byte_array([height as u8; 32]);
+                    Ok(Some((hash, Some([5u8; 32]))))
+                },
+            )
+        };
+        assert!(plan(false).await.unwrap().is_empty());
+        let skipped = plan(true).await.unwrap();
         assert_eq!(
-            plan.iter().map(|(height, _)| *height).collect::<Vec<_>>(),
-            [100, 101, 102, 103, 104],
-            "the plan stops at the first height above credited height minus the skip blocks"
+            skipped
+                .iter()
+                .map(|(height, _)| *height)
+                .collect::<Vec<_>>(),
+            [100],
+            "each skip starts a new grace, so the plan stops after the first one"
         );
-        assert!(plan.iter().all(
-            |(_, step)| matches!(step, SettleStep::Send { solana_block, .. } if *solana_block == [0u8; 32])
+        assert!(matches!(
+            skipped[0].1,
+            SettleStep::Send { solana_block, .. } if solana_block == [0u8; 32]
         ));
     }
 
@@ -2308,6 +2336,7 @@ mod tests {
                 &[],
                 u64::MAX,
                 credited_height,
+                false,
                 sender,
                 |height| async move {
                     let hash = BlockHash::from_byte_array([height as u8; 32]);

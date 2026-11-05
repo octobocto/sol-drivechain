@@ -15,6 +15,7 @@ use sol_drivechain_bridge::{
     Config, DepositAnswer, WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, BMM_PAID_ID,
     BMM_PAID_LEN, DEPOSIT_ANSWER_ENTRY_LEN, DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID,
     LAMPORTS_PER_SAT, MAX_BUNDLE_RECORDS, MAX_SCRIPT_PUBKEY_LEN, MIN_FEE_SATS, PAIR_WINDOW,
+    SKIP_GRACE_SLOTS,
 };
 use solana_account::Account;
 use solana_instruction::Instruction;
@@ -1966,21 +1967,51 @@ fn unpaired_commitments_in_a_row_skip_once_the_credits_pass_the_skip_blocks() {
     chain.pay_fees(1_000_000);
     chain.win(BMM_START, winner);
     chain.set_credited_height(BMM_START + BMM_SKIP_BLOCKS - 1);
+    let since = chain.config().bmm_next_since_slot;
+    chain.svm.warp_to_slot(since + SKIP_GRACE_SLOTS);
     assert!(chain.settle(BMM_START, thief).is_err());
     assert_eq!(chain.config().bmm_next_height, BMM_START);
 
     chain.set_credited_height(BMM_START + 1 + BMM_SKIP_BLOCKS);
-    let slot = chain.svm.get_sysvar::<anchor_lang::prelude::Clock>().slot;
     for height in [BMM_START, BMM_START + 1] {
+        let slot = chain.config().bmm_next_since_slot + SKIP_GRACE_SLOTS;
+        chain.svm.warp_to_slot(slot);
         chain.win(height, winner);
         chain
             .settle(height, thief)
-            .expect("a height that the credits passed moves on with no slot wait");
+            .expect("a height that the credits passed moves on after the grace slots");
         assert_eq!(chain.config().bmm_next_height, height + 1);
         assert_eq!(chain.config().bmm_next_since_slot, slot);
     }
+    chain
+        .svm
+        .warp_to_slot(chain.config().bmm_next_since_slot + SKIP_GRACE_SLOTS);
     chain.win(BMM_START + 2, winner);
     assert!(chain.settle(BMM_START + 2, thief).is_err());
+    assert_eq!(chain.balance(&thief), before);
+    assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
+}
+
+#[test]
+fn an_unpaired_commitment_skips_only_after_the_grace_slots() {
+    let mut chain = Chain::start();
+    let winner = chain.a_stranger().pubkey();
+    let thief = chain.a_stranger().pubkey();
+    let before = chain.balance(&thief);
+    chain.pay_fees(1_000_000);
+    chain.set_credited_height(BMM_START + 1 + BMM_SKIP_BLOCKS);
+    for height in [BMM_START, BMM_START + 1] {
+        let since = chain.config().bmm_next_since_slot;
+        chain.win(height, winner);
+        chain.svm.warp_to_slot(since + SKIP_GRACE_SLOTS - 1);
+        assert!(chain.settle(height, thief).is_err());
+        assert_eq!(chain.config().bmm_next_height, height);
+        chain.svm.warp_to_slot(since + SKIP_GRACE_SLOTS);
+        chain
+            .settle(height, thief)
+            .expect("the skip lands after the grace slots");
+        assert_eq!(chain.config().bmm_next_height, height + 1);
+    }
     assert_eq!(chain.balance(&thief), before);
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
 }
@@ -2165,6 +2196,9 @@ fn the_fees_of_a_height_without_a_pair_roll_over_after_the_skip_blocks() {
     chain.set_credited_height(BMM_START + 1 + BMM_SKIP_BLOCKS - 1);
     assert!(chain.settle(BMM_START + 1, anyone).is_err());
     chain.set_credited_height(BMM_START + 1 + BMM_SKIP_BLOCKS);
+    chain
+        .svm
+        .warp_to_slot(chain.config().bmm_next_since_slot + SKIP_GRACE_SLOTS);
     chain
         .settle(BMM_START + 1, anyone)
         .expect("the skip moves the cursor");

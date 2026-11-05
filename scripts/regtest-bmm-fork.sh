@@ -287,15 +287,17 @@ settle() {
 
 # Heights settle in order, so the cursor walks up to a height first. An
 # empty height settles at once, and a commitment with no known pair settles
-# with no payout once the credits pass it by BMM_SKIP_BLOCKS.
+# with no payout once the credits pass it by BMM_SKIP_BLOCKS and 300 slots
+# passed since the cursor reached it. Each skip waits about 2 minutes, so the
+# walk has a 30 minute deadline.
 settle_through() {
-  local height=$1 next
-  for _ in $(seq 1 400); do
+  local height=$1 next deadline=$((SECONDS + 1800))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     next="$(bridge_value "bmm next height")"
     [ "$next" -ge "$height" ] && return 0
     settle "$next" 11111111111111111111111111111111 >/dev/null 2>&1 || sleep 2
   done
-  fail "the cursor did not reach eCash height $height"
+  fail "the cursor did not reach eCash height $height in 30 minutes"
 }
 
 # The enforcer follows the node. Right after a reorg its block template still
