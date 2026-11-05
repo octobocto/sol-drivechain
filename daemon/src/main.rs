@@ -1317,10 +1317,11 @@ fn main() -> Result<(), CliError> {
             let publish = |pair: bmm::Pair| {
                 let rpc = rpc.clone();
                 async move {
-                    for outcome in bmm::publish_pairs(&rpc, &[pair]).await? {
+                    let answers = bmm::publish_pairs(&rpc, &[pair]).await?;
+                    for outcome in &answers {
                         println!("pair {outcome}");
                     }
-                    Ok::<_, CliError>(())
+                    Ok::<_, CliError>(answers)
                 }
             };
             let request =
@@ -1574,8 +1575,8 @@ fn read_state(path: &PathBuf) -> Result<migrate::State, CliError> {
     })
 }
 
-/// Waits for a recorded block of the followed branch that passes rule 3 for
-/// the next eCash block. Gives the eCash tip of the check and the block.
+/// Publishes `pair` unless `withhold`, and sends `bid` only after the
+/// validator holds the pair.
 async fn publish_before_bid<T, E, P, PF, B>(
     pair: Option<bmm::Pair>,
     withhold: bool,
@@ -1583,16 +1584,19 @@ async fn publish_before_bid<T, E, P, PF, B>(
     bid: B,
 ) -> Result<T, E>
 where
+    E: From<bmm::BmmError>,
     P: FnOnce(bmm::Pair) -> PF,
-    PF: std::future::Future<Output = Result<(), E>>,
+    PF: std::future::Future<Output = Result<Vec<String>, E>>,
     B: std::future::Future<Output = Result<T, E>>,
 {
     if let Some(pair) = pair.filter(|_| !withhold) {
-        publish(pair).await?;
+        bmm::held(pair.height, publish(pair).await?)?;
     }
     bid.await
 }
 
+/// Waits for a recorded block of the followed branch that passes rule 3 for
+/// the next eCash block. Gives the eCash tip of the check and the block.
 async fn wait_for_bid_block(
     rpc: &std::sync::Arc<solana_rpc_client::nonblocking::rpc_client::RpcClient>,
     enforcer: &mut Enforcer,
@@ -1648,11 +1652,11 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(format!("publish {}", pair.height));
-                async { Ok::<_, ()>(()) }
+                async { Ok::<_, CliError>(vec!["new".to_owned()]) }
             };
             let bid = async {
                 events.lock().unwrap().push("bid".to_string());
-                Err::<(), ()>(())
+                Err::<(), CliError>(CliError::NoCommitment)
             };
             assert!(publish_before_bid(Some(pair), withhold, publish, bid)
                 .await
@@ -1664,6 +1668,27 @@ mod tests {
             };
             assert_eq!(*events.lock().unwrap(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn the_cli_sends_no_bid_after_the_validator_refused_its_pair() {
+        let pair = bmm::Pair {
+            height: 7,
+            block: [1; 32],
+            payee: Pubkey::new_unique(),
+        };
+        let bid_sent = std::sync::atomic::AtomicBool::new(false);
+        let publish = |_| async { Ok::<_, CliError>(vec![bmm::FULL_HEIGHT_REFUSAL.to_owned()]) };
+        let bid = async {
+            bid_sent.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, CliError>(())
+        };
+        let refused = publish_before_bid(Some(pair), false, publish, bid).await;
+        assert!(!bid_sent.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            refused,
+            Err(CliError::Bmm(bmm::BmmError::PairRefused { height: 7, .. }))
+        ));
     }
 
     #[test]

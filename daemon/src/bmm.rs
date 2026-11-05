@@ -1481,13 +1481,15 @@ pub async fn recorded_blocks(rpc: &RpcClient) -> Result<Vec<RecordedBlock>, BmmE
 
 /// Publishes `pair`, and fails unless the validator holds it.
 pub async fn publish_one(chain: &impl Chain, pair: Pair) -> Result<(), BmmError> {
-    let answers = chain.publish(&[pair]).await?;
+    held(pair.height, chain.publish(&[pair]).await?)
+}
+
+/// Fails unless `answers` is the answer "new" or "known" for one pair at
+/// `height`.
+pub fn held(height: u64, answers: Vec<String>) -> Result<(), BmmError> {
     match answers.as_slice() {
         [answer] if answer == "new" || answer == "known" => Ok(()),
-        _ => Err(BmmError::PairRefused {
-            height: pair.height,
-            answers,
-        }),
+        _ => Err(BmmError::PairRefused { height, answers }),
     }
 }
 
