@@ -558,7 +558,9 @@ step "BMM: a settle for a stale block never lands"
 # or it moves the cursor past the height first.
 kill "$BMM_PID"
 wait "$BMM_PID" 2>/dev/null || true
-STALE_HEIGHT=$(( $(bridge_value "bmm next height") ))
+# A settle that landed just before the kill shows only at processed.
+STALE_HEIGHT="$("$D" bridge-state --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" --processed \
+  | awk '$0 ~ "^bmm next height" {print $NF}')"
 STALE_HASH="$(btc getblockhash "$STALE_HEIGHT")"
 echo "eCash height $STALE_HEIGHT holds block $STALE_HASH"
 btc invalidateblock "$STALE_HASH" >/dev/null
