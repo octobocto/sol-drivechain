@@ -184,17 +184,13 @@ pub struct Config {
     pub bundled_through: u64,
     pub bundle_sealed_height: u64,
     pub bundle_sealed_slot: u64,
-    pub bundle_min_slots: u64,
     pub bmm_skip_blocks: u64,
     pub bmm_next_since_slot: u64,
     pub bundle_m6id: [u8; 32],
 }
 
 impl Config {
-    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 9 + 32;
-
-    /// The size of a config before the `bundle_m6id` field.
-    pub const LEN_BEFORE_M6ID: usize = Self::LEN - 32;
+    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 8 + 32;
 
     /// The record indices of the live bundle, if one is live.
     pub fn live_bundle(&self) -> Option<std::ops::Range<u64>> {
@@ -244,7 +240,6 @@ impl Config {
             self.bundled_through,
             self.bundle_sealed_height,
             self.bundle_sealed_slot,
-            self.bundle_min_slots,
             self.bmm_skip_blocks,
             self.bmm_next_since_slot,
         ] {
@@ -252,17 +247,6 @@ impl Config {
         }
         data.extend_from_slice(&self.bundle_m6id);
         data
-    }
-
-    /// Decodes a config, or an older one without `bundle_m6id`, which reads
-    /// as zero.
-    pub fn decode_any(data: &[u8]) -> Result<Self, BridgeError> {
-        if data.len() == Self::LEN_BEFORE_M6ID {
-            let mut data = data.to_vec();
-            data.resize(Self::LEN, 0);
-            return Self::decode(&data);
-        }
-        Self::decode(data)
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, BridgeError> {
@@ -303,7 +287,6 @@ impl Config {
             bundled_through: reader.u64().ok_or_else(|| cut("bundled_through"))?,
             bundle_sealed_height: reader.u64().ok_or_else(|| cut("bundle_sealed_height"))?,
             bundle_sealed_slot: reader.u64().ok_or_else(|| cut("bundle_sealed_slot"))?,
-            bundle_min_slots: reader.u64().ok_or_else(|| cut("bundle_min_slots"))?,
             bmm_skip_blocks: reader.u64().ok_or_else(|| cut("bmm_skip_blocks"))?,
             bmm_next_since_slot: reader.u64().ok_or_else(|| cut("bmm_next_since_slot"))?,
             bundle_m6id: reader.array32().ok_or_else(|| cut("bundle_m6id"))?,
@@ -655,7 +638,6 @@ mod tests {
             bundled_through: 9,
             bundle_sealed_height: 990,
             bundle_sealed_slot: 77,
-            bundle_min_slots: 1_000,
             bmm_skip_blocks: 6,
             bmm_next_since_slot: 600,
             bundle_m6id: [6u8; 32],
@@ -729,21 +711,6 @@ mod tests {
         let mut long = current;
         long.push(0);
         assert!(Config::decode(&long).is_err());
-    }
-
-    #[test]
-    fn a_config_before_the_m6id_decodes_with_a_zero_m6id() {
-        let current = a_config().encode();
-        let old = &current[..Config::LEN_BEFORE_M6ID];
-        assert!(Config::decode(old).is_err());
-        assert_eq!(
-            Config::decode_any(old).unwrap(),
-            Config {
-                bundle_m6id: [0u8; 32],
-                ..a_config()
-            }
-        );
-        assert_eq!(Config::decode_any(&current).unwrap(), a_config());
     }
 
     #[test]
@@ -944,7 +911,7 @@ mod tests {
     fn the_config_sits_at_the_offsets_that_the_validator_reads() {
         let data = a_config().encode();
         let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        assert_eq!(data.len(), 291);
+        assert_eq!(data.len(), 283);
         assert_eq!(&data[8..40], &[7u8; 32]);
         assert_eq!(at(64), 900);
         assert_eq!(at(80), 6);
@@ -960,10 +927,9 @@ mod tests {
         assert_eq!(at(211), 9);
         assert_eq!(at(219), 990);
         assert_eq!(at(227), 77);
-        assert_eq!(at(235), 1_000);
-        assert_eq!(at(243), 6);
-        assert_eq!(at(251), 600);
-        assert_eq!(&data[259..291], &[6u8; 32]);
+        assert_eq!(at(235), 6);
+        assert_eq!(at(243), 600);
+        assert_eq!(&data[251..283], &[6u8; 32]);
     }
 
     #[test]

@@ -301,9 +301,6 @@ enum Command {
         /// backs: the identity, the vote and stake accounts, and the faucet.
         #[arg(long)]
         float_lamports: u64,
-        /// The fewest slots between a bundle seal and its `bundle_paid`.
-        #[arg(long)]
-        bundle_min_slots: u64,
         /// The eCash blocks that the credits must pass above a commitment
         /// without a pair before the BMM cursor skips it.
         #[arg(long)]
@@ -899,7 +896,6 @@ fn main() -> Result<(), CliError> {
             println!("bundled through   {}", config.bundled_through);
             println!("bundle sealed at  {}", config.bundle_sealed_height);
             println!("bundle sealed slot {}", config.bundle_sealed_slot);
-            println!("bundle min slots  {}", config.bundle_min_slots);
             println!("withdrawal fee    {} sats", bridge::MIN_FEE_SATS);
             if !books {
                 return Ok(());
@@ -1109,7 +1105,6 @@ fn main() -> Result<(), CliError> {
             oracle,
             oracle_lamports,
             float_lamports,
-            bundle_min_slots,
             bmm_skip_blocks,
             dex_accounts,
             bootstrap_vote,
@@ -1129,7 +1124,6 @@ fn main() -> Result<(), CliError> {
                 oracle: parse_pubkey(&oracle)?,
                 oracle_lamports,
                 float_lamports,
-                bundle_min_slots,
                 bmm_skip_blocks,
                 lamports_per_byte_year,
                 ecash_start_height,
@@ -1838,7 +1832,6 @@ mod tests {
             bundled_through: 0,
             bundle_sealed_height: 0,
             bundle_sealed_slot: 0,
-            bundle_min_slots: 0,
             bmm_skip_blocks: 0,
             bmm_next_since_slot: 0,
             bundle_m6id: [0u8; 32],

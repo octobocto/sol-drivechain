@@ -306,7 +306,6 @@ pub struct View {
     /// What eCash did with the final live bundle.
     pub status: BundleStatus,
     pub tip_height: u32,
-    pub finalized_slot: u64,
 }
 
 /// Picks the next step. One bundle is live at a time, and a record never
@@ -328,13 +327,7 @@ pub fn decide(view: &View) -> Action {
     match view.status {
         BundleStatus::Succeeded { height } => {
             let confirmations = u64::from(view.tip_height.saturating_sub(height)) + 1;
-            let ripe = view
-                .finalized
-                .bundle_sealed_slot
-                .saturating_add(view.finalized.bundle_min_slots);
-            if confirmations >= view.finalized.deposit_confirmations.max(1)
-                && view.finalized_slot >= ripe
-            {
+            if confirmations >= view.finalized.deposit_confirmations.max(1) {
                 Action::MarkPaid {
                     through: live.end,
                     height,
@@ -505,19 +498,11 @@ async fn pass(
     let program_id = &settings.program_id;
     let processed = read_config(rpc, program_id, CommitmentConfig::processed()).await?;
     let finalized = read_config(rpc, program_id, CommitmentConfig::finalized()).await?;
-    let finalized_slot = rpc
-        .get_slot_with_commitment(CommitmentConfig::finalized())
-        .await
-        .map_err(|source| PegError::Rpc {
-            call: "getSlot",
-            source,
-        })?;
     let mut view = View {
         processed,
         finalized,
         status: BundleStatus::Unknown,
         tip_height: 0,
-        finalized_slot,
     };
     memory.proposals.drop_paid(finalized.paid_through)?;
     let mut bundle = None;
@@ -842,7 +827,6 @@ mod tests {
             bundled_through,
             bundle_sealed_height: 50,
             bundle_sealed_slot: 1_000,
-            bundle_min_slots: 500,
             bmm_skip_blocks: 0,
             bmm_next_since_slot: 0,
             bundle_m6id: [0u8; 32],
@@ -855,7 +839,6 @@ mod tests {
             finalized,
             status,
             tip_height: 100,
-            finalized_slot: 2_000,
         }
     }
 
@@ -1471,12 +1454,10 @@ mod tests {
     }
 
     #[test]
-    fn a_young_bundle_waits_for_the_minimum_age() {
-        let config = a_config(3, 1, 3);
-        let mut view = a_view(config, config, BundleStatus::Succeeded { height: 80 });
-        view.finalized_slot = 1_499;
-        assert_eq!(decide(&view), Action::Wait);
-        view.finalized_slot = 1_500;
+    fn a_paid_bundle_needs_no_age_after_its_seal() {
+        let mut config = a_config(3, 1, 3);
+        config.bundle_sealed_slot = u64::MAX;
+        let view = a_view(config, config, BundleStatus::Succeeded { height: 80 });
         assert_eq!(
             decide(&view),
             Action::MarkPaid {
