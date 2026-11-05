@@ -22,16 +22,6 @@ pub fn min_fee_sats(waiting: u64) -> u64 {
     MIN_FEE_SATS.saturating_add(MIN_FEE_SATS.saturating_mul(waiting) / 100)
 }
 
-/// A validator drops the BMM pairs this many eCash blocks below its tip. It
-/// must match the bridge program and `PAIR_WINDOW` in the Agave patch.
-pub const PAIR_WINDOW: u64 = 4_032;
-
-/// True when the bridge skips a commitment at `height` with no pair at once.
-/// It must match `pair_too_old` of the bridge program.
-pub fn pair_too_old(height: u64, credited_height: u64) -> bool {
-    height.saturating_add(PAIR_WINDOW) < credited_height
-}
-
 /// The slots that an unpaired commitment waits after the cursor reaches it.
 /// It must match `SKIP_GRACE_SLOTS` of the bridge program.
 pub const SKIP_GRACE_SLOTS: u64 = 300;
