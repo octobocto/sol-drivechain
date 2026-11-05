@@ -673,7 +673,7 @@ step "migration: an open withdrawal, then the chain stops"
 # The peg closes the paid record once the BMM root holds its payment.
 records() {
   rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\",\"dataSlice\":{\"offset\":0,\"length\":0}}]" \
-    | python3 -c 'import json,sys; print(sum(1 for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 259))'
+    | python3 -c 'import json,sys; print(sum(1 for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 291))'
 }
 for _ in $(seq 1 60); do
   [ "$(records)" = 0 ] && break
@@ -691,7 +691,7 @@ OPEN_ADDRESS="$(new_address)"
 books_close
 OPEN_INDEX=$(( $(bridge_value "withdrawals") - 1 ))
 OPEN_RECORD="$(rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]" \
-  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 259]')"
+  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 291]')"
 [ "$(printf '%s\n' "$OPEN_RECORD" | grep -c .)" = 1 ] || fail "the chain holds these withdrawal records: $OPEN_RECORD"
 # A halted node casts no vote, so its `confirmed` stays behind. The cursor
 # reads `processed`, as the migration does.
@@ -777,7 +777,7 @@ printf '%s\n' "$CURSOR_BEFORE"
 [ "$(lamports_of "$DOWN_PUBKEY")" = "$DOWN_BEFORE" ] || fail "the second balance did not carry over"
 echo "PASS: the balances carried over: $USER_BEFORE and $DOWN_BEFORE lamports"
 NEW_RECORD="$(rpc getProgramAccounts "[\"$PROGRAM_ID\",{\"encoding\":\"base64\",\"commitment\":\"confirmed\"}]" \
-  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 259]')"
+  | python3 -c 'import json,sys; [print(a["pubkey"], a["account"]["lamports"], a["account"]["data"][0]) for a in json.load(sys.stdin)["result"] if a["account"]["space"] != 291]')"
 [ "$NEW_RECORD" = "$OPEN_RECORD" ] || fail "the open withdrawal record did not carry over"
 echo "PASS: open withdrawal $OPEN_INDEX carried over byte for byte"
 books_close

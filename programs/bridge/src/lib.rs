@@ -60,6 +60,9 @@ pub const BMM_PARAMS_ID: Pubkey = pubkey!("BmmParams1111111111111111111111111111
 /// top-level `bundle_paid`.
 pub const BMM_PAID_ID: Pubkey = pubkey!("BmmPaid111111111111111111111111111111111111");
 
+/// The `BmmPaid` data: height, block hash, M6ID, status, paid height.
+pub const BMM_PAID_LEN: usize = 8 + 32 + 32 + 1 + 8;
+
 /// The account that the patched validator builds for each tx with a
 /// top-level `credit_deposits`. It holds the deposits of one eCash block from
 /// the local enforcer.
@@ -410,10 +413,11 @@ pub mod bridge {
         )
     }
 
-    /// Puts the oldest open records into the live bundle. Only one bundle
-    /// is live at a time, and a record never leaves its bundle, so no two
+    /// Puts the open records from `paid_through` up to `through` into the
+    /// live bundle, whose blinded M6 has the ID `m6id`. Only one bundle is
+    /// live at a time, and a record never leaves its bundle, so no two
     /// bundles that eCash can pay hold the same record.
-    pub fn seal_bundle(ctx: Context<SealBundle>) -> Result<()> {
+    pub fn seal_bundle(ctx: Context<SealBundle>, through: u64, m6id: [u8; 32]) -> Result<()> {
         let config = &mut ctx.accounts.config;
         require_eq!(
             config.bundled_through,
@@ -425,12 +429,17 @@ pub mod bridge {
             config.bundled_through,
             BridgeError::NothingToSeal
         );
-        let through = config
+        let most = config
             .paid_through
             .checked_add(MAX_BUNDLE_RECORDS)
             .ok_or(BridgeError::AmountOverflow)?
             .min(config.withdrawal_count);
+        require!(
+            through > config.paid_through && through <= most,
+            BridgeError::BadBundleEnd
+        );
         config.bundled_through = through;
+        config.bundle_m6id = m6id;
         config.bundle_sealed_height = config.credited_height;
         config.bundle_sealed_slot = Clock::get()?.slot;
         msg!(
@@ -442,9 +451,16 @@ pub mod bridge {
     }
 
     /// Marks the live bundle paid. `through` must name its end, so a repeat
-    /// fails. The bundle must be at least `bundle_min_slots` old, so a stolen
-    /// oracle key closes at most one bundle in that time.
-    pub fn bundle_paid(ctx: Context<BundlePaid>, through: u64) -> Result<()> {
+    /// fails. The bundle must be at least `bundle_min_slots` old. eCash block
+    /// `block_hash` at `height` must hold a Succeeded event for `m6id`, the
+    /// M6ID of the seal.
+    pub fn bundle_paid(
+        ctx: Context<BundlePaid>,
+        through: u64,
+        height: u64,
+        block_hash: [u8; 32],
+        m6id: [u8; 32],
+    ) -> Result<()> {
         let config = &mut ctx.accounts.config;
         require_gt!(
             config.bundled_through,
@@ -461,6 +477,13 @@ pub mod bridge {
             .checked_add(config.bundle_min_slots)
             .ok_or(BridgeError::AmountOverflow)?;
         require_gte!(Clock::get()?.slot, ripe, BridgeError::BundleTooYoung);
+        let paid = BmmPaid::read(&ctx.accounts.bmm_paid)?;
+        require!(
+            paid.height == height && paid.block_hash == block_hash && paid.m6id == m6id,
+            BridgeError::PaidAnswerForAnotherQuestion
+        );
+        require!(m6id == config.bundle_m6id, BridgeError::NotTheSealedM6id);
+        require!(paid.paid, BridgeError::BundleNotPaid);
         msg!(
             "the mainchain paid records {} to {}",
             config.paid_through,
@@ -599,6 +622,43 @@ impl BmmAnswer {
             recorded: flag(data[105])?,
             credited_height: u64::from_le_bytes(data[106..114].try_into().ok()?),
             credits_active: flag(data[114])?,
+        })
+    }
+}
+
+/// The answer of the local enforcer to the first top-level `bundle_paid` of
+/// the tx.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BmmPaid {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub m6id: [u8; 32],
+    /// Block `block_hash` at `height` holds a Succeeded event for `m6id`.
+    pub paid: bool,
+    pub paid_height: u64,
+}
+
+impl BmmPaid {
+    pub fn read(account: &UncheckedAccount) -> Result<Self> {
+        let data = account.try_borrow_data()?;
+        Self::decode(&data).ok_or_else(|| error!(BridgeError::NoAnswer))
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() != BMM_PAID_LEN {
+            return None;
+        }
+        let paid = match data[72] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        Some(Self {
+            height: u64::from_le_bytes(data[..8].try_into().ok()?),
+            block_hash: data[8..40].try_into().ok()?,
+            m6id: data[40..72].try_into().ok()?,
+            paid,
+            paid_height: u64::from_le_bytes(data[73..81].try_into().ok()?),
         })
     }
 }
@@ -764,6 +824,9 @@ pub struct BundlePaid<'info> {
     #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = oracle)]
     pub config: Account<'info, Config>,
     pub oracle: Signer<'info>,
+    /// CHECK: the address fixes the account, and the validator builds its data.
+    #[account(address = BMM_PAID_ID)]
+    pub bmm_paid: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -839,6 +902,8 @@ pub struct Config {
     pub bmm_skip_blocks: u64,
     /// The slot of the newest settle, or of the genesis.
     pub bmm_next_since_slot: u64,
+    /// The M6ID of the newest sealed bundle, in the internal byte order.
+    pub bundle_m6id: [u8; 32],
 }
 
 #[account]
@@ -924,4 +989,12 @@ pub enum BridgeError {
     RecordNotPaid,
     #[msg("The config holds a bump that gives no address.")]
     BadBump,
+    #[msg("The bundle end is not above paid_through or is above the record cap or count.")]
+    BadBundleEnd,
+    #[msg("The paid answer is for another eCash height, eCash block, or M6ID.")]
+    PaidAnswerForAnotherQuestion,
+    #[msg("The M6ID is not the M6ID of the live bundle.")]
+    NotTheSealedM6id,
+    #[msg("The eCash block holds no Succeeded event for the M6ID.")]
+    BundleNotPaid,
 }

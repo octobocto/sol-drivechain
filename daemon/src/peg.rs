@@ -6,7 +6,7 @@
 
 use std::{ops::Range, time::Duration};
 
-use bitcoin::{ScriptBuf, Transaction as BitcoinTransaction, Txid};
+use bitcoin::{hashes::Hash as _, ScriptBuf, Transaction as BitcoinTransaction, Txid};
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -288,7 +288,7 @@ pub enum Action {
     Wait,
     Seal,
     Propose,
-    MarkPaid { through: u64 },
+    MarkPaid { through: u64, height: u32 },
 }
 
 /// What one pass of the peg sees.
@@ -330,7 +330,10 @@ pub fn decide(view: &View) -> Action {
             if confirmations >= view.finalized.deposit_confirmations.max(1)
                 && view.finalized_slot >= ripe
             {
-                Action::MarkPaid { through: live.end }
+                Action::MarkPaid {
+                    through: live.end,
+                    height,
+                }
             } else {
                 Action::Wait
             }
@@ -527,7 +530,7 @@ async fn pass(
         memory.scan = Some(scan);
         view.status = scan.status;
         view.tip_height = tip.1;
-        bundle = Some((blinded, m6id, live));
+        bundle = Some((blinded, m6id, live, tip));
     }
 
     match decide(&view) {
@@ -538,10 +541,13 @@ async fn pass(
                 .saturating_add(bridge::MAX_BUNDLE_RECORDS)
                 .min(processed.withdrawal_count);
             check_overlap(enforcer, &memory.proposals, start..end, None).await?;
+            let records =
+                live_records(rpc, program_id, start..end, CommitmentConfig::processed()).await?;
+            let m6id = m6::m6id(&bundle_of(&records)?);
             send(
                 rpc,
                 oracle,
-                bridge::seal_bundle_ix(program_id, &oracle.pubkey()),
+                bridge::seal_bundle_ix(program_id, &oracle.pubkey(), end, &m6id.to_byte_array()),
             )
             .await?;
             tracing::info!(
@@ -550,7 +556,7 @@ async fn pass(
             );
         }
         Action::Propose => {
-            if let Some((blinded, m6id, live)) = bundle {
+            if let Some((blinded, m6id, live, _)) = bundle {
                 let id = m6id.to_string();
                 check_overlap(enforcer, &memory.proposals, live.clone(), Some(&id)).await?;
                 let proposal = crate::proposals::Proposal {
@@ -579,14 +585,22 @@ async fn pass(
                 );
             }
         }
-        Action::MarkPaid { through } => {
-            send(
-                rpc,
-                oracle,
-                bridge::bundle_paid_ix(program_id, &oracle.pubkey(), through),
-            )
-            .await?;
-            if let Some((_, m6id, live)) = bundle {
+        Action::MarkPaid { through, height } => {
+            if let Some((_, m6id, live, tip)) = bundle {
+                let (block_hash, _) = enforcer.block_at(tip, height).await?;
+                send(
+                    rpc,
+                    oracle,
+                    bridge::bundle_paid_ix(
+                        program_id,
+                        &oracle.pubkey(),
+                        through,
+                        u64::from(height),
+                        &block_hash.to_byte_array(),
+                        &m6id.to_byte_array(),
+                    ),
+                )
+                .await?;
                 tracing::info!(%m6id, first = live.start, end = live.end, "eCash paid the bundle");
             }
         }
@@ -719,9 +733,7 @@ async fn send_all(
 mod tests {
     use super::*;
 
-    use bitcoin::{
-        absolute::LockTime, hashes::Hash as _, transaction::Version, Amount, BlockHash, TxOut,
-    };
+    use bitcoin::{absolute::LockTime, transaction::Version, Amount, BlockHash, TxOut};
     use std::{future::Future, pin::Pin, sync::Arc};
 
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -808,6 +820,7 @@ mod tests {
             bundle_min_slots: 500,
             bmm_skip_blocks: 0,
             bmm_next_since_slot: 0,
+            bundle_m6id: [0u8; 32],
         }
     }
 
@@ -834,13 +847,16 @@ mod tests {
         Txid::from_byte_array([byte; 32])
     }
 
-    /// A Solana RPC that holds one config and one paid record, and refuses
-    /// each close tx.
+    /// A Solana RPC that holds one config and its records by address, and
+    /// refuses each close tx.
     struct Bank {
         mock: MockSender,
         config: Config,
-        record: Account,
+        program_id: Pubkey,
+        records: Vec<(Pubkey, Account)>,
         sent: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        /// The data of each seal after its discriminator.
+        sealed: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     }
 
     fn ui_account(account: &Account) -> serde_json::Value {
@@ -867,15 +883,25 @@ mod tests {
                     "value": ui_account(&Account {
                         lamports: 1_000,
                         data: self.config.encode(),
-                        owner: self.record.owner,
+                        owner: self.program_id,
                         executable: false,
                         rent_epoch: 0,
                     }),
                 })),
-                RpcRequest::GetMultipleAccounts => Ok(serde_json::json!({
-                    "context": context,
-                    "value": [ui_account(&self.record)],
-                })),
+                RpcRequest::GetMultipleAccounts => {
+                    let value: Vec<serde_json::Value> = params[0]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|key| {
+                            self.records
+                                .iter()
+                                .find(|(at, _)| at.to_string() == key.as_str().unwrap())
+                                .map_or(serde_json::Value::Null, |(_, account)| ui_account(account))
+                        })
+                        .collect();
+                    Ok(serde_json::json!({"context": context, "value": value}))
+                }
                 RpcRequest::SendTransaction => {
                     let tx = BASE64.decode(params[0].as_str().unwrap()).unwrap();
                     let holds = |name: &str| {
@@ -887,6 +913,17 @@ mod tests {
                         .find(|name| holds(name))
                         .unwrap();
                     self.sent.lock().unwrap().push(name);
+                    if name == "seal_bundle" {
+                        let discriminator = bridge::discriminator("global", name);
+                        let at = tx
+                            .windows(8)
+                            .position(|window| window == discriminator)
+                            .unwrap();
+                        self.sealed
+                            .lock()
+                            .unwrap()
+                            .push(tx[at + 8..at + 48].to_vec());
+                    }
                     if name == "close_record" {
                         return Err(ClientRpcError::ForUser(
                             "a user closed the record first".to_owned(),
@@ -924,15 +961,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_close_does_not_stop_the_seal() {
+    async fn a_failed_close_does_not_stop_the_seal_of_the_m6id_of_the_records() {
         let program_id = Pubkey::new_from_array([3u8; 32]);
         let sent = Arc::default();
+        let sealed = Arc::default();
+        let records: Vec<WithdrawalRecord> =
+            (0..3).map(|index| a_record(index, 5_000, 1)).collect();
         let rpc = RpcClient::new_sender(
             Bank {
                 mock: MockSender::new("succeeds"),
                 config: a_config(3, 1, 1),
-                record: a_record_account(program_id, &a_record(0, 5_000, 1)),
+                program_id,
+                records: records
+                    .iter()
+                    .map(|record| {
+                        (
+                            bridge::withdrawal_pda(&program_id, record.index).0,
+                            a_record_account(program_id, record),
+                        )
+                    })
+                    .collect(),
                 sent: Arc::clone(&sent),
+                sealed: Arc::clone(&sealed),
             },
             RpcClientConfig::with_commitment(CommitmentConfig::processed()),
         );
@@ -974,6 +1024,11 @@ mod tests {
             }
         ));
         assert_eq!(*sent.lock().unwrap(), ["seal_bundle", "close_record"]);
+        let m6id = m6::m6id(&bundle_of(&records[1..]).unwrap());
+        assert_eq!(
+            *sealed.lock().unwrap(),
+            [[&3u64.to_le_bytes()[..], &m6id.to_byte_array()].concat()]
+        );
     }
 
     #[test]
@@ -1154,7 +1209,13 @@ mod tests {
         view.tip_height = 31;
         assert_eq!(decide(&view), Action::Wait);
         view.tip_height = 35;
-        assert_eq!(decide(&view), Action::MarkPaid { through: 3 });
+        assert_eq!(
+            decide(&view),
+            Action::MarkPaid {
+                through: 3,
+                height: 30
+            }
+        );
     }
 
     #[test]
@@ -1262,7 +1323,13 @@ mod tests {
         let mut view = a_view(config, config, BundleStatus::Succeeded { height: 96 });
         assert_eq!(decide(&view), Action::Wait, "five confirmations");
         view.tip_height = 101;
-        assert_eq!(decide(&view), Action::MarkPaid { through: 3 });
+        assert_eq!(
+            decide(&view),
+            Action::MarkPaid {
+                through: 3,
+                height: 96
+            }
+        );
         // A reorg that drops the payment takes the status back.
         view.status = BundleStatus::Submitted { height: 60 };
         assert_eq!(decide(&view), Action::Propose);
@@ -1282,7 +1349,13 @@ mod tests {
         view.finalized_slot = 1_499;
         assert_eq!(decide(&view), Action::Wait);
         view.finalized_slot = 1_500;
-        assert_eq!(decide(&view), Action::MarkPaid { through: 3 });
+        assert_eq!(
+            decide(&view),
+            Action::MarkPaid {
+                through: 3,
+                height: 80
+            }
+        );
     }
 
     #[test]

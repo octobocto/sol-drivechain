@@ -168,8 +168,9 @@ as eCash pays it.
    script must be a byte-exact P2PKH, P2SH, P2WPKH, P2WSH, or P2TR template.
    The enforcer reads any other output as a treasury or a deposit, and then
    it refuses the whole M6.
-2. When no bundle is live, the oracle sends `seal_bundle`. The live bundle is
-   the records from `paid_through` to `bundled_through`, at most 1500. One
+2. When no bundle is live, the oracle sends `seal_bundle(through, M6ID)`. The
+   live bundle is the records from `paid_through` to `bundled_through`, at
+   most 1500, and the bridge keeps the M6ID of their blinded M6. One
    bundle is live at a time, and a record never leaves its bundle, so no two
    bundles that eCash can pay hold the same record.
 3. After the seal is `finalized`, the daemon builds the blinded M6 from the
@@ -178,8 +179,11 @@ as eCash pays it.
    The daemon sets the bundle policy to `KNOWN`.
 4. Each pass reads the history of the active eCash chain from the seal. A
    failed bundle goes back to the enforcer unchanged. When eCash paid the
-   bundle D blocks deep, the oracle sends `bundle_paid`, and the daemon then
-   closes each paid record with `close_record`, which anyone can send.
+   bundle D blocks deep, the oracle sends `bundle_paid(through, H, M, M6ID)`
+   with the block M at height H of the Succeeded event. The bridge takes it
+   only for the M6ID of the seal and only when the paid check of the bank
+   passes. The daemon then closes each paid record with `close_record`, which
+   anyone can send.
 
 No pass trusts an event stream or memory, so a restart, a lost event, an RPC
 error, or an eCash reorg leaves no paid record open. The daemon writes each
@@ -762,7 +766,8 @@ needs a new genesis. `scripts/migrate-genesis.sh` carries the money over:
 The new chain credits only the deposits after the cursor. No deposit replay
 occurs, so no coin gets credited two times. BMM on the new chain settles from
 the eCash tip at the migration. The export takes only a config of the current
-layout, and it refuses any other.
+layout or of the layout before `bundle_m6id`, and it refuses any other. With
+a live bundle, it writes the M6ID of the carried records.
 
 The export reads the accounts of every program that a loader holds, so no
 user can stop it. An account whose owner is no program keeps lamports that
