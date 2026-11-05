@@ -11,11 +11,10 @@ use anchor_lang::{
 };
 use litesvm::LiteSVM;
 use sol_drivechain_bridge::{
-    accounts, commitment_of, instruction, min_fee_sats, AnsweredDeposit, BmmAnswer, BmmPaid,
-    Config, DepositAnswer, WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, BMM_PAID_ID,
-    BMM_PAID_LEN, DEPOSIT_ANSWER_ENTRY_LEN, DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID,
-    LAMPORTS_PER_SAT, MAX_BUNDLE_RECORDS, MAX_SCRIPT_PUBKEY_LEN, MIN_FEE_SATS, PAIR_WINDOW,
-    SKIP_GRACE_SLOTS,
+    accounts, commitment_of, instruction, AnsweredDeposit, BmmAnswer, BmmPaid, Config,
+    DepositAnswer, WithdrawalRecord, BMM_ANSWER_ID, BMM_ANSWER_LEN, BMM_PAID_ID, BMM_PAID_LEN,
+    DEPOSIT_ANSWER_ENTRY_LEN, DEPOSIT_ANSWER_HEAD_LEN, DEPOSIT_ANSWER_ID, LAMPORTS_PER_SAT,
+    MAX_BUNDLE_RECORDS, MAX_SCRIPT_PUBKEY_LEN, MIN_FEE_SATS, SKIP_GRACE_SLOTS,
 };
 use solana_account::Account;
 use solana_instruction::Instruction;
@@ -63,12 +62,11 @@ struct Chain {
 
 impl Chain {
     fn start() -> Self {
-        Self::start_with(0, 0)
+        Self::start_with(0)
     }
 
-    /// A chain whose genesis holds `float_lamports` of float and asks for
-    /// `bundle_min_slots` between a seal and its payment.
-    fn start_with(float_lamports: u64, bundle_min_slots: u64) -> Self {
+    /// A chain whose genesis holds `float_lamports` of float.
+    fn start_with(float_lamports: u64) -> Self {
         let program_id = sol_drivechain_bridge::ID;
         let config = Pubkey::find_program_address(&[b"config"], &program_id).0;
         let vault = Pubkey::find_program_address(&[b"vault"], &program_id).0;
@@ -105,10 +103,10 @@ impl Chain {
         )
         .unwrap();
 
-        let mut config_data = genesis_config(oracle.pubkey(), float_lamports, bundle_min_slots);
+        let mut config_data = genesis_config(oracle.pubkey(), float_lamports);
         // The cursor of the genesis moved at the first slot of the chain.
         let start_slot = svm.get_sysvar::<anchor_lang::prelude::Clock>().slot;
-        config_data[251..259].copy_from_slice(&start_slot.to_le_bytes());
+        config_data[243..251].copy_from_slice(&start_slot.to_le_bytes());
         let config_lamports = svm.minimum_balance_for_rent_exemption(config_data.len());
         svm.set_account(
             config,
@@ -593,12 +591,6 @@ impl Chain {
         self.svm.set_account(self.config, account).unwrap();
     }
 
-    fn set_skip_blocks(&mut self, blocks: u64) {
-        let mut account = self.svm.get_account(&self.config).unwrap();
-        account.data[243..251].copy_from_slice(&blocks.to_le_bytes());
-        self.svm.set_account(self.config, account).unwrap();
-    }
-
     fn record_key(&self, index: u64) -> Pubkey {
         Pubkey::find_program_address(&[b"withdrawal", &index.to_le_bytes()], &self.program_id).0
     }
@@ -672,7 +664,7 @@ fn nowhere(sequence_number: u64, value_sats: u64) -> AnsweredDeposit {
 }
 
 /// The config account that the genesis writes, in the Anchor layout.
-fn genesis_config(oracle: Pubkey, float_lamports: u64, bundle_min_slots: u64) -> Vec<u8> {
+fn genesis_config(oracle: Pubkey, float_lamports: u64) -> Vec<u8> {
     let program_id = sol_drivechain_bridge::ID;
     let bump = |seed: &[u8]| Pubkey::find_program_address(&[seed], &program_id).1;
     let config = Config {
@@ -698,7 +690,6 @@ fn genesis_config(oracle: Pubkey, float_lamports: u64, bundle_min_slots: u64) ->
         bundled_through: 0,
         bundle_sealed_height: 0,
         bundle_sealed_slot: 0,
-        bundle_min_slots,
         bmm_skip_blocks: BMM_SKIP_BLOCKS,
         bmm_next_since_slot: 0,
         bundle_m6id: [0; 32],
@@ -812,9 +803,9 @@ fn the_commitment_is_sha256_of_the_solana_block_then_the_payee() {
 fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
     // The daemon writes the genesis config by hand at these offsets.
     let oracle = Pubkey::new_from_array([5u8; 32]);
-    let data = genesis_config(oracle, 7, 9);
+    let data = genesis_config(oracle, 7);
     let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-    assert_eq!(data.len(), 291);
+    assert_eq!(data.len(), 283);
     assert_eq!(&data[..8], Config::DISCRIMINATOR);
     assert_eq!(&data[8..40], oracle.as_ref());
     assert_eq!(at(64), BMM_START);
@@ -829,10 +820,9 @@ fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
     );
     assert_eq!(at(187), VAULT_LAMPORTS);
     assert_eq!(at(195), 7);
-    assert_eq!(at(235), 9);
-    assert_eq!(at(243), BMM_SKIP_BLOCKS);
-    assert_eq!(at(251), 0);
-    assert_eq!(data[259..291], [0; 32]);
+    assert_eq!(at(235), BMM_SKIP_BLOCKS);
+    assert_eq!(at(243), 0);
+    assert_eq!(data[251..283], [0; 32]);
 }
 
 #[test]
@@ -1419,7 +1409,7 @@ fn check_treasury_script(opcode: u8) {
         .expect("the deposit passes");
     for slot in 0..=u8::MAX {
         let index = u64::from(slot);
-        let fee_sats = min_fee_sats(index);
+        let fee_sats = MIN_FEE_SATS;
         let lamports = (fee_sats + 600) * LAMPORTS_PER_SAT;
         let config = chain.svm.get_account(&chain.config).unwrap();
         let vault = chain.svm.get_account(&chain.vault).unwrap();
@@ -1482,7 +1472,7 @@ fn each_standard_template_passes() {
     for script in standard_scripts() {
         assert!(sol_drivechain_bridge::is_standard_script(&script));
         let index = chain.config().withdrawal_count;
-        let fee_sats = min_fee_sats(index);
+        let fee_sats = MIN_FEE_SATS;
         let lamports = (fee_sats + 600) * LAMPORTS_PER_SAT;
         chain
             .withdraw(index, lamports, fee_sats, &script)
@@ -1637,7 +1627,7 @@ fn a_bundle_holds_at_most_the_record_cap() {
     let mut chain = Chain::start();
     chain.deposit(0, 100_000_000).expect("the deposit lands");
     for index in 0..=MAX_BUNDLE_RECORDS {
-        let fee_sats = min_fee_sats(index);
+        let fee_sats = MIN_FEE_SATS;
         let each = (fee_sats + 600) * LAMPORTS_PER_SAT;
         chain
             .withdraw(index, each, fee_sats, &A_P2WPKH)
@@ -1653,20 +1643,21 @@ fn a_bundle_holds_at_most_the_record_cap() {
 }
 
 #[test]
-fn a_bundle_younger_than_the_minimum_cannot_be_marked_paid() {
-    let mut chain = Chain::start_with(0, 1_000);
+fn a_paid_bundle_is_marked_paid_in_the_slot_of_its_seal() {
+    let mut chain = Chain::start();
     chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
     chain
         .withdraw(0, 5_000_000, 1_000, &A_P2WPKH)
         .expect("the withdrawal lands");
     chain.seal().expect("the bundle seals");
     let sealed = chain.config().bundle_sealed_slot;
-    chain.svm.warp_to_slot(sealed + 999);
-    assert!(chain.bundle_paid(1).is_err());
-    chain.svm.warp_to_slot(sealed + 1_000);
     chain
         .bundle_paid(1)
-        .expect("the bundle pays at the minimum age");
+        .expect("the paid proof alone marks the bundle paid");
+    assert_eq!(
+        chain.svm.get_sysvar::<anchor_lang::prelude::Clock>().slot,
+        sealed
+    );
 }
 
 #[test]
@@ -1686,7 +1677,7 @@ fn a_seal_ends_above_paid_through_and_within_the_cap_and_the_count() {
     chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
     for index in 0..2 {
         chain
-            .withdraw(index, 2_000_000, min_fee_sats(index), &A_P2WPKH)
+            .withdraw(index, 2_000_000, MIN_FEE_SATS, &A_P2WPKH)
             .expect("the withdrawal lands");
     }
     assert!(chain.seal_through(0).is_err());
@@ -1705,7 +1696,7 @@ fn a_seal_above_the_record_cap_fails() {
     let mut chain = Chain::start();
     chain.deposit(0, 100_000_000).expect("the deposit lands");
     for index in 0..=MAX_BUNDLE_RECORDS {
-        let fee_sats = min_fee_sats(index);
+        let fee_sats = MIN_FEE_SATS;
         let each = (fee_sats + 600) * LAMPORTS_PER_SAT;
         chain
             .withdraw(index, each, fee_sats, &A_P2WPKH)
@@ -1805,7 +1796,7 @@ fn a_fee_below_the_minimum_fails() {
 #[test]
 fn the_float_cannot_peg_out_before_gifts_back_it() {
     let float = 3_000_000;
-    let mut chain = Chain::start_with(float, 0);
+    let mut chain = Chain::start_with(float);
     chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
     assert!(chain.withdraw(0, 5_000_000, 1_000, &A_P2WPKH).is_err());
     chain.gift_vault(float - 1);
@@ -2017,23 +2008,27 @@ fn an_unpaired_commitment_skips_only_after_the_grace_slots() {
 }
 
 #[test]
-fn a_cursor_below_the_pair_window_skips_each_height_at_once() {
+fn a_cursor_far_below_the_credits_still_waits_for_the_grace_slots() {
     let mut chain = Chain::start();
     let withheld = chain.a_stranger().pubkey();
     let anyone = chain.a_stranger().pubkey();
     chain.pay_fees(1_000_000);
-    chain.set_credited_height(BMM_START + 2 + PAIR_WINDOW);
-    chain.set_skip_blocks(2 * PAIR_WINDOW);
-    for height in [BMM_START, BMM_START + 1] {
-        chain.win(height, withheld);
-        chain
-            .settle(height, anyone)
-            .expect("a height below the pair window moves on at once");
-        assert_eq!(chain.config().bmm_next_height, height + 1);
-    }
-    chain.win(BMM_START + 2, withheld);
-    assert!(chain.settle(BMM_START + 2, anyone).is_err());
-    assert_eq!(chain.config().bmm_next_height, BMM_START + 2);
+    chain.set_credited_height(BMM_START + 10 * BMM_SKIP_BLOCKS);
+    let since = chain.config().bmm_next_since_slot;
+    chain.win(BMM_START, withheld);
+    chain.svm.warp_to_slot(since + SKIP_GRACE_SLOTS - 1);
+    assert!(chain.settle(BMM_START, anyone).is_err());
+    assert_eq!(chain.config().bmm_next_height, BMM_START);
+    chain.svm.warp_to_slot(since + SKIP_GRACE_SLOTS);
+    chain
+        .settle(BMM_START, anyone)
+        .expect("the skip lands after the grace slots");
+    assert_eq!(chain.config().bmm_next_height, BMM_START + 1);
+    chain.win(BMM_START + 1, withheld);
+    assert!(
+        chain.settle(BMM_START + 1, anyone).is_err(),
+        "each skip starts a new grace"
+    );
     assert_eq!(chain.balance(&chain.treasury), TREASURY_RESERVE + 1_000_000);
 }
 
@@ -2355,33 +2350,16 @@ fn a_full_part_of_new_targets_fits_the_credit_compute_limit() {
 }
 
 #[test]
-fn the_fee_rises_with_the_records_that_wait_for_a_seal() {
-    assert_eq!(min_fee_sats(0), 1_000);
-    assert_eq!(min_fee_sats(1), 1_010);
-    assert_eq!(min_fee_sats(100), 2_000);
-    assert_eq!(min_fee_sats(1_499), 15_990);
-    assert_eq!(min_fee_sats(u64::MAX), 1_000 + u64::MAX / 100);
+fn the_fee_stays_flat_while_records_wait_for_a_seal() {
     let mut chain = Chain::start();
     chain.deposit(0, 10_000_000).expect("the deposit lands");
-    for index in 0..100 {
-        let fee_sats = min_fee_sats(index);
-        chain
-            .withdraw(
-                index,
-                (fee_sats + 600) * LAMPORTS_PER_SAT,
-                fee_sats,
-                &A_P2WPKH,
-            )
-            .expect("a withdrawal at the quoted fee lands");
-    }
-    let lamports = (2_000 + 600) * LAMPORTS_PER_SAT;
-    assert!(chain.withdraw(100, lamports, 1_999, &A_P2WPKH).is_err());
-    chain
-        .withdraw(100, lamports, 2_000, &A_P2WPKH)
-        .expect("the fee of 100 waiting records lands");
-    chain.seal().expect("the bundle seals");
     let lamports = (MIN_FEE_SATS + 600) * LAMPORTS_PER_SAT;
-    chain
-        .withdraw(101, lamports, MIN_FEE_SATS, &A_P2WPKH)
-        .expect("a seal takes the price back down");
+    for index in 0..=100 {
+        chain
+            .withdraw(index, lamports, MIN_FEE_SATS, &A_P2WPKH)
+            .expect("a withdrawal at the flat fee lands");
+    }
+    assert!(chain
+        .withdraw(101, lamports, MIN_FEE_SATS - 1, &A_P2WPKH)
+        .is_err());
 }

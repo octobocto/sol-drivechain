@@ -16,26 +16,9 @@ pub const MIN_PAYOUT_SATS: u64 = 546;
 /// its output at more than 20 sat/vB, so a flood of records costs real money.
 pub const MIN_FEE_SATS: u64 = 1_000;
 
-/// The lowest mainchain fee while `waiting` records wait for a seal:
-/// `MIN_FEE_SATS × (1 + waiting / 100)`. A flood of records then costs more
-/// with each record.
-pub fn min_fee_sats(waiting: u64) -> u64 {
-    MIN_FEE_SATS.saturating_add(MIN_FEE_SATS.saturating_mul(waiting) / 100)
-}
-
 /// The most records in one bundle. Each payout output is at most 43 bytes,
 /// so a bundle stays near 260,000 weight units, below the standard 400,000.
 pub const MAX_BUNDLE_RECORDS: u64 = 1_500;
-
-/// A validator drops the BMM pairs this many eCash blocks below its tip
-/// (`PAIR_WINDOW` in the Agave patch).
-pub const PAIR_WINDOW: u64 = 4_032;
-
-/// True when no validator still holds a pair for eCash height `height`. The
-/// eCash tip is at least `credited_height`.
-pub fn pair_too_old(height: u64, credited_height: u64) -> bool {
-    height.saturating_add(PAIR_WINDOW) < credited_height
-}
 
 /// The slots, about 2 minutes, that an unpaired commitment waits after the cursor reaches it.
 pub const SKIP_GRACE_SLOTS: u64 = 300;
@@ -144,8 +127,7 @@ pub mod bridge {
     /// commitment, or a checkpoint that its own pair proves invalid, moves
     /// the cursor with no payout. A commitment that no pair matches moves it
     /// only when the credits reach `bmm_skip_blocks` above its height and
-    /// `SKIP_GRACE_SLOTS` passed since the cursor reached it, or at once when
-    /// its height is below the pair window.
+    /// `SKIP_GRACE_SLOTS` passed since the cursor reached it.
     pub fn settle_bmm(
         ctx: Context<SettleBmm>,
         height: u64,
@@ -186,21 +168,17 @@ pub mod bridge {
             }
             Some(_) => {
                 let config = &ctx.accounts.config;
-                if pair_too_old(height, config.credited_height) {
-                    msg!("eCash height {} is below the pair window", height);
-                } else {
-                    require_gte!(
-                        config.credited_height,
-                        height.saturating_add(config.bmm_skip_blocks),
-                        BridgeError::PairDoesNotMatch
-                    );
-                    require_gte!(
-                        slot,
-                        config.bmm_next_since_slot.saturating_add(SKIP_GRACE_SLOTS),
-                        BridgeError::PairDoesNotMatch
-                    );
-                    msg!("eCash height {} waited too long for its pair", height);
-                }
+                require_gte!(
+                    config.credited_height,
+                    height.saturating_add(config.bmm_skip_blocks),
+                    BridgeError::PairDoesNotMatch
+                );
+                require_gte!(
+                    slot,
+                    config.bmm_next_since_slot.saturating_add(SKIP_GRACE_SLOTS),
+                    BridgeError::PairDoesNotMatch
+                );
+                msg!("eCash height {} waited too long for its pair", height);
                 false
             }
         };
@@ -376,11 +354,8 @@ pub mod bridge {
             .checked_sub(fee_sats)
             .ok_or(BridgeError::FeeAboveAmount)?;
         require!(payout_sats >= MIN_PAYOUT_SATS, BridgeError::PayoutIsDust);
+        require_gte!(fee_sats, MIN_FEE_SATS, BridgeError::FeeTooLow);
         let config = &mut ctx.accounts.config;
-        let waiting = config
-            .withdrawal_count
-            .saturating_sub(config.bundled_through);
-        require_gte!(fee_sats, min_fee_sats(waiting), BridgeError::FeeTooLow);
         // The genesis float circulates beside the pegged lamports, so no
         // lamport pegs out until gifts to the vault back the whole float.
         let backed = ctx
@@ -460,9 +435,8 @@ pub mod bridge {
     }
 
     /// Marks the live bundle paid. `through` must name its end, so a repeat
-    /// fails. The bundle must be at least `bundle_min_slots` old. eCash block
-    /// `block_hash` at `height` must hold a Succeeded event for `m6id`, the
-    /// M6ID of the seal.
+    /// fails. eCash block `block_hash` at `height` must hold a Succeeded
+    /// event for `m6id`, the M6ID of the seal.
     pub fn bundle_paid(
         ctx: Context<BundlePaid>,
         through: u64,
@@ -481,11 +455,6 @@ pub mod bridge {
             config.bundled_through,
             BridgeError::NotTheLiveBundle
         );
-        let ripe = config
-            .bundle_sealed_slot
-            .checked_add(config.bundle_min_slots)
-            .ok_or(BridgeError::AmountOverflow)?;
-        require_gte!(Clock::get()?.slot, ripe, BridgeError::BundleTooYoung);
         let paid = BmmPaid::read(&ctx.accounts.bmm_paid)?;
         require!(
             paid.height == height && paid.block_hash == block_hash && paid.m6id == m6id,
@@ -904,8 +873,6 @@ pub struct Config {
     pub bundle_sealed_height: u64,
     /// The slot that sealed the live bundle.
     pub bundle_sealed_slot: u64,
-    /// The fewest slots between a seal and its `bundle_paid`.
-    pub bundle_min_slots: u64,
     /// A commitment at eCash height H that no pair matches can settle with no
     /// payout once `credited_height` reaches H + `bmm_skip_blocks`.
     pub bmm_skip_blocks: u64,
@@ -980,7 +947,7 @@ pub enum BridgeError {
     CreditsDropped,
     #[msg("The tx sends a BMM payee read-only.")]
     PayeeNotWritable,
-    #[msg("The mainchain fee is below the minimum for the records that wait.")]
+    #[msg("The mainchain fee is below the minimum.")]
     FeeTooLow,
     #[msg("Gifts to the vault do not yet back the genesis float.")]
     FloatNotBacked,
@@ -992,8 +959,6 @@ pub enum BridgeError {
     NoLiveBundle,
     #[msg("The bundle is not the live bundle.")]
     NotTheLiveBundle,
-    #[msg("The live bundle is younger than the minimum.")]
-    BundleTooYoung,
     #[msg("The record is not paid.")]
     RecordNotPaid,
     #[msg("The config holds a bump that gives no address.")]
