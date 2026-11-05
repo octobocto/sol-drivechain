@@ -238,7 +238,7 @@ mod tests {
             bundle_sealed_height: 0,
             bundle_sealed_slot: 0,
             bundle_min_slots: 0,
-            bmm_skip_slots: 0,
+            bmm_skip_blocks: 0,
             bmm_next_since_slot: 0,
         }
     }

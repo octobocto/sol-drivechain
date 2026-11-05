@@ -31,8 +31,9 @@ pub struct Params {
     pub float_lamports: u64,
     /// The fewest slots between a bundle seal and its `bundle_paid`.
     pub bundle_min_slots: u64,
-    /// The slots that a commitment without a pair blocks the BMM cursor.
-    pub bmm_skip_slots: u64,
+    /// The eCash blocks that the credits must pass above a commitment without
+    /// a pair before the BMM cursor skips it.
+    pub bmm_skip_blocks: u64,
     pub lamports_per_byte_year: u64,
     /// The eCash tip when the chain starts. BMM settles from this height,
     /// and a new chain counts the deposits up to it as credited.
@@ -206,7 +207,7 @@ pub fn accounts(
         bundle_sealed_height: 0,
         bundle_sealed_slot: 0,
         bundle_min_slots: params.bundle_min_slots,
-        bmm_skip_slots: params.bmm_skip_slots,
+        bmm_skip_blocks: params.bmm_skip_blocks,
         bmm_next_since_slot: 0,
     };
     let mut accounts: BTreeMap<Pubkey, Account> = BTreeMap::new();
@@ -666,7 +667,7 @@ mod tests {
             oracle_lamports: 1_000_000,
             float_lamports: 120_000,
             bundle_min_slots: 4_000,
-            bmm_skip_slots: 9_000,
+            bmm_skip_blocks: 6,
             lamports_per_byte_year: 4,
             ecash_start_height: 500,
             deposit_confirmations: 6,

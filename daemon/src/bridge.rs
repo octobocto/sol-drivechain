@@ -192,7 +192,7 @@ pub struct Config {
     pub bundle_sealed_height: u64,
     pub bundle_sealed_slot: u64,
     pub bundle_min_slots: u64,
-    pub bmm_skip_slots: u64,
+    pub bmm_skip_blocks: u64,
     pub bmm_next_since_slot: u64,
 }
 
@@ -253,7 +253,7 @@ impl Config {
             self.bundle_sealed_height,
             self.bundle_sealed_slot,
             self.bundle_min_slots,
-            self.bmm_skip_slots,
+            self.bmm_skip_blocks,
             self.bmm_next_since_slot,
         ] {
             data.extend_from_slice(&value.to_le_bytes());
@@ -300,7 +300,7 @@ impl Config {
             bundle_sealed_height: reader.u64().ok_or_else(|| cut("bundle_sealed_height"))?,
             bundle_sealed_slot: reader.u64().ok_or_else(|| cut("bundle_sealed_slot"))?,
             bundle_min_slots: reader.u64().ok_or_else(|| cut("bundle_min_slots"))?,
-            bmm_skip_slots: reader.u64().ok_or_else(|| cut("bmm_skip_slots"))?,
+            bmm_skip_blocks: reader.u64().ok_or_else(|| cut("bmm_skip_blocks"))?,
             bmm_next_since_slot: reader.u64().ok_or_else(|| cut("bmm_next_since_slot"))?,
         })
     }
@@ -629,7 +629,7 @@ mod tests {
             bundle_sealed_height: 990,
             bundle_sealed_slot: 77,
             bundle_min_slots: 1_000,
-            bmm_skip_slots: 9_000,
+            bmm_skip_blocks: 6,
             bmm_next_since_slot: 600,
         }
     }
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(at(219), 990);
         assert_eq!(at(227), 77);
         assert_eq!(at(235), 1_000);
-        assert_eq!(at(243), 9_000);
+        assert_eq!(at(243), 6);
         assert_eq!(at(251), 600);
     }
 

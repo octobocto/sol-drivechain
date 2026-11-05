@@ -133,7 +133,7 @@ BMM_START="$(btc getblockcount)"
 NETWORK=regtest LEDGER="$ROOT/ledger" KEYS="$ROOT/keys" ECASH_START_HEIGHT="$BMM_START" \
   DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 \
   ORACLE_LAMPORTS=2000000 BOOTSTRAP_LAMPORTS=2000000 \
-  BMM_SKIP_SLOTS=25 \
+  BMM_SKIP_BLOCKS=2 \
   SIDECHAIN_SLOT="$SLOT" BMM_CONFIRMATIONS="$BMM_CONFIRMATIONS" \
   bash "$REPO/genesis/build-genesis.sh" > "$ROOT/genesis.log"
 # A copy of the fresh ledger lets a second validator replay from the genesis,
@@ -740,7 +740,7 @@ grep -q "takes the answer of its first run" "$ROOT/validator-halted.log" \
 echo "PASS: the halted node replayed from the genesis through the settles of the dropped eCash blocks"
 OLD_RPC="$SOLANA_URL" LEDGER="$ROOT/ledger-new" KEYS="$ROOT/keys" STATE="$ROOT/state.json" \
   ENFORCER_URL="$ENFORCER_URL" SIDECHAIN_SLOT="$SLOT" NETWORK=regtest DAEMON="$D" \
-  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 BMM_SKIP_SLOTS=25 \
+  DEPOSIT_CONFIRMATIONS="$DEPOSIT_CONFIRMATIONS" BUNDLE_MIN_SLOTS=0 BMM_SKIP_BLOCKS=2 \
   bash "$REPO/scripts/migrate-genesis.sh" | tee "$ROOT/migrate.log"
 kill "$HALTED_PID"
 wait "$HALTED_PID" 2>/dev/null || true

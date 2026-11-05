@@ -1148,8 +1148,8 @@ pub const SETTLE_WALK_PAGES: usize = 8;
 /// What the loop sends for the next height to settle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettleStep {
-    /// The height is not deep enough, or its pair is unknown and the skip
-    /// time has not passed.
+    /// The height is not deep enough, or its pair is unknown and the credits
+    /// have not passed the skip blocks.
     Wait,
     /// A settle with this Solana block and payee. An empty height or a skip
     /// takes any pair, and it pays nothing.
@@ -1197,16 +1197,16 @@ pub fn next_settle(
 }
 
 /// The settles from the cursor `next` up, at most `SETTLE_STEPS`, as each
-/// one moves the cursor by one. `skip_ready` holds for `next` alone, because
-/// each settle starts the skip time again. A height below the pair window
-/// needs no skip time. It stops at the first wait.
+/// one moves the cursor by one. A commitment without a pair can skip once
+/// `credited_height` reaches its height plus `skip_blocks`, or when it is
+/// below the pair window. It stops at the first wait.
 #[allow(clippy::too_many_arguments)]
 pub async fn plan_settles<F, Fut>(
     next: u64,
     tip_height: u64,
     confirmations: u64,
     pairs: &[Pair],
-    skip_ready: bool,
+    skip_blocks: u64,
     credited_height: u64,
     sender: Pubkey,
     mut block_at: F,
@@ -1227,7 +1227,8 @@ where
             confirmations,
             block,
             pairs,
-            (skip_ready && height == next) || bridge::pair_too_old(height, credited_height),
+            credited_height >= height.saturating_add(skip_blocks)
+                || bridge::pair_too_old(height, credited_height),
             sender,
         );
         if step == SettleStep::Wait {
@@ -1254,17 +1255,6 @@ async fn settle(
         return Ok(());
     }
     let pairs = fetch_pairs(rpc, config.bmm_next_height).await?;
-    let slot = rpc
-        .get_slot_with_commitment(CommitmentConfig::processed())
-        .await
-        .map_err(|source| BmmError::Rpc {
-            call: "getSlot",
-            source,
-        })?;
-    let skip_ready = slot
-        >= config
-            .bmm_next_since_slot
-            .saturating_add(config.bmm_skip_slots);
     let mut headers = live.cursor_headers.lock().await;
     headers
         .follow(
@@ -1279,7 +1269,7 @@ async fn settle(
         tip_height,
         settings.confirmations,
         &pairs,
-        skip_ready,
+        config.bmm_skip_blocks,
         config.credited_height,
         identity.pubkey(),
         |height| {
@@ -2167,7 +2157,7 @@ mod tests {
                 tip_height,
                 6,
                 &[won],
-                false,
+                6,
                 0,
                 sender,
                 |height| async move {
@@ -2197,20 +2187,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_plan_stops_at_a_commitment_without_a_pair() {
+    async fn a_plan_skips_each_height_without_a_pair_that_the_credits_passed() {
         let sender = Pubkey::new_from_array([8u8; 32]);
-        let plan = plan_settles(100, 200, 6, &[], true, 0, sender, |height| async move {
+        let plan = plan_settles(100, 200, 6, &[], 6, 110, sender, |height| async move {
             let hash = BlockHash::from_byte_array([height as u8; 32]);
-            Ok(Some((hash, (height >= 100).then_some([5u8; 32]))))
+            Ok(Some((hash, Some([5u8; 32]))))
         })
         .await
         .unwrap();
-        assert_eq!(plan.len(), 1, "the skip holds for the cursor alone");
-        assert_eq!(plan[0].0, 100);
+        assert_eq!(
+            plan.iter().map(|(height, _)| *height).collect::<Vec<_>>(),
+            [100, 101, 102, 103, 104],
+            "the plan stops at the first height above credited height minus the skip blocks"
+        );
+        assert!(plan.iter().all(
+            |(_, step)| matches!(step, SettleStep::Send { solana_block, .. } if *solana_block == [0u8; 32])
+        ));
     }
 
     #[tokio::test]
-    async fn a_cursor_below_the_pair_window_skips_each_height_without_the_skip_time() {
+    async fn a_cursor_below_the_pair_window_skips_each_height_without_the_skip_blocks() {
         let sender = Pubkey::new_from_array([8u8; 32]);
         let credited_height = 10_000u64;
         let tip_height = credited_height + 6;
@@ -2222,7 +2218,7 @@ mod tests {
                 tip_height,
                 6,
                 &[],
-                false,
+                u64::MAX,
                 credited_height,
                 sender,
                 |height| async move {
@@ -2256,7 +2252,7 @@ mod tests {
     }
 
     #[test]
-    fn a_commitment_without_a_pair_waits_for_the_skip_time() {
+    fn a_commitment_without_a_pair_waits_for_the_skip_blocks() {
         let sender = Pubkey::new_from_array([8u8; 32]);
         let hash = BlockHash::from_byte_array([1u8; 32]);
         let garbage = Some((hash, Some([5u8; 32])));
