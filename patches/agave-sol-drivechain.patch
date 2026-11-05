@@ -134,33 +134,10 @@ index 57ac688..6392ac8 100644
  solana-accounts-db = { workspace = true }
  solana-address-lookup-table-interface = { workspace = true }
 diff --git a/core/src/banking_stage/consumer.rs b/core/src/banking_stage/consumer.rs
-index 9c1e4e5..96459bb 100644
+index 9c1e4e5..69ffe66 100644
 --- a/core/src/banking_stage/consumer.rs
 +++ b/core/src/banking_stage/consumer.rs
-@@ -342,6 +342,22 @@ impl Consumer {
-             balance_collector,
-         } = load_and_execute_transactions_output;
- 
-+        // sol-drivechain: a settle for an eCash block that is not deep enough
-+        // yet stays in the queue, and the leader tries it again.
-+        retryable_transaction_indexes.extend(processing_results.iter().enumerate().filter_map(
-+            |(index, processing_result)| {
-+                matches!(
-+                    processing_result,
-+                    Err(TransactionError::ProgramExecutionTemporarilyRestricted { .. })
-+                )
-+                .then_some(RetryableIndex {
-+                    index,
-+                    immediately_retryable: false,
-+                })
-+            },
-+        ));
-+        retryable_transaction_indexes.sort_unstable();
-+
-         let transaction_counts = LeaderProcessedTransactionCounts {
-             processed_count: processed_counts.processed_transactions_count,
-             processed_with_successful_result_count: processed_counts
-@@ -478,12 +494,17 @@ impl Consumer {
+@@ -478,12 +478,17 @@ impl Consumer {
      ) -> Result<(), TransactionError> {
          let fee_payer = transaction.fee_payer();
          let transaction_configuration = transaction.transaction_configuration(&bank.feature_set)?;
@@ -184,7 +161,7 @@ index 9c1e4e5..96459bb 100644
          let (mut fee_payer_account, _slot) = bank
              .rc
              .accounts
-@@ -552,6 +573,66 @@ mod tests {
+@@ -552,6 +557,66 @@ mod tests {
          test_case::test_case,
      };
  
@@ -253,10 +230,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..89a0513
+index 0000000..9b2f329
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,474 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -303,8 +280,6 @@ index 0000000..89a0513
 +    choice: Choice,
 +    missing_archive_height: u64,
 +    credits: HashMap<(Slot, BankHash), Option<Credits>>,
-+    dropped: HashSet<Slot>,
-+    root_dropped: bool,
 +    rejected: HashSet<(u64, BankHash)>,
 +    ancestors: Vec<RecordedBlock>,
 +    credited_tip: u64,
@@ -373,8 +348,6 @@ index 0000000..89a0513
 +            choice: Choice::default(),
 +            missing_archive_height: 0,
 +            credits: HashMap::new(),
-+            dropped: HashSet::new(),
-+            root_dropped: false,
 +            rejected: HashSet::new(),
 +            ancestors: Vec::new(),
 +            credited_tip: 0,
@@ -476,34 +449,6 @@ index 0000000..89a0513
 +        }
 +        self.rejected
 +            .retain(|(height, _)| height.saturating_add(PAIR_WINDOW) >= tip_height);
-+        let dropped: HashSet<Slot> = self
-+            .banks
-+            .iter()
-+            .filter(|bank| deposits.get(&bank.hash) == Some(&Deposits::Dropped))
-+            .map(|bank| bank.slot)
-+            .collect();
-+        let root_dropped = self
-+            .banks
-+            .iter()
-+            .find(|bank| bank.slot == root)
-+            .is_some_and(|bank| deposits.get(&bank.hash) == Some(&Deposits::Dropped));
-+        if root_dropped && !self.root_dropped {
-+            error!(
-+                "BMM: root {root} credits deposits of an eCash block that the active chain \
-+                 dropped, so only a restart at an older anchor can leave it"
-+            );
-+        }
-+        self.root_dropped = root_dropped;
-+        if dropped != self.dropped {
-+            if let Some(lowest) = dropped.iter().min() {
-+                warn!(
-+                    "BMM: {} banks from slot {lowest} credit deposits of eCash blocks that the \
-+                     active chain dropped, so no leader builds on them",
-+                    dropped.len()
-+                );
-+            }
-+            self.dropped = dropped;
-+        }
 +        self.absent = screened.absent;
 +        self.checkpoints = screened.counted;
 +        self.tip_height = tip_height;
@@ -576,33 +521,17 @@ index 0000000..89a0513
 +        self.choice.fallback
 +    }
 +
-+    /// The bank to build on and vote on, when it is not `stock`: the heaviest
-+    /// bank under the BMM head, or `stock` when no checkpoint is above the
-+    /// root. Neither may hold credits of a dropped eCash block, so a leader
-+    /// builds beside such a bank.
++    /// The bank to build on and vote on: the heaviest bank under the BMM
++    /// head. `None` when no checkpoint is above the root.
 +    pub(crate) fn heaviest(
 +        &self,
 +        fork_choice: &HeaviestSubtreeForkChoice,
 +        bank_forks: &RwLock<BankForks>,
-+        stock: &Bank,
 +    ) -> Option<Arc<Bank>> {
 +        let bank_forks = bank_forks.read().unwrap();
-+        let head = match self.choice.head {
-+            Some(head) => Some(bank_forks.get(head)?),
-+            None => None,
-+        };
-+        let candidate = match &head {
-+            Some(head) => fork_choice.best_slot(&(head.slot(), head.hash()))?.0,
-+            None => stock.slot(),
-+        };
-+        let root = bank_forks.root();
-+        let slot = (!self.root_dropped)
-+            .then(|| fork_choice::avoid_dropped(root, &self.banks, &self.dropped, candidate))
-+            .flatten()
-+            .unwrap_or(candidate);
-+        (head.is_some() || slot != stock.slot())
-+            .then(|| bank_forks.get(slot))
-+            .flatten()
++        let head = bank_forks.get(self.choice.head?)?;
++        let slot = fork_choice.best_slot(&(head.slot(), head.hash()))?.0;
++        bank_forks.get(slot)
 +    }
 +
 +    /// The anchor that the root must move to. It writes the new anchors to
@@ -650,20 +579,7 @@ index 0000000..89a0513
 +            &self.ancestors,
 +            self.credited_tip,
 +            fork_choice::params(),
-+        )
-+        .or_else(|| {
-+            self.root_dropped
-+                .then(|| {
-+                    fork_choice::restart_for_dropped_root(
-+                        root,
-+                        &self.checkpoints,
-+                        &self.saved,
-+                        &self.ancestors,
-+                        self.tip_height,
-+                    )
-+                })
-+                .flatten()
-+        });
++        );
 +        let Some(restart) = restart else {
 +            return Ok(None);
 +        };
@@ -770,8 +686,6 @@ index 0000000..89a0513
 +            choice,
 +            missing_archive_height: 0,
 +            credits: HashMap::new(),
-+            dropped: HashSet::new(),
-+            root_dropped: false,
 +            rejected: HashSet::new(),
 +            ancestors: Vec::new(),
 +            credited_tip: 0,
@@ -892,7 +806,7 @@ index 5180157..7eafc97 100644
  pub mod cluster_slots_service;
  pub mod commitment_service;
 diff --git a/core/src/replay_stage.rs b/core/src/replay_stage.rs
-index c5a5f4d..65a3936 100644
+index c5a5f4d..7a8761b 100644
 --- a/core/src/replay_stage.rs
 +++ b/core/src/replay_stage.rs
 @@ -4,6 +4,7 @@ use {
@@ -922,7 +836,7 @@ index c5a5f4d..65a3936 100644
              // Thread pool to (maybe) replay multiple threads in parallel
              let replay_mode = if replay_forks_threads.get() == 1 {
                  ForkReplayMode::Serial
-@@ -1255,9 +1268,40 @@ impl ReplayStage {
+@@ -1255,9 +1268,37 @@ impl ReplayStage {
                      compute_slot_stats_time.stop();
  
                      let mut select_forks_time = Measure::start("select_forks_time");
@@ -932,11 +846,8 @@ index c5a5f4d..65a3936 100644
                          .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
 +                    if let Some(bmm) = bmm_choice.as_mut() {
 +                        bmm.update(forks_root, &frozen_banks);
-+                        let bmm_heaviest = bmm.heaviest(
-+                            &tbft_structs.heaviest_subtree_fork_choice,
-+                            &bank_forks,
-+                            &heaviest_bank,
-+                        );
++                        let bmm_heaviest =
++                            bmm.heaviest(&tbft_structs.heaviest_subtree_fork_choice, &bank_forks);
 +                        if let Some(bmm_heaviest) = &bmm_heaviest
 +                            && bmm_heaviest.slot() != heaviest_bank.slot()
 +                        {
@@ -964,7 +875,7 @@ index c5a5f4d..65a3936 100644
                      select_forks_time.stop();
  
                      let mut select_vote_and_reset_forks_time =
-@@ -1276,6 +1320,9 @@ impl ReplayStage {
+@@ -1276,6 +1317,9 @@ impl ReplayStage {
                          &latest_validator_votes_for_frozen_banks,
                          &tbft_structs.heaviest_subtree_fork_choice,
                      );
@@ -974,7 +885,7 @@ index c5a5f4d..65a3936 100644
                      select_vote_and_reset_forks_time.stop();
  
                      if vote_bank.is_none() {
-@@ -1347,8 +1394,31 @@ impl ReplayStage {
+@@ -1347,8 +1391,31 @@ impl ReplayStage {
                              wait_to_vote_slot,
                              migration_status.as_ref(),
                              &mut tbft_structs,
@@ -1006,7 +917,7 @@ index c5a5f4d..65a3936 100644
                      voting_time.stop();
  
                      let mut reset_bank_time = Measure::start("reset_bank");
-@@ -1433,6 +1503,21 @@ impl ReplayStage {
+@@ -1433,6 +1500,21 @@ impl ReplayStage {
                                  last_reset_bank_descendants = vec![];
                              }
  
@@ -1028,7 +939,7 @@ index c5a5f4d..65a3936 100644
                              if let Some(last_voted_slot) = tower.last_voted_slot() {
                                  // If the current heaviest bank is not a descendant of the last voted slot,
                                  // there must be a partition
-@@ -2038,6 +2123,13 @@ impl ReplayStage {
+@@ -2038,6 +2120,13 @@ impl ReplayStage {
          // confirmed, what happens then? Should probably keep track of dumped list and skip things
          // in `duplicate_slots_to_repair` that have already been dumped. Add test.
          duplicate_slots_to_repair.retain(|duplicate_slot, correct_hash| {
@@ -1042,7 +953,7 @@ index c5a5f4d..65a3936 100644
              // Should not dump duplicate slots if there is currently a poh bank building
              // on top of that slot, as BankingStage might still be referencing/touching that state
              // concurrently.
-@@ -2911,7 +3003,11 @@ impl ReplayStage {
+@@ -2911,7 +3000,11 @@ impl ReplayStage {
                  ("leader", next_leader_id.to_string(), String),
              );
  
@@ -1055,7 +966,7 @@ index c5a5f4d..65a3936 100644
                  let latest_unconfirmed_leader_slot = progress_map
                      .get_latest_leader_slot_must_exist(parent_slot)
                      .expect(
-@@ -3047,16 +3143,21 @@ impl ReplayStage {
+@@ -3047,16 +3140,21 @@ impl ReplayStage {
          wait_to_vote_slot: Option<Slot>,
          migration_status: &MigrationStatus,
          tbft_structs: &mut TowerBFTStructures,
@@ -1081,7 +992,7 @@ index c5a5f4d..65a3936 100644
  
          if let Some(new_root) = new_root {
              let highest_super_majority_root = Some(
-@@ -4955,6 +5056,91 @@ impl ReplayStage {
+@@ -4955,6 +5053,91 @@ impl ReplayStage {
          duplicate_confirmed_forks
      }
  
@@ -1174,7 +1085,7 @@ index c5a5f4d..65a3936 100644
      /// A wrapper around `root_utils::check_and_handle_new_root` which:
      /// - calls into `root_utils::set_bank_forks_root`
 diff --git a/core/src/validator.rs b/core/src/validator.rs
-index 400ad25..8ecabcd 100644
+index 400ad25..1021348 100644
 --- a/core/src/validator.rs
 +++ b/core/src/validator.rs
 @@ -2159,6 +2159,18 @@ fn post_process_restored_tower(
@@ -1196,31 +1107,23 @@ index 400ad25..8ecabcd 100644
          let slot_history = root_bank
              .get_slot_history()
              .expect("slot history must exist");
-@@ -2399,6 +2411,23 @@ fn load_blockstore(
+@@ -2399,6 +2411,15 @@ fn load_blockstore(
      // following boot sequence (esp BankForks) could set root. so stash the original value
      // of blockstore root away here as soon as possible.
      let original_blockstore_root = blockstore.max_root();
-+    // sol-drivechain: each block of this ledger that this node froze before
++    // sol-drivechain: each slot of this ledger that this node froze before
 +    // takes the answer of that run, so an eCash reorg since cannot stop it.
-+    let answers = sol_drivechain_bmm::answers::answers();
-+    answers.set_replay_root(
++    sol_drivechain_bmm::answers::answers().set_replay_root(
 +        blockstore
 +            .highest_slot()
 +            .ok()
 +            .flatten()
 +            .unwrap_or(original_blockstore_root),
 +    );
-+    let ledger = Arc::downgrade(&blockstore);
-+    answers.set_frozen_hashes(move |slot| {
-+        ledger
-+            .upgrade()?
-+            .get_bank_hash(slot)
-+            .map(|hash| hash.to_bytes())
-+    });
      process_options.halt_at_slot = blockstore.highest_slot().unwrap_or(None);
  
      let enable_rpc_transaction_history =
-@@ -2588,7 +2617,10 @@ impl<'a> ProcessBlockStore<'a> {
+@@ -2588,7 +2609,10 @@ impl<'a> ProcessBlockStore<'a> {
          // Load and post process tower
          let tower = {
              let restored_tower = Tower::restore(self.config.tower_storage.as_ref(), self.id);
@@ -1581,34 +1484,15 @@ index dbc053b..ed34d7f 100644
  solana-account-decoder = { workspace = true }
  solana-accounts-db = { workspace = true }
 diff --git a/rpc/src/rpc.rs b/rpc/src/rpc.rs
-index 7bf84a0..6e24572 100644
+index 7bf84a0..13b6798 100644
 --- a/rpc/src/rpc.rs
 +++ b/rpc/src/rpc.rs
-@@ -146,6 +146,67 @@ fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
+@@ -146,6 +146,48 @@ fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
      }
  }
  
-+/// sol-drivechain: exactly the bank at the BMM final slot, or an error.
-+#[allow(clippy::result_large_err)]
-+fn bmm_final_bank(
-+    bank_forks: &BankForks,
-+    slot: Slot,
-+) -> std::result::Result<Arc<Bank>, RpcCustomError> {
-+    bank_forks
-+        .get(slot)
-+        .ok_or(RpcCustomError::BlockNotAvailable { slot })
-+}
-+
-+/// sol-drivechain: the status of `signature` at or below the slot of `bank`.
-+/// The status cache also gives the newer roots, and a BMM final bank can be
-+/// below the root.
-+fn status_at(bank: &Bank, signature: &Signature) -> Option<(Slot, transaction::Result<()>)> {
-+    bank.get_signature_status_slot(signature)
-+        .filter(|(slot, _)| *slot <= bank.slot())
-+}
-+
-+/// sol-drivechain: the bank of the BMM finalized slot for a read of account
-+/// state, or an error when the bank forks no longer hold it.
++/// sol-drivechain: the bank of the BMM finalized slot, or an error when the
++/// bank forks no longer hold it.
 +#[allow(clippy::result_large_err)]
 +fn bmm_finalized_bank(
 +    bank_forks: &BankForks,
@@ -1652,69 +1536,19 @@ index 7bf84a0..6e24572 100644
  fn is_finalized(
      block_commitment_cache: &BlockCommitmentCache,
      bank: &Bank,
-@@ -269,11 +330,50 @@ impl JsonRpcRequestProcessor {
- 
- impl JsonRpcRequestProcessor {
-     fn get_bank_with_config(&self, config: RpcContextConfig) -> Result<Arc<Bank>> {
--        let RpcContextConfig {
--            commitment,
--            min_context_slot,
--        } = config;
+@@ -273,7 +315,7 @@ impl JsonRpcRequestProcessor {
+             commitment,
+             min_context_slot,
+         } = config;
 -        let bank = self.bank(commitment);
-+        let bank = self.metadata_bank(config.commitment)?;
-+        Self::check_min_context_slot(bank, config.min_context_slot)
-+    }
-+
-+    /// sol-drivechain: the bank for a read of block metadata. At `finalized`
-+    /// it is exactly the BMM final bank, which can lie below the root, or an
-+    /// error. It never takes another bank in its place.
-+    #[allow(clippy::result_large_err)]
-+    fn metadata_bank(
-+        &self,
-+        commitment: Option<CommitmentConfig>,
-+    ) -> std::result::Result<Arc<Bank>, RpcCustomError> {
-+        let final_slot = sol_drivechain_bmm::fork_choice::enabled()
-+            .then(sol_drivechain_bmm::fork_choice::final_root);
-+        self.metadata_bank_at(commitment, final_slot)
-+    }
-+
-+    /// `metadata_bank` with `final_slot`, the BMM final slot when BMM is on.
-+    #[allow(clippy::result_large_err)]
-+    fn metadata_bank_at(
-+        &self,
-+        commitment: Option<CommitmentConfig>,
-+        final_slot: Option<Slot>,
-+    ) -> std::result::Result<Arc<Bank>, RpcCustomError> {
-+        let level = commitment.unwrap_or_default().commitment;
-+        match final_slot {
-+            Some(slot) if level == CommitmentLevel::Finalized => {
-+                bmm_final_bank(&self.bank_forks.read().unwrap(), slot)
-+            }
-+            _ => Ok(self.bank(commitment)),
-+        }
-+    }
-+
-+    /// sol-drivechain: the bank for a read of account state. At `finalized`
-+    /// it fails while the BMM finalized bank cannot serve its own state.
-+    fn get_state_bank_with_config(&self, config: RpcContextConfig) -> Result<Arc<Bank>> {
-+        let bank = self.checked_bank(config.commitment)?;
-+        Self::check_min_context_slot(bank, config.min_context_slot)
-+    }
-+
-+    fn check_min_context_slot(
-+        bank: Arc<Bank>,
-+        min_context_slot: Option<Slot>,
-+    ) -> Result<Arc<Bank>> {
++        let bank = self.checked_bank(commitment)?;
          if let Some(min_context_slot) = min_context_slot
              && bank.slot() < min_context_slot
          {
-@@ -343,6 +443,35 @@ impl JsonRpcRequestProcessor {
+@@ -343,6 +385,34 @@ impl JsonRpcRequestProcessor {
          Ok(accounts)
      }
  
-+    /// sol-drivechain: the bank of `commitment`. When the BMM finalized bank
-+    /// is gone, a `finalized` read fails, and never falls back to a fallback
-+    /// root.
 +    /// sol-drivechain: fails a read whose bank fell below the root while the
 +    /// read ran, because it then read the accounts of a fallback root.
 +    #[allow(clippy::result_large_err)]
@@ -1726,6 +1560,8 @@ index 7bf84a0..6e24572 100644
 +        )
 +    }
 +
++    /// sol-drivechain: the bank of `commitment`. While the BMM final root is
++    /// below the root, a `finalized` read fails.
 +    #[allow(clippy::result_large_err)]
 +    fn checked_bank(
 +        &self,
@@ -1744,16 +1580,7 @@ index 7bf84a0..6e24572 100644
      #[allow(deprecated)]
      fn bank(&self, commitment: Option<CommitmentConfig>) -> Arc<Bank> {
          debug!("RPC commitment_config: {commitment:?}");
-@@ -538,7 +667,7 @@ impl JsonRpcRequestProcessor {
-             commitment,
-             min_context_slot,
-         } = config.unwrap_or_default();
--        let bank = self.get_bank_with_config(RpcContextConfig {
-+        let bank = self.get_state_bank_with_config(RpcContextConfig {
-             commitment,
-             min_context_slot,
-         })?;
-@@ -552,6 +681,7 @@ impl JsonRpcRequestProcessor {
+@@ -552,6 +622,7 @@ impl JsonRpcRequestProcessor {
              })
              .await
              .expect("rpc: get_encoded_account panicked")?;
@@ -1761,16 +1588,7 @@ index 7bf84a0..6e24572 100644
          Ok(new_response(&bank, response))
      }
  
-@@ -566,7 +696,7 @@ impl JsonRpcRequestProcessor {
-             commitment,
-             min_context_slot,
-         } = config.unwrap_or_default();
--        let bank = self.get_bank_with_config(RpcContextConfig {
-+        let bank = self.get_state_bank_with_config(RpcContextConfig {
-             commitment,
-             min_context_slot,
-         })?;
-@@ -584,6 +714,7 @@ impl JsonRpcRequestProcessor {
+@@ -584,6 +655,7 @@ impl JsonRpcRequestProcessor {
                      .expect("rpc: get_encoded_account panicked")?,
              );
          }
@@ -1778,7 +1596,7 @@ index 7bf84a0..6e24572 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -591,9 +722,10 @@ impl JsonRpcRequestProcessor {
+@@ -591,9 +663,10 @@ impl JsonRpcRequestProcessor {
          &self,
          data_len: usize,
          commitment: Option<CommitmentConfig>,
@@ -1787,21 +1605,12 @@ index 7bf84a0..6e24572 100644
 -            .get_minimum_balance_for_rent_exemption(data_len)
 +    ) -> Result<u64> {
 +        Ok(self
-+            .metadata_bank(commitment)?
++            .checked_bank(commitment)?
 +            .get_minimum_balance_for_rent_exemption(data_len))
      }
  
      pub async fn get_program_accounts(
-@@ -610,7 +742,7 @@ impl JsonRpcRequestProcessor {
-             commitment,
-             min_context_slot,
-         } = config.unwrap_or_default();
--        let bank = self.get_bank_with_config(RpcContextConfig {
-+        let bank = self.get_state_bank_with_config(RpcContextConfig {
-             commitment,
-             min_context_slot,
-         })?;
-@@ -660,6 +792,7 @@ impl JsonRpcRequestProcessor {
+@@ -660,6 +733,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Result<Vec<_>>>()?
          };
@@ -1809,42 +1618,38 @@ index 7bf84a0..6e24572 100644
          Ok(match with_context {
              true => OptionalContext::Context(new_response(&bank, accounts)),
              false => OptionalContext::NoContext(accounts),
-@@ -896,8 +1029,8 @@ impl JsonRpcRequestProcessor {
+@@ -896,8 +970,8 @@ impl JsonRpcRequestProcessor {
      pub fn get_inflation_governor(
          &self,
          commitment: Option<CommitmentConfig>,
 -    ) -> RpcInflationGovernor {
 -        self.bank(commitment).inflation().into()
 +    ) -> Result<RpcInflationGovernor> {
-+        Ok(self.metadata_bank(commitment)?.inflation().into())
++        Ok(self.checked_bank(commitment)?.inflation().into())
      }
  
      pub fn get_inflation_rate(&self) -> RpcInflationRate {
-@@ -938,8 +1071,10 @@ impl JsonRpcRequestProcessor {
-         pubkey: &Pubkey,
+@@ -939,7 +1013,9 @@ impl JsonRpcRequestProcessor {
          config: RpcContextConfig,
      ) -> Result<RpcResponse<u64>> {
--        let bank = self.get_bank_with_config(config)?;
+         let bank = self.get_bank_with_config(config)?;
 -        Ok(new_response(&bank, bank.get_balance(pubkey)))
-+        let bank = self.get_state_bank_with_config(config)?;
 +        let balance = bank.get_balance(pubkey);
 +        self.verify_finalized(&bank)?;
 +        Ok(new_response(&bank, balance))
      }
  
      pub fn confirm_transaction(
-@@ -947,8 +1082,8 @@ impl JsonRpcRequestProcessor {
+@@ -947,7 +1023,7 @@ impl JsonRpcRequestProcessor {
          signature: &Signature,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<bool>> {
 -        let bank = self.bank(commitment);
--        let status = bank.get_signature_status(signature);
-+        let bank = self.metadata_bank(commitment)?;
-+        let status = status_at(&bank, signature).map(|(_, status)| status);
++        let bank = self.checked_bank(commitment)?;
+         let status = bank.get_signature_status(signature);
          match status {
              Some(status) => Ok(new_response(&bank, status.is_ok())),
-             None => Ok(new_response(&bank, false)),
-@@ -966,6 +1101,16 @@ impl JsonRpcRequestProcessor {
+@@ -966,6 +1042,16 @@ impl JsonRpcRequestProcessor {
      }
  
      fn get_slot(&self, config: RpcContextConfig) -> Result<Slot> {
@@ -1861,16 +1666,16 @@ index 7bf84a0..6e24572 100644
          let bank = self.get_bank_with_config(config)?;
          Ok(bank.slot())
      }
-@@ -994,7 +1139,7 @@ impl JsonRpcRequestProcessor {
+@@ -994,7 +1080,7 @@ impl JsonRpcRequestProcessor {
          start_slot: Slot,
          limit: usize,
      ) -> Result<Vec<Pubkey>> {
 -        let bank = self.bank(commitment);
-+        let bank = self.metadata_bank(commitment)?;
++        let bank = self.checked_bank(commitment)?;
  
          let (mut epoch, mut slot_index) =
              bank.epoch_schedule().get_epoch_and_slot_index(start_slot);
-@@ -1065,7 +1210,7 @@ impl JsonRpcRequestProcessor {
+@@ -1065,7 +1151,7 @@ impl JsonRpcRequestProcessor {
          config: Option<RpcLargestAccountsConfig>,
      ) -> RpcCustomResult<RpcResponse<Vec<RpcAccountBalance>>> {
          let config = config.unwrap_or_default();
@@ -1879,7 +1684,7 @@ index 7bf84a0..6e24572 100644
  
          if let Some((slot, accounts)) = self.get_cached_largest_accounts(&config.filter) {
              Ok(RpcResponse {
-@@ -1109,6 +1254,7 @@ impl JsonRpcRequestProcessor {
+@@ -1109,6 +1195,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Vec<RpcAccountBalance>>();
  
@@ -1887,7 +1692,7 @@ index 7bf84a0..6e24572 100644
              self.set_cached_largest_accounts(&config.filter, bank.slot(), &accounts);
              Ok(new_response(&bank, accounts))
          }
-@@ -1119,7 +1265,7 @@ impl JsonRpcRequestProcessor {
+@@ -1119,7 +1206,7 @@ impl JsonRpcRequestProcessor {
          config: Option<RpcSupplyConfig>,
      ) -> RpcCustomResult<RpcResponse<RpcSupply>> {
          let config = config.unwrap_or_default();
@@ -1896,7 +1701,7 @@ index 7bf84a0..6e24572 100644
          let non_circulating_supply =
              self.calculate_non_circulating_supply(&bank)
                  .await
-@@ -1137,6 +1283,7 @@ impl JsonRpcRequestProcessor {
+@@ -1137,6 +1224,7 @@ impl JsonRpcRequestProcessor {
                  .collect()
          };
  
@@ -1904,7 +1709,7 @@ index 7bf84a0..6e24572 100644
          Ok(new_response(
              &bank,
              RpcSupply {
-@@ -1160,7 +1307,7 @@ impl JsonRpcRequestProcessor {
+@@ -1160,7 +1248,7 @@ impl JsonRpcRequestProcessor {
              None
          };
  
@@ -1913,38 +1718,25 @@ index 7bf84a0..6e24572 100644
          let commission_rate_in_basis_points = bank
              .feature_set
              .is_active(&agave_feature_set::commission_rate_in_basis_points::id());
-@@ -1640,7 +1787,7 @@ impl JsonRpcRequestProcessor {
+@@ -1640,7 +1728,7 @@ impl JsonRpcRequestProcessor {
          signature: Signature,
          commitment: Option<CommitmentConfig>,
      ) -> Result<Option<RpcSignatureConfirmation>> {
 -        let bank = self.bank(commitment);
-+        let bank = self.metadata_bank(commitment)?;
++        let bank = self.checked_bank(commitment)?;
          Ok(self
              .get_transaction_status(signature, &bank)
              .map(|transaction_status| {
-@@ -1659,10 +1806,8 @@ impl JsonRpcRequestProcessor {
+@@ -1659,7 +1747,7 @@ impl JsonRpcRequestProcessor {
          signature: Signature,
          commitment: Option<CommitmentConfig>,
      ) -> Result<Option<transaction::Result<()>>> {
 -        let bank = self.bank(commitment);
--        Ok(bank
--            .get_signature_status_slot(&signature)
--            .map(|(_, status)| status))
-+        let bank = self.metadata_bank(commitment)?;
-+        Ok(status_at(&bank, &signature).map(|(_, status)| status))
-     }
- 
-     pub async fn get_signature_statuses(
-@@ -1729,7 +1874,7 @@ impl JsonRpcRequestProcessor {
-         signature: Signature,
-         bank: &Bank,
-     ) -> Option<TransactionStatus> {
--        let (slot, status) = bank.get_signature_status_slot(&signature)?;
-+        let (slot, status) = status_at(bank, &signature)?;
- 
-         let optimistically_confirmed_bank = self.bank(Some(CommitmentConfig::confirmed()));
-         let optimistically_confirmed =
-@@ -2011,7 +2156,7 @@ impl JsonRpcRequestProcessor {
++        let bank = self.checked_bank(commitment)?;
+         Ok(bank
+             .get_signature_status_slot(&signature)
+             .map(|(_, status)| status))
+@@ -2011,7 +2099,7 @@ impl JsonRpcRequestProcessor {
          pubkey: &Pubkey,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<UiTokenAmount>> {
@@ -1953,7 +1745,7 @@ index 7bf84a0..6e24572 100644
          let account = bank.get_account(pubkey).ok_or_else(|| {
              Error::invalid_params("Invalid param: could not find account".to_string())
          })?;
-@@ -2027,6 +2172,7 @@ impl JsonRpcRequestProcessor {
+@@ -2027,6 +2115,7 @@ impl JsonRpcRequestProcessor {
              .expect("Token account mint should be convertible to Pubkey");
          let (_, data) = get_mint_owner_and_additional_data(&bank, mint)?;
          let balance = token_amount_to_ui_amount_v3(token_account.base.amount, &data);
@@ -1961,7 +1753,7 @@ index 7bf84a0..6e24572 100644
          Ok(new_response(&bank, balance))
      }
  
-@@ -2035,7 +2181,7 @@ impl JsonRpcRequestProcessor {
+@@ -2035,7 +2124,7 @@ impl JsonRpcRequestProcessor {
          mint: &Pubkey,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<UiTokenAmount>> {
@@ -1970,7 +1762,7 @@ index 7bf84a0..6e24572 100644
          let mint_account = bank.get_account(mint).ok_or_else(|| {
              Error::invalid_params("Invalid param: could not find account".to_string())
          })?;
-@@ -2066,6 +2212,7 @@ impl JsonRpcRequestProcessor {
+@@ -2066,6 +2155,7 @@ impl JsonRpcRequestProcessor {
                  scaled_ui_amount_config,
              },
          );
@@ -1978,7 +1770,7 @@ index 7bf84a0..6e24572 100644
          Ok(new_response(&bank, supply))
      }
  
-@@ -2074,7 +2221,7 @@ impl JsonRpcRequestProcessor {
+@@ -2074,7 +2164,7 @@ impl JsonRpcRequestProcessor {
          mint: Pubkey,
          commitment: Option<CommitmentConfig>,
      ) -> Result<RpcResponse<Vec<RpcTokenAccountBalance>>> {
@@ -1987,7 +1779,7 @@ index 7bf84a0..6e24572 100644
          let (mint_owner, data) = get_mint_owner_and_additional_data(&bank, &mint)?;
          if !is_known_spl_token_id(&mint_owner) {
              return Err(Error::invalid_params(
-@@ -2122,6 +2269,7 @@ impl JsonRpcRequestProcessor {
+@@ -2122,6 +2212,7 @@ impl JsonRpcRequestProcessor {
              })
              .collect::<Result<Vec<_>>>()?;
  
@@ -1995,16 +1787,7 @@ index 7bf84a0..6e24572 100644
          Ok(new_response(&bank, token_balances))
      }
  
-@@ -2138,7 +2286,7 @@ impl JsonRpcRequestProcessor {
-             commitment,
-             min_context_slot,
-         } = config.unwrap_or_default();
--        let bank = self.get_bank_with_config(RpcContextConfig {
-+        let bank = self.get_state_bank_with_config(RpcContextConfig {
-             commitment,
-             min_context_slot,
-         })?;
-@@ -2176,6 +2324,7 @@ impl JsonRpcRequestProcessor {
+@@ -2176,6 +2267,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Result<Vec<_>>>()?
          };
@@ -2012,16 +1795,7 @@ index 7bf84a0..6e24572 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -2192,7 +2341,7 @@ impl JsonRpcRequestProcessor {
-             commitment,
-             min_context_slot,
-         } = config.unwrap_or_default();
--        let bank = self.get_bank_with_config(RpcContextConfig {
-+        let bank = self.get_state_bank_with_config(RpcContextConfig {
-             commitment,
-             min_context_slot,
-         })?;
-@@ -2242,6 +2391,7 @@ impl JsonRpcRequestProcessor {
+@@ -2242,6 +2334,7 @@ impl JsonRpcRequestProcessor {
                  })
                  .collect::<Result<Vec<_>>>()?
          };
@@ -2029,7 +1803,7 @@ index 7bf84a0..6e24572 100644
          Ok(new_response(&bank, accounts))
      }
  
-@@ -2825,10 +2975,85 @@ pub mod rpc_minimal {
+@@ -2825,10 +2918,85 @@ pub mod rpc_minimal {
              options: Option<RpcLeaderScheduleConfigWrapper>,
              config: Option<RpcLeaderScheduleConfig>,
          ) -> Result<Option<RpcLeaderSchedule>>;
@@ -2115,16 +1889,16 @@ index 7bf84a0..6e24572 100644
          type Metadata = JsonRpcRequestProcessor;
  
          fn get_balance(
-@@ -2968,7 +3193,7 @@ pub mod rpc_minimal {
+@@ -2968,7 +3136,7 @@ pub mod rpc_minimal {
                  let _ = verify_pubkey(identity)?;
              }
  
 -            let bank = meta.bank(config.commitment);
-+            let bank = meta.metadata_bank(config.commitment)?;
++            let bank = meta.checked_bank(config.commitment)?;
              let slot = slot.unwrap_or_else(|| bank.slot());
              let epoch = bank.epoch_schedule().get_epoch(slot);
  
-@@ -3064,7 +3289,7 @@ pub mod rpc_bank {
+@@ -3064,7 +3232,7 @@ pub mod rpc_bank {
              if data_len as u64 > solana_system_interface::MAX_PERMITTED_DATA_LENGTH {
                  return Err(Error::invalid_request());
              }
@@ -2133,7 +1907,7 @@ index 7bf84a0..6e24572 100644
          }
  
          fn get_inflation_governor(
-@@ -3073,7 +3298,7 @@ pub mod rpc_bank {
+@@ -3073,7 +3241,7 @@ pub mod rpc_bank {
              commitment: Option<CommitmentConfig>,
          ) -> Result<RpcInflationGovernor> {
              debug!("get_inflation_governor rpc request received");
@@ -2142,7 +1916,7 @@ index 7bf84a0..6e24572 100644
          }
  
          fn get_inflation_rate(&self, meta: Self::Metadata) -> Result<RpcInflationRate> {
-@@ -3139,7 +3364,7 @@ pub mod rpc_bank {
+@@ -3139,7 +3307,7 @@ pub mod rpc_bank {
                  None
              };
  
@@ -2151,105 +1925,19 @@ index 7bf84a0..6e24572 100644
              let (first_slot, last_slot) = match config.range {
                  None => (
                      bank.epoch_schedule().get_first_slot_in_epoch(bank.epoch()),
-@@ -3815,7 +4040,7 @@ pub mod rpc_full {
+@@ -3815,7 +3983,7 @@ pub mod rpc_full {
              let pubkey = verify_pubkey(&pubkey_str)?;
  
              let config = config.unwrap_or_default();
 -            let bank = meta.bank(config.commitment);
-+            let bank = meta.metadata_bank(config.commitment)?;
++            let bank = meta.checked_bank(config.commitment)?;
  
              let blockhash = if let Some(blockhash) = config.recent_blockhash {
                  verify_hash(&blockhash)?
-@@ -3886,7 +4111,7 @@ pub mod rpc_full {
-             } else {
-                 preflight_commitment.map(|commitment| CommitmentConfig { commitment })
-             };
--            let preflight_bank = &*meta.get_bank_with_config(RpcContextConfig {
-+            let preflight_bank = &*meta.get_state_bank_with_config(RpcContextConfig {
-                 commitment: preflight_commitment,
-                 min_context_slot,
-             })?;
-@@ -4032,7 +4257,7 @@ pub mod rpc_full {
-             let (_, mut unsanitized_tx) =
-                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
- 
--            let bank = &*meta.get_bank_with_config(RpcContextConfig {
-+            let bank = &*meta.get_state_bank_with_config(RpcContextConfig {
-                 commitment,
-                 min_context_slot,
-             })?;
-@@ -4328,7 +4553,7 @@ pub mod rpc_full {
-                 data,
-                 TransactionBinaryEncoding::Base64,
-             )?;
--            let bank = &*meta.get_bank_with_config(config.unwrap_or_default())?;
-+            let bank = &*meta.get_state_bank_with_config(config.unwrap_or_default())?;
-             let sanitized_versioned_message = SanitizedVersionedMessage::try_from(message)
-                 .map_err(|err| {
-                     Error::invalid_params(format!("invalid transaction message: {err}"))
-@@ -5152,6 +5377,120 @@ pub mod tests {
+@@ -5152,6 +5320,61 @@ pub mod tests {
          }
      }
  
-+    #[test]
-+    fn test_bmm_final_bank_is_exact_and_may_lie_below_the_root() {
-+        let genesis = create_genesis_config(100);
-+        let bank = Bank::new_for_tests(&genesis.genesis_config);
-+        let bank_forks = BankForks::new_rw_arc(bank);
-+        let root = bank_forks.read().unwrap().root_bank();
-+        let child = Bank::new_from_parent(root, SlotLeader::default(), 1);
-+        bank_forks.write().unwrap().insert(child);
-+        bank_forks.write().unwrap().set_root(1, None, Some(0));
-+        let forks = bank_forks.read().unwrap();
-+        assert_eq!(bmm_final_bank(&forks, 0).unwrap().slot(), 0);
-+        assert!(bmm_final_bank(&forks, 7).is_err());
-+    }
-+
-+    #[test]
-+    fn test_bmm_final_bank_shows_no_status_of_a_newer_root() {
-+        let genesis = create_genesis_config(1_000_000);
-+        let bank = Bank::new_for_tests(&genesis.genesis_config);
-+        let bank_forks = BankForks::new_rw_arc(bank);
-+        let final_bank = bank_forks.read().unwrap().root_bank();
-+        let child = Bank::new_from_parent(final_bank.clone(), SlotLeader::default(), 1);
-+        let signature = child
-+            .transfer(10, &genesis.mint_keypair, &Pubkey::new_unique())
-+            .unwrap();
-+        child.freeze();
-+        bank_forks.write().unwrap().insert(child);
-+        bank_forks.write().unwrap().set_root(1, None, Some(0));
-+        assert_eq!(
-+            final_bank
-+                .get_signature_status_slot(&signature)
-+                .map(|(slot, _)| slot),
-+            Some(1)
-+        );
-+        assert_eq!(status_at(&final_bank, &signature), None);
-+        let root = bank_forks.read().unwrap().root_bank();
-+        assert_eq!(status_at(&root, &signature), Some((1, Ok(()))));
-+    }
-+
-+    #[test]
-+    fn test_bmm_metadata_reads_take_the_final_bank_and_never_the_root() {
-+        let genesis = create_genesis_config(1_000_000);
-+        let meta = JsonRpcRequestProcessor::new_from_bank(
-+            Bank::new_for_tests(&genesis.genesis_config),
-+            SocketAddrSpace::Unspecified,
-+        );
-+        let final_bank = meta.bank_forks.read().unwrap().root_bank();
-+        let child = Bank::new_from_parent(final_bank, SlotLeader::default(), 1);
-+        meta.bank_forks.write().unwrap().insert(child);
-+        meta.bank_forks.write().unwrap().set_root(1, None, Some(0));
-+        let finalized = Some(CommitmentConfig::finalized());
-+        assert_eq!(meta.metadata_bank_at(finalized, Some(0)).unwrap().slot(), 0);
-+        assert!(matches!(
-+            meta.metadata_bank_at(finalized, Some(7)),
-+            Err(RpcCustomError::BlockNotAvailable { slot: 7 })
-+        ));
-+        let confirmed = Some(CommitmentConfig::confirmed());
-+        assert!(meta.metadata_bank_at(confirmed, Some(7)).is_ok());
-+    }
-+
 +    #[test]
 +    fn test_bmm_final_slot_compares_the_min_context_slot_to_the_final_root() {
 +        assert_eq!(bmm_final_slot(40, None).unwrap(), 40);
@@ -2438,7 +2126,7 @@ index 2c2292f..52634d7 100644
  solana-account-info = { workspace = true }
  solana-accounts-db = { workspace = true }
 diff --git a/runtime/src/bank.rs b/runtime/src/bank.rs
-index c8399cb..c4dec90 100644
+index c8399cb..e65b4e8 100644
 --- a/runtime/src/bank.rs
 +++ b/runtime/src/bank.rs
 @@ -233,6 +233,7 @@ use {
@@ -2482,7 +2170,7 @@ index c8399cb..c4dec90 100644
              self.finish_accounts_lt_hash_updates();
              *hash = self.hash_internal_state();
              self.rc.accounts.accounts_db.mark_slot_frozen(self.slot());
-+            self.keep_bmm_answers(&hash);
++            self.keep_bmm_answers();
          }
      }
  
@@ -2558,10 +2246,10 @@ index c8399cb..c4dec90 100644
                  && let Some(feature) = feature::state::from_account(&account)
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..79ec97c
+index 0000000..513df3f
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,1065 @@
+@@ -0,0 +1,966 @@
 +//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
@@ -2589,7 +2277,7 @@ index 0000000..79ec97c
 +        DEPOSIT_ANSWER_ID, Lookup, PaidQuestion, Question, RecordAnswer, RecordedBlock, Wait,
 +        answer_data, answers::answers, bmm_next_height, bundle_paid_question,
 +        credit_deposits_question, deposit_answer_data, deposit_confirmations, find_recorded,
-+        fork_choice, held::held, live_bundle_sealed_height, paid_answer_data, record_block,
++        fork_choice, live_bundle_sealed_height, paid_answer_data, record_block,
 +        refused_deposit_answer_data, settle_bmm_question, view,
 +    },
 +    solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
@@ -2598,15 +2286,13 @@ index 0000000..79ec97c
 +    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
 +    solana_svm::account_loader::TransactionCheckResult,
 +    solana_transaction_error::TransactionError,
-+    std::time::Instant,
 +};
 +
 +/// Who runs the batch, which sets the depth and the wait of the check.
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 +pub(super) enum BmmCheck {
-+    /// A leader. It needs N + 1 blocks on top, and it does not wait. The
-+    /// banking stage tries a "not ready" tx again later, within the limits
-+    /// of `held`.
++    /// A leader. It needs N + 2 blocks on top, and it does not wait. It
++    /// drops a "not ready" tx.
 +    Leader,
 +    /// A simulation. It asks the same as a leader, and it keeps no answer.
 +    Simulation,
@@ -2723,39 +2409,12 @@ index 0000000..79ec97c
 +                    None => self.bridge_answer(tx, &question, signature.as_ref(), check),
 +                };
 +                let (key, data) = match answer {
-+                    Lookup::Ready(answer) => {
-+                        if let Some(signature) = &signature {
-+                            held().release(signature);
-+                        }
-+                        answer
-+                    }
-+                    // Only a leader drops a tx, so the other checks report
-+                    // both the same way.
-+                    Lookup::Never if check != BmmCheck::Leader => {
-+                        log::debug!(
-+                            "the BMM view can give no answer for {question:?} as {check:?}"
-+                        );
-+                        return Err(TransactionError::ProgramExecutionTemporarilyRestricted {
-+                            account_index: program_id_index,
-+                        });
-+                    }
-+                    Lookup::NotYet
-+                        if check != BmmCheck::Leader
-+                            || signature.is_some_and(|signature| {
-+                                self.can_pay_fee(tx.fee_payer(), details.fee_details().total_fee())
-+                                    && held().admit(&signature, tx.fee_payer(), Instant::now())
-+                            }) =>
-+                    {
-+                        log::debug!("the BMM view has no answer yet for {question:?} as {check:?}");
-+                        return Err(TransactionError::ProgramExecutionTemporarilyRestricted {
-+                            account_index: program_id_index,
-+                        });
-+                    }
++                    Lookup::Ready(answer) => answer,
 +                    Lookup::NotYet | Lookup::Never => {
-+                        log::debug!(
-+                            "the BMM view can give no answer for {question:?} as {check:?}"
-+                        );
-+                        return Err(TransactionError::InvalidProgramForExecution);
++                        log::debug!("the BMM view has no answer for {question:?} as {check:?}");
++                        return Err(TransactionError::ProgramExecutionTemporarilyRestricted {
++                            account_index: program_id_index,
++                        });
 +                    }
 +                };
 +                let account = AccountSharedData::from(Account {
@@ -2852,12 +2511,6 @@ index 0000000..79ec97c
 +            .is_some_and(|index| tx.is_signer(index))
 +    }
 +
-+    /// True when `payer` holds `fee`, so a held tx can pay when it runs.
-+    fn can_pay_fee(&self, payer: &Pubkey, fee: u64) -> bool {
-+        self.get_account(payer)
-+            .is_some_and(|account| account.lamports() >= fee.max(1))
-+    }
-+
 +    fn recorded_answer(
 +        &self,
 +        signature: Option<&[u8; 64]>,
@@ -2930,7 +2583,7 @@ index 0000000..79ec97c
 +        Lookup::Ready((key, data))
 +    }
 +
-+    /// Status 1 when block M at H, with K blocks on top for a replay and one
++    /// Status 1 when block M at H, with K blocks on top for a replay and two
 +    /// more for a leader, holds a Succeeded event for the M6ID.
 +    /// A question for a height at or below the seal of the live bundle, or
 +    /// without a live bundle, gets status 0 at once and asks the view nothing.
@@ -2951,7 +2604,7 @@ index 0000000..79ec97c
 +            .bmm_params()
 +            .map_or(fork_choice::params().root_depth, |params| params.root_depth);
 +        let depth = match check {
-+            BmmCheck::Leader | BmmCheck::Simulation => root_depth.saturating_add(1),
++            BmmCheck::Leader | BmmCheck::Simulation => root_depth.saturating_add(2),
 +            BmmCheck::Replay => root_depth,
 +        };
 +        view()
@@ -2983,7 +2636,7 @@ index 0000000..79ec97c
 +            return refused_settle(question);
 +        }
 +        let depth = match check {
-+            BmmCheck::Leader | BmmCheck::Simulation => self.bmm_confirmations().saturating_add(1),
++            BmmCheck::Leader | BmmCheck::Simulation => self.bmm_confirmations().saturating_add(2),
 +            BmmCheck::Replay => self.bmm_confirmations(),
 +        };
 +        let height = question.height;
@@ -3057,7 +2710,7 @@ index 0000000..79ec97c
 +        }
 +        let on_top = confirmations.saturating_sub(1);
 +        let depth = match check {
-+            BmmCheck::Leader | BmmCheck::Simulation => on_top.saturating_add(1),
++            BmmCheck::Leader | BmmCheck::Simulation => on_top.saturating_add(2),
 +            BmmCheck::Replay => on_top,
 +        };
 +        let height = question.height;
@@ -3073,10 +2726,10 @@ index 0000000..79ec97c
 +    /// Writes the answers of the committed txs of this bank to the answers
 +    /// file. A failed write stops the validator, because a later replay
 +    /// needs the answer.
-+    pub(super) fn keep_bmm_answers(&self, bank_hash: &Hash) {
++    pub(super) fn keep_bmm_answers(&self) {
 +        let slot = self.slot();
 +        let status_cache = self.status_cache.read().unwrap();
-+        let kept = answers().freeze(slot, &bank_hash.to_bytes(), |signature, blockhash| {
++        let kept = answers().freeze(slot, |signature, blockhash| {
 +            status_cache
 +                .get_status(
 +                    solana_signature::Signature::from(*signature),
@@ -3345,85 +2998,6 @@ index 0000000..79ec97c
 +        }
 +    }
 +
-+    #[test]
-+    fn a_replaced_block_with_the_same_settle_tx_asks_the_bridge_again() {
-+        let genesis = create_genesis_config(1_000_000_000);
-+        let (start, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis.genesis_config);
-+        store_bridge(&start, 100, 40, 0);
-+        let slot = 900_001;
-+        let bank = Bank::new_from_parent_with_bank_forks(
-+            bank_forks.as_ref(),
-+            start,
-+            SlotLeader::default(),
-+            slot,
-+        );
-+        let settle_tx = tx(credit_of_view(41), true);
-+        let signature: [u8; 64] = settle_tx.signature().as_ref().try_into().unwrap();
-+        let first_run = vec![9; 4];
-+        static LEDGER_HASH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
-+        answers().set_frozen_hashes(move |frozen| {
-+            (frozen == slot).then(|| [LEDGER_HASH.load(std::sync::atomic::Ordering::Relaxed); 32])
-+        });
-+        answers().note(slot, &signature, &[0; 32], &BMM_ANSWER_ID, &first_run);
-+        answers().freeze(slot, &[1; 32], |_, _| true).unwrap();
-+        answers().set_replay_root(u64::MAX);
-+        assert_eq!(
-+            answer_of(check(&bank, settle_tx.clone(), BmmCheck::Replay)),
-+            first_run
-+        );
-+
-+        LEDGER_HASH.store(2, std::sync::atomic::Ordering::Relaxed);
-+        let asked = answer_of(check(&bank, settle_tx.clone(), BmmCheck::Replay));
-+        assert_ne!(asked, first_run);
-+        assert_eq!(asked, answer_of(check(&bank, settle_tx, BmmCheck::Leader)));
-+    }
-+
-+    #[test]
-+    fn a_question_that_needs_the_view_waits_in_the_queue_within_the_limits() {
-+        let bank = bank_with_config(100, 40, 2);
-+        assert!(not_ready(&check(
-+            &bank,
-+            tx(credit(41, 2), true),
-+            BmmCheck::Simulation
-+        )));
-+        let poor = Keypair::new();
-+        let payer = Keypair::new();
-+        bank.store_account(
-+            &payer.pubkey(),
-+            &AccountSharedData::new(1_000_000, 0, &Pubkey::default()),
-+        );
-+        let leader_check = |payer: &Keypair| {
-+            let instruction = Instruction::new_with_bytes(
-+                sol_drivechain_bmm::BRIDGE_PROGRAM_ID,
-+                &settle(195),
-+                vec![AccountMeta::new(sol_drivechain_bmm::config(), false)],
-+            );
-+            let transaction = Transaction::new_signed_with_payer(
-+                &[instruction],
-+                Some(&payer.pubkey()),
-+                &[payer],
-+                Hash::new_unique(),
-+            );
-+            check(
-+                &bank,
-+                RuntimeTransaction::from_transaction_for_tests(transaction),
-+                BmmCheck::Leader,
-+            )
-+        };
-+        assert_eq!(
-+            leader_check(&poor),
-+            Err(TransactionError::InvalidProgramForExecution)
-+        );
-+        let mut results: Vec<_> = (0..=sol_drivechain_bmm::held::MAX_PER_PAYER)
-+            .map(|_| leader_check(&payer))
-+            .collect();
-+        assert_eq!(
-+            results.pop(),
-+            Some(Err(TransactionError::InvalidProgramForExecution))
-+        );
-+        assert!(results.iter().all(not_ready));
-+    }
-+
 +    fn bundle_paid(height: u64, block_hash: [u8; 32], m6id: [u8; 32]) -> Vec<u8> {
 +        let mut data = sol_drivechain_bmm::BUNDLE_PAID_DISCRIMINATOR.to_vec();
 +        data.extend_from_slice(&9u64.to_le_bytes());
@@ -3475,15 +3049,30 @@ index 0000000..79ec97c
 +        assert_eq!(sealed(&config_data(100, 40, 2)), Some(140));
 +    }
 +
++    fn settle_of_view(height: u64) -> Vec<u8> {
++        let mut data = sol_drivechain_bmm::SETTLE_BMM_DISCRIMINATOR.to_vec();
++        data.extend_from_slice(&height.to_le_bytes());
++        data.extend_from_slice(&[height as u8; 32]);
++        data.extend_from_slice(&[3; 32]);
++        data
++    }
++
++    /// The view tip is 200, N is 6, and D is 6.
 +    #[test]
-+    fn a_leader_drops_a_question_that_no_new_block_can_answer() {
++    fn a_leader_needs_two_more_blocks_on_top_than_a_replay() {
 +        let bank = bank_with_config(100, 40, 2);
-+        let far = tx(settle(1_000_000), true);
-+        assert!(not_ready(&check(&bank, far.clone(), BmmCheck::Simulation)));
-+        assert_eq!(
-+            check(&bank, far, BmmCheck::Leader),
-+            Err(TransactionError::InvalidProgramForExecution)
-+        );
++        let ready = |data: Vec<u8>, check_as| check(&bank, tx(data, true), check_as).is_ok();
++        assert!(ready(settle_of_view(194), BmmCheck::Replay));
++        assert!(ready(settle_of_view(192), BmmCheck::Leader));
++        assert!(!ready(settle_of_view(193), BmmCheck::Leader));
++        assert!(ready(credit_of_view(195), BmmCheck::Replay));
++        assert!(ready(credit_of_view(193), BmmCheck::Leader));
++        assert!(!ready(credit_of_view(194), BmmCheck::Leader));
++        assert!(not_ready(&check(
++            &bank,
++            tx(settle(1_000_000), true),
++            BmmCheck::Leader
++        )));
 +    }
 +
 +    fn vote_fee(bank: &Bank, tx: Transaction) -> u64 {
@@ -3727,31 +3316,24 @@ index 4adb0eb..56738fb 100644
  
  #[test]
 diff --git a/runtime/src/bank_forks.rs b/runtime/src/bank_forks.rs
-index c4ae164..62ff1dd 100644
+index c4ae164..526c182 100644
 --- a/runtime/src/bank_forks.rs
 +++ b/runtime/src/bank_forks.rs
-@@ -720,12 +720,18 @@ impl BankForks {
+@@ -720,10 +720,13 @@ impl BankForks {
          highest_super_majority_root: Option<Slot>,
      ) -> impl Iterator<Item = Slot> + '_ {
          let highest_super_majority_root = highest_super_majority_root.unwrap_or(root);
-+        // sol-drivechain: a BMM final root can stay far below a fallback root,
-+        // so only its own bank stays for the RPC.
++        // sol-drivechain: no RPC read takes a bank below the root, so none stays.
 +        let bmm = sol_drivechain_bmm::fork_choice::enabled();
          self.banks.keys().copied().filter(move |slot| {
-+            let in_range = if bmm {
-+                *slot == highest_super_majority_root
-+            } else {
-+                *slot >= highest_super_majority_root
-+            };
              let keep = *slot == root
                  || self.descendants[&root].contains(slot)
 -                || (*slot < root
--                    && *slot >= highest_super_majority_root
--                    && self.descendants[slot].contains(&root));
-+                || (*slot < root && in_range && self.descendants[slot].contains(&root));
++                || (!bmm
++                    && *slot < root
+                     && *slot >= highest_super_majority_root
+                     && self.descendants[slot].contains(&root));
              !keep
-         })
-     }
 diff --git a/sol-drivechain-bmm/Cargo.toml b/sol-drivechain-bmm/Cargo.toml
 new file mode 100644
 index 0000000..a75986f
@@ -3790,17 +3372,16 @@ index 0000000..a75986f
 +workspace = true
 diff --git a/sol-drivechain-bmm/src/answers.rs b/sol-drivechain-bmm/src/answers.rs
 new file mode 100644
-index 0000000..bf37e56
+index 0000000..9546c9f
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/answers.rs
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,462 @@
 +//! The answers of the pre-check, per tx. A replay of a rooted slot uses the
 +//! answer of its first run, because a later eCash reorg can drop the block
 +//! that the tx names, and the view then has no answer for it.
 +//!
 +//! The check of a tx only notes its answer. When the bank of the slot
-+//! freezes, the answers of the committed txs go to the file in one write,
-+//! with the bank hash. Only the same block of the slot uses them again.
++//! freezes, the answers of the committed txs go to the file in one write.
 +
 +use {
 +    solana_pubkey::Pubkey,
@@ -3827,29 +3408,16 @@ index 0000000..bf37e56
 +    data: Vec<u8>,
 +}
 +
-+/// An answer of a committed tx, and the hash of the bank that froze it.
-+/// A line from before the hash has none.
-+#[derive(Clone, Debug, PartialEq, Eq)]
-+struct Kept {
-+    bank_hash: Option<[u8; 32]>,
-+    key: Pubkey,
-+    data: Vec<u8>,
-+}
-+
 +#[derive(Default)]
 +struct State {
-+    by_tx: HashMap<TxKey, Kept>,
++    by_tx: HashMap<TxKey, (Pubkey, Vec<u8>)>,
 +    noted: BTreeMap<u64, HashMap<[u8; 64], Noted>>,
 +    path: Option<PathBuf>,
 +    file: crate::Sink,
 +    /// The blockstore root at the start. Only a slot at or below it takes a
 +    /// recorded answer.
 +    replay_root: Option<u64>,
-+    /// The bank hash that the ledger holds for a frozen slot.
-+    frozen_hash: Option<FrozenHash>,
 +}
-+
-+type FrozenHash = Box<dyn Fn(u64) -> Option<[u8; 32]> + Send>;
 +
 +/// The answers that this validator gave to the txs of its blocks.
 +#[derive(Default)]
@@ -3904,26 +3472,13 @@ index 0000000..bf37e56
 +        self.state.lock().unwrap().replay_root = Some(slot);
 +    }
 +
-+    /// Sets where the ledger keeps the bank hash of each frozen slot. A purge
-+    /// of a block also drops its hash.
-+    pub fn set_frozen_hashes(
-+        &self,
-+        frozen_hash: impl Fn(u64) -> Option<[u8; 32]> + Send + 'static,
-+    ) {
-+        self.state.lock().unwrap().frozen_hash = Some(Box::new(frozen_hash));
-+    }
-+
-+    /// The answer of the first run of a tx in a slot from before the start,
-+    /// when the ledger still holds the frozen block of that run.
++    /// The answer of the first run of a tx in a slot from before the start.
 +    pub fn recorded(&self, slot: u64, signature: &[u8; 64]) -> Option<(Pubkey, Vec<u8>)> {
 +        let state = self.state.lock().unwrap();
 +        if state.replay_root.is_none_or(|root| slot > root) {
 +            return None;
 +        }
-+        let kept = state.by_tx.get(&(slot, *signature))?;
-+        let frozen_hash = state.frozen_hash.as_ref()?;
-+        (kept.bank_hash.is_some() && kept.bank_hash == frozen_hash(slot))
-+            .then(|| (kept.key, kept.data.clone()))
++        state.by_tx.get(&(slot, *signature)).cloned()
 +    }
 +
 +    /// Notes the answer that a tx in `slot` gets. `freeze` keeps it when the
@@ -3948,11 +3503,10 @@ index 0000000..bf37e56
 +    }
 +
 +    /// Keeps the noted answers of `slot` whose tx `committed` gives true for,
-+    /// with the hash of the frozen bank, in one write.
++    /// with one write and one sync.
 +    pub fn freeze(
 +        &self,
 +        slot: u64,
-+        bank_hash: &[u8; 32],
 +        mut committed: impl FnMut(&[u8; 64], &[u8; 32]) -> bool,
 +    ) -> io::Result<()> {
 +        let mut state = self.state.lock().unwrap();
@@ -3963,15 +3517,11 @@ index 0000000..bf37e56
 +            if !committed(&signature, &noted.blockhash) {
 +                continue;
 +            }
-+            let entry = Kept {
-+                bank_hash: Some(*bank_hash),
-+                key: noted.key,
-+                data: noted.data,
-+            };
++            let entry = (noted.key, noted.data);
 +            if state.by_tx.get(&(slot, signature)) == Some(&entry) {
 +                continue;
 +            }
-+            text.push_str(&line(slot, &signature, &entry));
++            text.push_str(&line(slot, &signature, &entry.0, &entry.1));
 +            kept.push(((slot, signature), entry));
 +        }
 +        if text.is_empty() {
@@ -4019,27 +3569,21 @@ index 0000000..bf37e56
 +    }
 +}
 +
-+fn line(slot: u64, signature: &[u8; 64], kept: &Kept) -> String {
-+    let mut text = format!(
-+        "answer {slot} {} {} {}",
++fn line(slot: u64, signature: &[u8; 64], key: &Pubkey, data: &[u8]) -> String {
++    format!(
++        "answer {slot} {} {} {}\n",
 +        to_hex(signature),
-+        to_hex(kept.key.as_ref()),
-+        to_hex(&kept.data)
-+    );
-+    if let Some(bank_hash) = &kept.bank_hash {
-+        text.push(' ');
-+        text.push_str(&to_hex(bank_hash));
-+    }
-+    text.push('\n');
-+    text
++        to_hex(key.as_ref()),
++        to_hex(data)
++    )
 +}
 +
-+fn render(by_tx: &HashMap<TxKey, Kept>) -> Vec<u8> {
++fn render(by_tx: &HashMap<TxKey, (Pubkey, Vec<u8>)>) -> Vec<u8> {
 +    let mut entries: Vec<_> = by_tx.iter().collect();
 +    entries.sort_by_key(|((slot, signature), _)| (*slot, *signature));
 +    let mut text = String::new();
-+    for ((slot, signature), kept) in entries {
-+        text.push_str(&line(*slot, signature, kept));
++    for ((slot, signature), (key, data)) in entries {
++        text.push_str(&line(*slot, signature, key, data));
 +    }
 +    text.into_bytes()
 +}
@@ -4059,30 +3603,18 @@ index 0000000..bf37e56
 +}
 +
 +/// A later line for the same tx takes the place of an earlier one.
-+fn parse(text: &str) -> Option<HashMap<TxKey, Kept>> {
++fn parse(text: &str) -> Option<HashMap<TxKey, (Pubkey, Vec<u8>)>> {
 +    let mut by_tx = HashMap::new();
 +    for line in text.lines().filter(|line| !line.trim().is_empty()) {
 +        let words: Vec<&str> = line.split_whitespace().collect();
-+        let (slot, signature, key, data, bank_hash) = match words.as_slice() {
-+            ["answer", slot, signature, key, data] => (slot, signature, key, data, None),
-+            ["answer", slot, signature, key, data, bank_hash] => (
-+                slot,
-+                signature,
-+                key,
-+                data,
-+                Some(from_hex(bank_hash)?.try_into().ok()?),
-+            ),
-+            _ => return None,
++        let ["answer", slot, signature, key, data] = words.as_slice() else {
++            return None;
 +        };
 +        let signature: [u8; 64] = from_hex(signature)?.try_into().ok()?;
 +        let key: [u8; 32] = from_hex(key)?.try_into().ok()?;
 +        by_tx.insert(
 +            (slot.parse().ok()?, signature),
-+            Kept {
-+                bank_hash,
-+                key: Pubkey::new_from_array(key),
-+                data: from_hex(data)?,
-+            },
++            (Pubkey::new_from_array(key), from_hex(data)?),
 +        );
 +    }
 +    Some(by_tx)
@@ -4099,16 +3631,9 @@ index 0000000..bf37e56
 +        dir
 +    }
 +
-+    /// A store whose ledger holds the hash that `keep` freezes each slot with.
-+    fn stored() -> AnswerStore {
-+        let store = AnswerStore::default();
-+        store.set_frozen_hashes(|slot| Some([slot as u8; 32]));
-+        store
-+    }
-+
 +    fn keep(store: &AnswerStore, slot: u64, signature: [u8; 64], data: &[u8]) {
 +        store.note(slot, &signature, &[0; 32], &BMM_ANSWER_ID, data);
-+        store.freeze(slot, &[slot as u8; 32], |_, _| true).unwrap();
++        store.freeze(slot, |_, _| true).unwrap();
 +    }
 +
 +    fn lines(dir: &Path) -> usize {
@@ -4121,12 +3646,12 @@ index 0000000..bf37e56
 +    #[test]
 +    fn a_rooted_slot_takes_the_answer_of_its_first_run_after_a_restart() {
 +        let dir = temp_dir("restart");
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1, 2, 3]);
 +        keep(&store, 41, [8; 64], &[4]);
 +
-+        let again = stored();
++        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(40);
 +        assert_eq!(
@@ -4139,7 +3664,7 @@ index 0000000..bf37e56
 +
 +    #[test]
 +    fn a_slot_above_the_root_never_takes_a_recorded_answer() {
-+        let store = stored();
++        let store = AnswerStore::default();
 +        keep(&store, 41, [8; 64], &[4]);
 +        assert_eq!(store.recorded(41, &[8; 64]), None);
 +        store.set_replay_root(40);
@@ -4151,11 +3676,11 @@ index 0000000..bf37e56
 +    #[test]
 +    fn a_later_answer_for_the_same_tx_takes_the_place_of_the_first() {
 +        let dir = temp_dir("later");
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        keep(&store, 40, [7; 64], &[2]);
-+        let again = stored();
++        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(40);
 +        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![2])));
@@ -4165,18 +3690,18 @@ index 0000000..bf37e56
 +    #[test]
 +    fn only_a_committed_tx_writes_its_answer() {
 +        let dir = temp_dir("committed");
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        store.note(40, &[7; 64], &[1; 32], &BMM_ANSWER_ID, &[1]);
 +        store.note(40, &[8; 64], &[2; 32], &BMM_ANSWER_ID, &[2]);
 +        store.note(40, &[8; 64], &[2; 32], &BMM_ANSWER_ID, &[2]);
 +        store
-+            .freeze(40, &[0; 32], |signature, blockhash| {
++            .freeze(40, |signature, blockhash| {
 +                signature == &[7; 64] && blockhash == &[1; 32]
 +            })
 +            .unwrap();
 +        assert_eq!(lines(&dir), 1);
-+        store.freeze(40, &[0; 32], |_, _| true).unwrap();
++        store.freeze(40, |_, _| true).unwrap();
 +        assert_eq!(lines(&dir), 1);
 +        store.set_replay_root(40);
 +        assert_eq!(store.recorded(40, &[8; 64]), None);
@@ -4186,7 +3711,7 @@ index 0000000..bf37e56
 +    #[test]
 +    fn the_same_answer_twice_writes_one_line() {
 +        let dir = temp_dir("twice");
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        keep(&store, 40, [7; 64], &[1]);
@@ -4197,7 +3722,7 @@ index 0000000..bf37e56
 +    #[test]
 +    fn the_answers_below_a_slot_leave_the_file() {
 +        let dir = temp_dir("prune");
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        keep(&store, 50, [8; 64], &[2]);
@@ -4205,7 +3730,7 @@ index 0000000..bf37e56
 +        assert_eq!(store.lowest_slot(), Some(50));
 +        keep(&store, 60, [9; 64], &[3]);
 +        assert_eq!(lines(&dir), 2);
-+        let again = stored();
++        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(60);
 +        assert_eq!(again.recorded(40, &[7; 64]), None);
@@ -4215,11 +3740,11 @@ index 0000000..bf37e56
 +
 +    #[test]
 +    fn a_noted_answer_waits_for_its_bank_until_the_root_passes_it() {
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.note(10, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
-+        store.freeze(10_000, &[0; 32], |_, _| true).unwrap();
++        store.freeze(10_000, |_, _| true).unwrap();
 +        store.prune_noted_below(10);
-+        store.freeze(10, &[10; 32], |_, _| true).unwrap();
++        store.freeze(10, |_, _| true).unwrap();
 +        store.set_replay_root(10);
 +        assert_eq!(store.recorded(10, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
 +        store.note(20, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
@@ -4230,7 +3755,7 @@ index 0000000..bf37e56
 +    #[test]
 +    fn a_part_of_a_last_line_is_dropped_at_the_open() {
 +        let dir = temp_dir("partial");
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        let mut file = OpenOptions::new()
@@ -4238,7 +3763,7 @@ index 0000000..bf37e56
 +            .open(dir.join(ANSWERS_FILE))
 +            .unwrap();
 +        file.write_all(b"answer 41 0a").unwrap();
-+        let again = stored();
++        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(41);
 +        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
@@ -4253,7 +3778,7 @@ index 0000000..bf37e56
 +    #[test]
 +    fn a_failed_append_leaves_no_part_of_a_line() {
 +        let dir = temp_dir("partial-write");
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        let failed = crate::append_or_roll_back(
@@ -4266,7 +3791,7 @@ index 0000000..bf37e56
 +        );
 +        assert!(failed.is_err());
 +        keep(&store, 42, [9; 64], &[3]);
-+        let again = stored();
++        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(42);
 +        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
@@ -4277,20 +3802,20 @@ index 0000000..bf37e56
 +    #[test]
 +    fn a_broken_log_fails_each_later_freeze() {
 +        let dir = temp_dir("broken");
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        store.state.lock().unwrap().file = crate::Sink::Broken;
 +        store.note(40, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
-+        assert!(store.freeze(40, &[0; 32], |_, _| true).is_err());
++        assert!(store.freeze(40, |_, _| true).is_err());
 +        store.note(41, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
-+        assert!(store.freeze(41, &[0; 32], |_, _| true).is_err());
++        assert!(store.freeze(41, |_, _| true).is_err());
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
 +    #[test]
 +    fn a_prune_that_cannot_rename_keeps_the_old_file_and_handle() {
 +        let dir = temp_dir("prune-rename");
-+        let store = stored();
++        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        keep(&store, 40, [7; 64], &[1]);
 +        keep(&store, 50, [8; 64], &[2]);
@@ -4298,7 +3823,7 @@ index 0000000..bf37e56
 +        assert!(store.prune_below(45).is_err());
 +        keep(&store, 60, [9; 64], &[3]);
 +        fs::remove_dir_all(dir.join(ANSWERS_FILE).with_extension("tmp")).unwrap();
-+        let again = stored();
++        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(60);
 +        assert_eq!(again.recorded(60, &[9; 64]), Some((BMM_ANSWER_ID, vec![3])));
@@ -4309,39 +3834,7 @@ index 0000000..bf37e56
 +    fn a_bad_line_stops_the_open() {
 +        let dir = temp_dir("bad");
 +        fs::write(dir.join(ANSWERS_FILE), "answer 1 zz\n").unwrap();
-+        assert!(stored().open(&dir).is_err());
-+        fs::remove_dir_all(&dir).unwrap();
-+    }
-+
-+    #[test]
-+    fn only_the_frozen_block_of_the_first_run_takes_its_answer() {
-+        let frozen = std::sync::Arc::new(Mutex::new(HashMap::from([(50u64, [50u8; 32])])));
-+        let ledger = std::sync::Arc::clone(&frozen);
-+        let store = AnswerStore::default();
-+        store.set_frozen_hashes(move |slot| ledger.lock().unwrap().get(&slot).copied());
-+        store.set_replay_root(60);
-+        keep(&store, 50, [8; 64], &[2]);
-+        assert_eq!(store.recorded(50, &[8; 64]), Some((BMM_ANSWER_ID, vec![2])));
-+        frozen.lock().unwrap().insert(50, [51; 32]);
-+        assert_eq!(store.recorded(50, &[8; 64]), None);
-+        frozen.lock().unwrap().remove(&50);
-+        assert_eq!(store.recorded(50, &[8; 64]), None);
-+        assert_eq!(AnswerStore::default().recorded(50, &[8; 64]), None);
-+    }
-+
-+    #[test]
-+    fn a_line_without_a_bank_hash_takes_no_answer() {
-+        let dir = temp_dir("no-hash");
-+        let data = format!(
-+            "answer 40 {} {} 01\n",
-+            to_hex(&[7; 64]),
-+            to_hex(BMM_ANSWER_ID.as_ref())
-+        );
-+        fs::write(dir.join(ANSWERS_FILE), data).unwrap();
-+        let store = stored();
-+        store.open(&dir).unwrap();
-+        store.set_replay_root(50);
-+        assert_eq!(store.recorded(40, &[7; 64]), None);
++        assert!(AnswerStore::default().open(&dir).is_err());
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +}
@@ -5226,10 +4719,10 @@ index 0000000..248a0d1
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..1588ccc
+index 0000000..0574c28
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2613 @@
+@@ -0,0 +1,2474 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -5248,8 +4741,8 @@ index 0000000..1588ccc
 +//! A checkpoint at eCash height H counts only when the bridge config of its
 +//! bank credited every deposit through H - lag, and the active eCash chain
 +//! still holds those credits. While the view cannot check the credits, the
-+//! checkpoint stays pending. A bank whose credits the active eCash chain
-+//! dropped never counts, and no leader builds on it.
++//! checkpoint stays pending. A checkpoint whose bank credited a block that
++//! the active eCash chain dropped never counts.
 +
 +use {
 +    crate::{BlockHash, Credits, RecordAnswer, RecordedBlock},
@@ -5507,7 +5000,8 @@ index 0000000..1588ccc
 +        .max_by_key(|anchor| anchor.height)
 +        .map(|anchor| (anchor.height, anchor.block_hash));
 +    let new_pruned = new_root
-+        .map(|new_root| {
++        .zip(winner)
++        .map(|(new_root, winner)| {
 +            matched
 +                .iter()
 +                .filter(|(_, slot)| {
@@ -5753,32 +5247,6 @@ index 0000000..1588ccc
 +        .any(|height| tip_height.saturating_sub(*height) < params.fallback_blocks)
 +}
 +
-+/// The bank to build on in place of `candidate`, when the path from
-+/// `candidate` down to the root holds a bank in `dropped`. It is the highest
-+/// bank at or above the parent of the lowest such bank with no bank of
-+/// `dropped` on its own path. `None` when the path holds no such bank.
-+pub fn avoid_dropped(
-+    root: Slot,
-+    banks: &[ForkBank],
-+    dropped: &HashSet<Slot>,
-+    candidate: Slot,
-+) -> Option<Slot> {
-+    let tree = Tree::new(banks);
-+    let lowest = tree
-+        .path(candidate, root)
-+        .filter(|slot| dropped.contains(slot))
-+        .min()?;
-+    let base = tree.parent.get(&lowest).copied().flatten()?;
-+    banks
-+        .iter()
-+        .map(|bank| bank.slot)
-+        .filter(|slot| {
-+            tree.descends(*slot, base)
-+                && !tree.path(*slot, base).any(|step| dropped.contains(&step))
-+        })
-+        .max()
-+}
-+
 +/// A request to restart from a snapshot at or below `anchor.slot`.
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 +pub struct Restart {
@@ -5792,8 +5260,7 @@ index 0000000..1588ccc
 +pub struct Pruned {
 +    pub checkpoint: Checkpoint,
 +    /// The eCash height and block of the newest checkpoint that beat it.
-+    /// `None` in a state file from before this field.
-+    pub winner: Option<(u64, BlockHash)>,
++    pub winner: (u64, BlockHash),
 +}
 +
 +impl Pruned {
@@ -5801,11 +5268,10 @@ index 0000000..1588ccc
 +    /// chain. After an eCash reorg drops that checkpoint, the pruned one
 +    /// counts again.
 +    pub fn is_lost(&self, checkpoints: &[Checkpoint]) -> bool {
-+        self.winner.is_none_or(|(height, block_hash)| {
-+            checkpoints.iter().any(|checkpoint| {
-+                checkpoint.height == height && checkpoint.block_hash == block_hash
-+            })
-+        })
++        let (height, block_hash) = self.winner;
++        checkpoints
++            .iter()
++            .any(|checkpoint| checkpoint.height == height && checkpoint.block_hash == block_hash)
 +    }
 +}
 +
@@ -5973,32 +5439,6 @@ index 0000000..1588ccc
 +    (trigger_height > saved.handled_height).then_some(Restart {
 +        anchor,
 +        trigger_height,
-+    })
-+}
-+
-+/// A restart request when the root bank credited deposits of an eCash block
-+/// that the active chain dropped. No leader can build beside the root, so the
-+/// node restarts at the newest anchor below the root that the active chain
-+/// still holds. Its bank came before the dropped credit, because a credit
-+/// waits for confirmations and the anchor block is older than the dropped
-+/// block. Each eCash tip asks for one restart at most.
-+pub fn restart_for_dropped_root(
-+    root: Slot,
-+    checkpoints: &[Checkpoint],
-+    saved: &Saved,
-+    ancestors: &[RecordedBlock],
-+    tip_height: u64,
-+) -> Option<Restart> {
-+    if tip_height <= saved.handled_height {
-+        return None;
-+    }
-+    let anchor = known_anchors(saved, ancestors, checkpoints)
-+        .into_iter()
-+        .filter(|anchor| anchor.slot < root && anchor.is_active(checkpoints))
-+        .max_by_key(|anchor| anchor.slot)?;
-+    Some(Restart {
-+        anchor,
-+        trigger_height: tip_height,
 +    })
 +}
 +
@@ -6199,10 +5639,8 @@ index 0000000..1588ccc
 +                to_hex(&checkpoint.bank_hash),
 +                to_hex(&checkpoint.block_hash)
 +            ));
-+            if let Some((height, block_hash)) = pruned.winner {
-+                text.push_str(&format!(" {height} {}", to_hex(&block_hash)));
-+            }
-+            text.push('\n');
++            let (height, block_hash) = pruned.winner;
++            text.push_str(&format!(" {height} {}\n", to_hex(&block_hash)));
 +        }
 +        if let Some(base) = self.base {
 +            text.push_str(&format!("base {} {}\n", base.slot, base.credited_height));
@@ -6232,23 +5670,21 @@ index 0000000..1588ccc
 +                    height: height.parse().ok()?,
 +                    block_hash: from_hex(block_hash)?,
 +                }),
-+                ["pruned", height, bank_hash, block_hash, winner @ ..] => {
-+                    let winner = match winner {
-+                        [] => None,
-+                        [winner_height, winner_block] => {
-+                            Some((winner_height.parse().ok()?, from_hex(winner_block)?))
-+                        }
-+                        _ => return None,
-+                    };
-+                    saved.pruned.push(Pruned {
-+                        checkpoint: Checkpoint {
-+                            height: height.parse().ok()?,
-+                            block_hash: from_hex(block_hash)?,
-+                            bank_hash: from_hex(bank_hash)?,
-+                        },
-+                        winner,
-+                    })
-+                }
++                [
++                    "pruned",
++                    height,
++                    bank_hash,
++                    block_hash,
++                    winner_height,
++                    winner_block,
++                ] => saved.pruned.push(Pruned {
++                    checkpoint: Checkpoint {
++                        height: height.parse().ok()?,
++                        block_hash: from_hex(block_hash)?,
++                        bank_hash: from_hex(bank_hash)?,
++                    },
++                    winner: (winner_height.parse().ok()?, from_hex(winner_block)?),
++                }),
 +                ["base", slot, credited_height] => {
 +                    saved.base = Some(Base {
 +                        slot: slot.parse().ok()?,
@@ -6264,8 +5700,6 @@ index 0000000..1588ccc
 +                    })
 +                }
 +                ["pause", height] => saved.hold_pause_until = height.parse().ok()?,
-+                // State files from older versions hold these lines.
-+                ["proof", ..] | ["distrust", ..] => {}
 +                _ => return None,
 +            }
 +        }
@@ -6431,17 +5865,6 @@ index 0000000..1588ccc
 +            u64::MAX,
 +            PARAMS,
 +        )
-+    }
-+
-+    /// Checkpoints that lost to a checkpoint that the active chain holds.
-+    fn lost(checkpoints: &[Checkpoint]) -> Vec<Pruned> {
-+        checkpoints
-+            .iter()
-+            .map(|checkpoint| Pruned {
-+                checkpoint: *checkpoint,
-+                winner: None,
-+            })
-+            .collect()
 +    }
 +
 +    fn credited(credited_height: u64) -> Deposits {
@@ -6841,47 +6264,6 @@ index 0000000..1588ccc
 +        let choice = choose(10, &split(), &screened.counted, 102, PARAMS);
 +        assert_eq!(choice.head, Some(15));
 +        assert_eq!(choice.count, 1);
-+    }
-+
-+    #[test]
-+    fn a_leader_builds_beside_a_bank_with_dropped_credits() {
-+        // Root 10. Branch A: 11, 12, 13. Branch B: 14, 15 off 10. Branch C: 16 off 11.
-+        let banks = tree(&[
-+            (10, 0),
-+            (11, 10),
-+            (12, 11),
-+            (13, 12),
-+            (14, 10),
-+            (15, 14),
-+            (16, 11),
-+        ]);
-+        let dropped = HashSet::from([12, 13]);
-+        assert_eq!(avoid_dropped(10, &banks, &dropped, 13), Some(16));
-+        assert_eq!(avoid_dropped(10, &banks, &dropped, 15), None);
-+        let only_a = tree(&[(10, 0), (11, 10), (12, 11), (13, 12)]);
-+        assert_eq!(avoid_dropped(10, &only_a, &dropped, 13), Some(11));
-+        assert_eq!(avoid_dropped(10, &only_a, &HashSet::new(), 13), None);
-+    }
-+
-+    #[test]
-+    fn a_dropped_root_restarts_at_the_newest_active_anchor_below_it() {
-+        let checkpoints = [checkpoint(100, 5), checkpoint(101, 7)];
-+        let anchors = [anchor(100, 5), anchor(101, 7), anchor(103, 10)];
-+        assert_eq!(
-+            restart_for_dropped_root(10, &checkpoints, &saved(&anchors, &[], 0), &[], 110),
-+            Some(Restart {
-+                anchor: anchor(101, 7),
-+                trigger_height: 110,
-+            })
-+        );
-+        assert_eq!(
-+            restart_for_dropped_root(10, &checkpoints, &saved(&anchors, &[], 110), &[], 110),
-+            None
-+        );
-+        assert_eq!(
-+            restart_for_dropped_root(10, &[], &saved(&anchors, &[], 0), &[], 110),
-+            None
-+        );
 +    }
 +
 +    #[test]
@@ -7361,11 +6743,8 @@ index 0000000..1588ccc
 +    fn a_checkpoint_that_lost_here_asks_for_no_restart() {
 +        let checkpoints = [checkpoint(100, 5), unknown(101), unknown(102)];
 +        let anchors = [anchor(100, 5)];
-+        let pruned = [unknown(101), unknown(102)];
-+        assert_eq!(
-+            restart_at(&checkpoints, 105, &anchors, &lost(&pruned), 0),
-+            None
-+        );
++        let pruned = [beaten_by(unknown(101), 100), beaten_by(unknown(102), 100)];
++        assert_eq!(restart_at(&checkpoints, 105, &anchors, &pruned, 0), None);
 +    }
 +
 +    #[test]
@@ -7710,7 +7089,7 @@ index 0000000..1588ccc
 +    fn beaten_by(checkpoint: Checkpoint, winner: u64) -> Pruned {
 +        Pruned {
 +            checkpoint,
-+            winner: Some((winner, block(winner))),
++            winner: (winner, block(winner)),
 +        }
 +    }
 +
@@ -7750,13 +7129,7 @@ index 0000000..1588ccc
 +        assert_eq!(Saved::load(&dir).unwrap(), Saved::default());
 +        let saved = Saved {
 +            anchors: vec![anchor(100, 5), anchor(101, 12)],
-+            pruned: vec![
-+                beaten_by(checkpoint(102, 15), 103),
-+                Pruned {
-+                    checkpoint: checkpoint(104, 16),
-+                    winner: None,
-+                },
-+            ],
++            pruned: vec![beaten_by(checkpoint(102, 15), 103)],
 +            base: Some(base(3, 90)),
 +            handled_height: 102,
 +            restart_to: Some(5),
@@ -7769,25 +7142,6 @@ index 0000000..1588ccc
 +        saved.store(&dir).unwrap();
 +        assert_eq!(Saved::load(&dir).unwrap(), saved);
 +        fs::remove_dir_all(&dir).unwrap();
-+    }
-+
-+    #[test]
-+    fn a_state_file_with_old_proof_lines_still_loads() {
-+        let text = format!(
-+            "anchor 5 {} 100 {}\nhandled 102\nproof 114 {} -\ndistrust {} 1110\n",
-+            to_hex(&hash(5)),
-+            to_hex(&block(100)),
-+            to_hex(&[0xee; 32]),
-+            to_hex(&[3; 32])
-+        );
-+        assert_eq!(
-+            Saved::parse(&text),
-+            Some(Saved {
-+                anchors: vec![anchor(100, 5)],
-+                handled_height: 102,
-+                ..Saved::default()
-+            })
-+        );
 +    }
 +
 +    #[test]
@@ -7843,134 +7197,12 @@ index 0000000..1588ccc
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +}
-diff --git a/sol-drivechain-bmm/src/held.rs b/sol-drivechain-bmm/src/held.rs
-new file mode 100644
-index 0000000..ac46da6
---- /dev/null
-+++ b/sol-drivechain-bmm/src/held.rs
-@@ -0,0 +1,116 @@
-+//! The bridge txs that a leader keeps in its queue while the view cannot
-+//! answer them yet. Such a tx pays no fee, so the leader keeps few of them,
-+//! and each for a short time.
-+
-+use {
-+    solana_pubkey::Pubkey,
-+    std::{
-+        collections::HashMap,
-+        sync::{Mutex, OnceLock},
-+        time::{Duration, Instant},
-+    },
-+};
-+
-+/// A tx leaves the queue this long after its first "not ready".
-+pub const HOLD_TIME: Duration = Duration::from_secs(30);
-+
-+/// A dropped tx stays known this long, so it cannot enter the queue again.
-+const FORGET_TIME: Duration = Duration::from_secs(120);
-+
-+/// The txs of one fee payer in the queue at one time.
-+pub const MAX_PER_PAYER: usize = 4;
-+
-+/// The txs in the queue at one time.
-+pub const MAX_HELD: usize = 256;
-+
-+#[derive(Default)]
-+pub struct Held {
-+    by_signature: Mutex<HashMap<[u8; 64], (Pubkey, Instant)>>,
-+}
-+
-+/// The queue limits of this leader.
-+pub fn held() -> &'static Held {
-+    static HELD: OnceLock<Held> = OnceLock::new();
-+    HELD.get_or_init(Held::default)
-+}
-+
-+impl Held {
-+    /// True when the leader may keep a tx that is not ready, so it tries the
-+    /// tx again later. False when the leader must drop it.
-+    pub fn admit(&self, signature: &[u8; 64], payer: &Pubkey, now: Instant) -> bool {
-+        let mut by_signature = self.by_signature.lock().unwrap();
-+        let age = |first: &Instant| now.saturating_duration_since(*first);
-+        by_signature.retain(|_, (_, first)| age(first) < FORGET_TIME);
-+        if let Some((_, first)) = by_signature.get(signature) {
-+            return age(first) < HOLD_TIME;
-+        }
-+        let active = || {
-+            by_signature
-+                .values()
-+                .filter(|(_, first)| age(first) < HOLD_TIME)
-+        };
-+        let of_payer = active()
-+            .filter(|(held_payer, _)| held_payer == payer)
-+            .count();
-+        if of_payer >= MAX_PER_PAYER || active().count() >= MAX_HELD {
-+            return false;
-+        }
-+        by_signature.insert(*signature, (*payer, now));
-+        true
-+    }
-+
-+    /// Forgets a tx that got its answer.
-+    pub fn release(&self, signature: &[u8; 64]) {
-+        self.by_signature.lock().unwrap().remove(signature);
-+    }
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+
-+    fn signature(byte: u8) -> [u8; 64] {
-+        [byte; 64]
-+    }
-+
-+    #[test]
-+    fn a_tx_stays_for_the_hold_time_only() {
-+        let held = Held::default();
-+        let payer = Pubkey::new_from_array([1; 32]);
-+        let start = Instant::now();
-+        assert!(held.admit(&signature(1), &payer, start));
-+        assert!(held.admit(&signature(1), &payer, start + HOLD_TIME / 2));
-+        assert!(!held.admit(&signature(1), &payer, start + HOLD_TIME));
-+        assert!(!held.admit(&signature(1), &payer, start + HOLD_TIME * 2));
-+        assert!(held.admit(&signature(2), &payer, start + HOLD_TIME * 2));
-+    }
-+
-+    #[test]
-+    fn one_payer_keeps_at_most_its_share() {
-+        let held = Held::default();
-+        let payer = Pubkey::new_from_array([1; 32]);
-+        let other = Pubkey::new_from_array([2; 32]);
-+        let now = Instant::now();
-+        for byte in 0..MAX_PER_PAYER as u8 {
-+            assert!(held.admit(&signature(byte), &payer, now));
-+        }
-+        assert!(!held.admit(&signature(200), &payer, now));
-+        assert!(held.admit(&signature(201), &other, now));
-+        held.release(&signature(0));
-+        assert!(held.admit(&signature(200), &payer, now));
-+    }
-+
-+    #[test]
-+    fn the_queue_has_a_limit_for_all_payers() {
-+        let held = Held::default();
-+        let now = Instant::now();
-+        for index in 0..MAX_HELD {
-+            let mut key = [0u8; 32];
-+            key[..8].copy_from_slice(&(index as u64).to_le_bytes());
-+            let mut sig = [0u8; 64];
-+            sig[..8].copy_from_slice(&(index as u64).to_le_bytes());
-+            assert!(held.admit(&sig, &Pubkey::new_from_array(key), now));
-+        }
-+        assert!(!held.admit(&[255; 64], &Pubkey::new_from_array([255; 32]), now));
-+    }
-+}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..b89558a
+index 0000000..45b0a84
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2266 @@
+@@ -0,0 +1,2116 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -7987,7 +7219,6 @@ index 0000000..b89558a
 +#[cfg(feature = "poller")]
 +mod enforcer;
 +pub mod fork_choice;
-+pub mod held;
 +pub mod pairs;
 +#[cfg(feature = "poller")]
 +mod poller;
@@ -8179,15 +7410,6 @@ index 0000000..b89558a
 +/// staked leader cannot make each of its blocks wait `REPLAY_WAIT`.
 +pub const LEADER_REPLAY_WAIT: Duration = Duration::from_secs(60);
 +
-+/// The questions of one replayed slot for a block one past the view wait at
-+/// least this long in all, also when the leader used its `LEADER_REPLAY_WAIT`.
-+/// So a node one block behind does not fail such a slot at once.
-+pub const BOUNDARY_WAIT: Duration = Duration::from_secs(3);
-+
-+/// The `BOUNDARY_WAIT` of all replayed slots of one leader in one epoch, so a
-+/// leader cannot make each of its blocks wait `BOUNDARY_WAIT`.
-+pub const LEADER_BOUNDARY_WAIT: Duration = Duration::from_secs(15);
-+
 +/// The size of the `BmmAnswer` data: height, block hash, found, commitment,
 +/// Solana block, recorded, credited height, credits active.
 +pub const BMM_ANSWER_LEN: usize = 8 + 32 + 1 + 32 + 32 + 1 + 8 + 1;
@@ -8269,7 +7491,7 @@ index 0000000..b89558a
 +}
 +
 +/// Runs `f` as block production, so the BMM check of the bank asks as a
-+/// leader: no wait, and N + 1 blocks on top.
++/// leader: no wait, and N + 2 blocks on top.
 +pub fn produce_block<T>(f: impl FnOnce() -> T) -> T {
 +    struct Restore(bool);
 +    impl Drop for Restore {
@@ -8683,8 +7905,8 @@ index 0000000..b89558a
 +#[derive(Clone, Debug, PartialEq, Eq)]
 +pub enum Lookup<T> {
 +    Ready(T),
-+    /// The view can give the answer after at most `MAX_AHEAD` new eCash
-+    /// blocks, or after a backfill.
++    /// The view can give the answer after new eCash blocks, after a reorg,
++    /// or after a backfill.
 +    NotYet,
 +    /// No answer can come from the active chain that this view holds.
 +    Never,
@@ -8723,10 +7945,6 @@ index 0000000..b89558a
 +    },
 +}
 +
-+/// A question may name a block this many eCash blocks above what the view can
-+/// answer now. A replay then waits for the enforcer, and a leader tries again.
-+pub const MAX_AHEAD: u64 = 2;
-+
 +/// The view drops blocks this far below the tip, except a backfill that a
 +/// question asked for in the last `PIN_TIME`.
 +const RETAIN: u64 = 8064;
@@ -8743,17 +7961,10 @@ index 0000000..b89558a
 +
 +const MAX_BUDGETS: usize = 512;
 +
-+/// A lookup inside the view. `Ahead` names a block more than `MAX_AHEAD`
-+/// blocks past what the view can answer. `Mismatch` names another block than
-+/// the view holds, which an eCash reorg can still change. `Backfill` waits for
-+/// older blocks.
-+/// `Next` names a block exactly one past what the view can answer.
++/// A lookup inside the view. `Backfill` waits for older blocks.
 +enum Found<T> {
 +    Ready(T),
 +    NotYet,
-+    Next,
-+    Ahead,
-+    Mismatch,
 +    Backfill,
 +    Never,
 +}
@@ -8779,10 +7990,6 @@ index 0000000..b89558a
 +    budgets: HashMap<u64, Duration>,
 +    /// The wait that each leader has left in an epoch.
 +    leader_budgets: HashMap<([u8; 32], u64), Duration>,
-+    /// The `BOUNDARY_WAIT` that each replayed slot has left.
-+    boundary_budgets: HashMap<u64, Duration>,
-+    /// The `LEADER_BOUNDARY_WAIT` that each leader has left in an epoch.
-+    leader_boundary_budgets: HashMap<([u8; 32], u64), Duration>,
 +    /// The last time that a backfill started or added older blocks.
 +    backfill_progress: Option<Instant>,
 +}
@@ -8841,68 +8048,40 @@ index 0000000..b89558a
 +        if self.lowest().is_some_and(|lowest| height < lowest) {
 +            return self.below_view(height, floor);
 +        }
-+        let missing = height.saturating_add(depth).saturating_sub(tip_height);
 +        match self.active.get(&height) {
-+            Some(block) if missing == 0 => {
-+                if &block.hash == block_hash {
-+                    Found::Ready(block.clone())
-+                } else {
-+                    Found::Mismatch
-+                }
++            Some(block)
++                if height.saturating_add(depth) <= tip_height && &block.hash == block_hash =>
++            {
++                Found::Ready(block.clone())
 +            }
-+            _ if missing == 1 => Found::Next,
-+            _ if missing <= MAX_AHEAD => Found::NotYet,
-+            _ => Found::Ahead,
++            _ => Found::NotYet,
 +        }
 +    }
 +
 +    /// The hash of the active block at `height`.
 +    fn hash_at(&mut self, height: u64, floor: u64) -> Found<BlockHash> {
-+        let Some(tip_height) = self.tip_height else {
-+            return Found::NotYet;
-+        };
 +        if let Some(block) = self.active.get(&height) {
 +            return Found::Ready(block.hash);
 +        }
 +        if self.lowest().is_some_and(|lowest| height < lowest) {
 +            return self.below_view(height, floor);
 +        }
-+        if height.saturating_sub(tip_height) == 1 {
-+            Found::Next
-+        } else if height.saturating_sub(tip_height) <= MAX_AHEAD {
-+            Found::NotYet
-+        } else {
-+            Found::Ahead
-+        }
++        Found::NotYet
 +    }
 +
-+    /// The healthy wait that `slot` and its leader have left. A question
-+    /// one block past the view can also use the `BOUNDARY_WAIT` of the slot.
-+    /// A wait while the enforcer is away or a backfill adds blocks uses none
-+    /// of it.
-+    fn budget(&mut self, slot: u64, leader: ([u8; 32], u64), next: bool) -> Duration {
++    /// The healthy wait that `slot` and its leader have left. A wait while
++    /// the enforcer is away or a backfill adds blocks uses none of it.
++    fn budget(&mut self, slot: u64, leader: ([u8; 32], u64)) -> Duration {
 +        if self.budgets.len() >= MAX_BUDGETS {
 +            let mut slots: Vec<u64> = self.budgets.keys().copied().collect();
 +            slots.sort_unstable();
 +            for old in &slots[..slots.len() / 2] {
 +                self.budgets.remove(old);
 +            }
-+            let budgets = &self.budgets;
-+            self.boundary_budgets
-+                .retain(|slot, _| budgets.contains_key(slot));
 +        }
 +        if self.leader_budgets.len() >= MAX_BUDGETS {
 +            let newest = self.leader_budgets.keys().map(|(_, epoch)| *epoch).max();
 +            self.leader_budgets
-+                .retain(|(_, epoch), _| Some(*epoch) == newest);
-+        }
-+        if self.leader_boundary_budgets.len() >= MAX_BUDGETS {
-+            let newest = self
-+                .leader_boundary_budgets
-+                .keys()
-+                .map(|(_, epoch)| *epoch)
-+                .max();
-+            self.leader_boundary_budgets
 +                .retain(|(_, epoch), _| Some(*epoch) == newest);
 +        }
 +        let slot_left = *self.budgets.entry(slot).or_insert(REPLAY_WAIT);
@@ -8910,32 +8089,15 @@ index 0000000..b89558a
 +            .leader_budgets
 +            .entry(leader)
 +            .or_insert(LEADER_REPLAY_WAIT);
-+        if next {
-+            let boundary_left = (*self.boundary_budgets.entry(slot).or_insert(BOUNDARY_WAIT)).min(
-+                *self
-+                    .leader_boundary_budgets
-+                    .entry(leader)
-+                    .or_insert(LEADER_BOUNDARY_WAIT),
-+            );
-+            return slot_left.min(leader_left.max(boundary_left));
-+        }
 +        slot_left.min(leader_left)
 +    }
 +
-+    fn spend(&mut self, slot: u64, leader: ([u8; 32], u64), next: bool, spent: Duration) {
++    fn spend(&mut self, slot: u64, leader: ([u8; 32], u64), spent: Duration) {
 +        if let Some(left) = self.budgets.get_mut(&slot) {
 +            *left = left.saturating_sub(spent);
 +        }
 +        if let Some(left) = self.leader_budgets.get_mut(&leader) {
 +            *left = left.saturating_sub(spent);
-+        }
-+        if next {
-+            if let Some(left) = self.boundary_budgets.get_mut(&slot) {
-+                *left = left.saturating_sub(spent);
-+            }
-+            if let Some(left) = self.leader_boundary_budgets.get_mut(&leader) {
-+                *left = left.saturating_sub(spent);
-+            }
 +        }
 +    }
 +
@@ -9006,10 +8168,9 @@ index 0000000..b89558a
 +        self.resolve(wait, |state| state.hash_at(height, floor))
 +    }
 +
-+    /// A leader drops a question `Ahead` of the view. A replay waits for it
-+    /// within `REPLAY_WAIT` per slot and `LEADER_REPLAY_WAIT` per leader and
-+    /// epoch, or `BOUNDARY_WAIT` per slot for a block one past the view,
-+    /// because its own view can lag.
++    /// A leader does not wait. A replay waits within `REPLAY_WAIT` per slot
++    /// and `LEADER_REPLAY_WAIT` per leader and epoch, because its own view
++    /// can lag.
 +    fn resolve<T>(&self, wait: Wait, mut query: impl FnMut(&mut State) -> Found<T>) -> Lookup<T> {
 +        let mut state = self.state.lock().unwrap();
 +        loop {
@@ -9022,14 +8183,13 @@ index 0000000..b89558a
 +            else {
 +                return match found {
 +                    Found::Ready(value) => Lookup::Ready(value),
-+                    Found::NotYet | Found::Next | Found::Backfill => Lookup::NotYet,
-+                    Found::Ahead | Found::Mismatch | Found::Never => Lookup::Never,
++                    Found::NotYet | Found::Backfill => Lookup::NotYet,
++                    Found::Never => Lookup::Never,
 +                };
 +            };
 +            // A view that the enforcer does not update cannot say "never".
 +            let away = state.exit.is_some() && !state.healthy();
 +            let backfill = matches!(found, Found::Backfill) && state.backfilling();
-+            let next = matches!(found, Found::Next);
 +            match found {
 +                Found::Ready(value) => return Lookup::Ready(value),
 +                Found::Never if !away => return Lookup::Never,
@@ -9040,7 +8200,7 @@ index 0000000..b89558a
 +            let step = if paused {
 +                WAIT_STEP
 +            } else {
-+                match state.budget(slot, (leader, epoch), next) {
++                match state.budget(slot, (leader, epoch)) {
 +                    left if left.is_zero() => return Lookup::NotYet,
 +                    left => left.min(WAIT_STEP),
 +                }
@@ -9048,7 +8208,7 @@ index 0000000..b89558a
 +            let start = Instant::now();
 +            state = self.changed.wait_timeout(state, step).unwrap().0;
 +            if !paused {
-+                state.spend(slot, (leader, epoch), next, start.elapsed());
++                state.spend(slot, (leader, epoch), start.elapsed());
 +            }
 +        }
 +    }
@@ -9488,7 +8648,7 @@ index 0000000..b89558a
 +        );
 +        assert_eq!(
 +            view.deep_block(104, &hash(1), 6, 0, Wait::No),
-+            Lookup::Never
++            Lookup::NotYet
 +        );
 +    }
 +
@@ -9688,21 +8848,19 @@ index 0000000..b89558a
 +    }
 +
 +    #[test]
-+    fn a_block_far_above_the_tip_is_never_ready() {
++    fn a_block_far_above_the_tip_is_not_ready() {
 +        let view = BmmView::default();
 +        view.replace_from(&chain(100, 110, 0));
-+        assert_eq!(ask(&view, 107, hash(107), 6), Lookup::Never);
-+        assert_eq!(ask(&view, 500, hash(200), 6), Lookup::Never);
-+        assert_eq!(ask(&view, 112, hash(112), 0), Lookup::NotYet);
-+        assert_eq!(ask(&view, 113, hash(113), 0), Lookup::Never);
++        assert_eq!(ask(&view, 107, hash(107), 6), Lookup::NotYet);
++        assert_eq!(ask(&view, 500, hash(200), 6), Lookup::NotYet);
++        assert_eq!(ask(&view, 113, hash(113), 0), Lookup::NotYet);
 +    }
 +
 +    #[test]
-+    fn another_block_deep_enough_at_the_height_is_never_ready() {
++    fn another_block_deep_enough_at_the_height_is_not_ready() {
 +        let view = BmmView::default();
 +        view.replace_from(&chain(100, 110, 0));
-+        assert_eq!(ask(&view, 104, hash(200), 6), Lookup::Never);
-+        assert_eq!(ask(&view, 105, hash(200), 6), Lookup::NotYet);
++        assert_eq!(ask(&view, 104, hash(200), 6), Lookup::NotYet);
 +    }
 +
 +    /// A fork of `chain(from, to, salt)` whose lowest block has the parent
@@ -9718,7 +8876,7 @@ index 0000000..b89558a
 +        let view = BmmView::default();
 +        view.replace_from(&chain(100, 110, 0));
 +        view.replace_from(&fork(104, 120, 50));
-+        assert_eq!(ask(&view, 104, hash(104), 6), Lookup::Never);
++        assert_eq!(ask(&view, 104, hash(104), 6), Lookup::NotYet);
 +        assert_eq!(
 +            ask(&view, 104, hash(104 + 50), 6),
 +            Lookup::Ready(Some([104; 32]))
@@ -9819,7 +8977,7 @@ index 0000000..b89558a
 +            Lookup::Ready(Some([104; 32]))
 +        );
 +        handle.join().unwrap();
-+        assert_eq!(view.answer(105, &hash(200), 6, 0, Wait::No), Lookup::Never);
++        assert_eq!(view.answer(105, &hash(200), 6, 0, Wait::No), Lookup::NotYet);
 +        view.state
 +            .lock()
 +            .unwrap()
@@ -9962,7 +9120,7 @@ index 0000000..b89558a
 +            Lookup::Ready(Some([110; 32]))
 +        );
 +        handle.join().unwrap();
-+        assert_eq!(view.answer(300, &hash(44), 6, 0, Wait::No), Lookup::Never);
++        assert_eq!(view.answer(300, &hash(44), 6, 0, Wait::No), Lookup::NotYet);
 +        view.state
 +            .lock()
 +            .unwrap()
@@ -10036,89 +9194,14 @@ index 0000000..b89558a
 +    }
 +
 +    #[test]
-+    fn a_block_one_past_the_view_waits_on_an_empty_leader_wait() {
-+        let view = view_with_leader_wait(15, Duration::ZERO);
-+        let writer = Arc::clone(&view);
-+        let handle = std::thread::spawn(move || {
-+            std::thread::sleep(Duration::from_millis(100));
-+            writer.replace_from(&chain(110, 110, 0));
-+            writer.mark_synced();
-+        });
-+        assert_eq!(
-+            view.answer(104, &hash(104), 6, 0, replay(15)),
-+            Lookup::Ready(Some([104; 32]))
-+        );
-+        handle.join().unwrap();
-+        let writer = Arc::clone(&view);
-+        let handle = std::thread::spawn(move || {
-+            std::thread::sleep(Duration::from_millis(100));
-+            writer.replace_from(&chain(111, 111, 0));
-+            writer.mark_synced();
-+        });
-+        assert_eq!(view.hash_at(111, 0, replay(15)), Lookup::Ready(hash(111)));
-+        handle.join().unwrap();
-+    }
-+
-+    #[test]
-+    fn a_block_one_past_the_view_gives_not_yet_after_the_boundary_wait() {
-+        let view = view_with_leader_wait(16, Duration::ZERO);
-+        view.state
-+            .lock()
-+            .unwrap()
-+            .boundary_budgets
-+            .insert(16, Duration::from_millis(300));
-+        let start = Instant::now();
-+        assert_eq!(view.hash_at(110, 0, replay(16)), Lookup::NotYet);
-+        assert!(start.elapsed() >= Duration::from_millis(300));
-+        assert!(start.elapsed() < Duration::from_secs(1));
-+        assert_eq!(
-+            view.answer(104, &hash(104), 6, 0, replay(16)),
-+            Lookup::NotYet
-+        );
-+        assert!(start.elapsed() < Duration::from_secs(1));
-+    }
-+
-+    #[test]
-+    fn a_leader_with_no_boundary_wait_left_gets_not_yet_at_once_one_past_the_view() {
-+        let view = view_with_leader_wait(19, Duration::ZERO);
-+        view.state
-+            .lock()
-+            .unwrap()
-+            .leader_boundary_budgets
-+            .insert(([19; 32], 0), Duration::ZERO);
-+        let start = Instant::now();
-+        assert_eq!(view.hash_at(110, 0, replay(19)), Lookup::NotYet);
-+        assert!(start.elapsed() < Duration::from_millis(500));
-+    }
-+
-+    #[test]
-+    fn the_boundary_waits_of_one_leader_share_one_budget() {
-+        let view = view_with_leader_wait(20, Duration::ZERO);
-+        view.state
-+            .lock()
-+            .unwrap()
-+            .leader_boundary_budgets
-+            .insert(([20; 32], 0), Duration::from_millis(300));
-+        let start = Instant::now();
-+        assert_eq!(view.hash_at(110, 0, replay(20)), Lookup::NotYet);
-+        assert!(start.elapsed() >= Duration::from_millis(300));
-+        assert!(start.elapsed() < Duration::from_secs(1));
-+        let state = view.state.lock().unwrap();
-+        assert_eq!(
-+            state.leader_boundary_budgets.get(&([20; 32], 0)),
-+            Some(&Duration::ZERO)
-+        );
-+    }
-+
-+    #[test]
-+    fn a_block_one_past_the_view_waits_the_slot_wait_on_the_leader_wait() {
++    fn a_replay_waits_the_slot_wait_when_the_leader_has_more_left() {
 +        let leader_left = Duration::from_secs(5);
 +        let view = view_with_leader_wait(17, leader_left);
-+        {
-+            let mut state = view.state.lock().unwrap();
-+            state.budgets.insert(17, Duration::from_millis(400));
-+            state.boundary_budgets.insert(17, Duration::ZERO);
-+        }
++        view.state
++            .lock()
++            .unwrap()
++            .budgets
++            .insert(17, Duration::from_millis(400));
 +        let start = Instant::now();
 +        assert_eq!(
 +            view.answer(104, &hash(104), 6, 0, replay(17)),
@@ -10137,14 +9220,14 @@ index 0000000..b89558a
 +    }
 +
 +    #[test]
-+    fn a_block_two_past_the_view_fails_at_once_on_an_empty_leader_wait() {
++    fn a_block_one_past_the_view_fails_at_once_on_an_empty_leader_wait() {
 +        let view = view_with_leader_wait(18, Duration::ZERO);
 +        let start = Instant::now();
 +        assert_eq!(
-+            view.answer(105, &hash(105), 6, 0, replay(18)),
++            view.answer(104, &hash(104), 6, 0, replay(18)),
 +            Lookup::NotYet
 +        );
-+        assert_eq!(view.hash_at(111, 0, replay(18)), Lookup::NotYet);
++        assert_eq!(view.hash_at(110, 0, replay(18)), Lookup::NotYet);
 +        assert!(start.elapsed() < Duration::from_millis(500));
 +    }
 +
@@ -10212,7 +9295,6 @@ index 0000000..b89558a
 +        view.replace_from(&chain(100, 110, 0));
 +        assert_eq!(view.hash_at(104, 0, Wait::No), Lookup::Ready(hash(104)));
 +        assert_eq!(view.hash_at(112, 0, Wait::No), Lookup::NotYet);
-+        assert_eq!(view.hash_at(113, 0, Wait::No), Lookup::Never);
 +    }
 +
 +    #[test]

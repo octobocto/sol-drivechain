@@ -32,7 +32,8 @@
 #    no root until its bank arrives or the next eCash block comes, and a
 #    hold that brings no bank blocks a new hold for one block. Each restart
 #    needs a new checkpoint K blocks deep.
-#    The RPC `finalized` commitment is the newest root that BMM moved.
+#    The RPC `finalized` commitment is the newest root that BMM moved. While
+#    that root is below the root of the node, each `finalized` read fails.
 # 8. A commitment h* counts only when a pair (bank hash, payee) with
 #    SHA-256(bank hash ‖ payee) = h* is known. The RPC method `bmmPublishPairs`
 #    takes the pairs. The validator sends them to the RPC of every staked
@@ -43,8 +44,7 @@
 # 9. Before a `credit_deposits` runs, the bank asks the local enforcer for the
 #    deposits of that eCash block, after D confirmations from the bridge
 #    config. A checkpoint counts only when its bank credited every deposit
-#    through H - lag, and the active eCash chain still holds those credits.
-#    No leader builds on a bank whose credits the active chain dropped. A
+#    through H - lag, and the active eCash chain still holds those credits. A
 #    settle gets the same rule 3 answer for the credits of its record entry.
 # 10. Each validator keeps the answer of each settle and credit in the file
 #    `bmm-answers` of its ledger. A replay of a slot at or below the root of
