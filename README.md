@@ -241,7 +241,7 @@ commitments than the honest bidders since the split.
 4. **Win.** The miner of block H = T + 1 takes the top bid. It puts h* in the
    coinbase, and the request pays the bid. A losing request is invalid, so it
    costs nothing.
-5. **Settle.** When block H + N + 1 arrives, any node sends
+5. **Settle.** When block H + N + 2 arrives, any node sends
    `settle_bmm(H, hash(H), bank hash)` with the payee account. The program
    checks SHA-256(bank hash ‖ payee) against h*, and it checks that the block
    record of the bank holds the block. It applies rule 3 with the credits of
