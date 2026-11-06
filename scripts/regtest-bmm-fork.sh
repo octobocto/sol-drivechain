@@ -29,6 +29,9 @@ DEPOSIT_D="${DEPOSIT_D:-2}"
 LAG="${DEPOSIT_LAG:-5}"
 # N, the eCash blocks on top of a commitment before its settle.
 N="${BMM_CONFIRMATIONS:-$K}"
+# A restart counts a checkpoint only after the credits reach its height, and
+# a leader credits a height after D + 1 blocks on top.
+RESTART_BLOCKS=$(( K > DEPOSIT_D + 1 ? K : DEPOSIT_D + 1 ))
 # A commitment with no known pair blocks the BMM cursor until the credits
 # pass its height by this many eCash blocks.
 BMM_SKIP_BLOCKS="${BMM_SKIP_BLOCKS:-2}"
@@ -674,7 +677,7 @@ wait_recorded_above H "$SPLIT5"
 MARK_M=$(lines M) MARK_H=$(lines H)
 read -r _ B5 _ < <(checkpoint H)
 [ "$B5" -gt "$SPLIT5" ] || fail "the bid names slot $B5, which is not after the split"
-mine "$K"
+mine "$RESTART_BLOCKS"
 heal
 wait_log M "select a branch that splits behind root" "$MARK_M" 60
 wait_log M "the validator stopped with exit code 75" "$MARK_M" 60
@@ -686,7 +689,7 @@ for try in 1 2 3 4; do
   [ "$try" -lt 4 ] || fail "M did not follow branch B after $try checkpoints"
   read -r _ B5 _ < <(checkpoint H)
   echo "M rooted branch A again before branch B arrived, so H commits slot $B5"
-  mine "$K"
+  mine "$RESTART_BLOCKS"
 done
 wait_log M "moves the root from [0-9]+ to anchor $B5\$" "$MARK_M" 120
 wait_log H "moves the root from [0-9]+ to anchor $B5\$" "$MARK_H" 120
@@ -828,7 +831,7 @@ wait_recorded_above H "$SPLITNA"
 MARK_M=$(lines M) MARK_H=$(lines H)
 read -r _ BNA _ < <(checkpoint H)
 [ "$BNA" -gt "$SPLITNA" ] || fail "the bid names slot $BNA, which is not after the split"
-mine "$K"
+mine "$RESTART_BLOCKS"
 heal
 wait_log M "select a branch that splits behind root" "$MARK_M" 60
 wait_log M "the validator stopped with exit code 75" "$MARK_M" 60
@@ -840,7 +843,7 @@ for try in 1 2 3 4; do
   [ "$try" -lt 4 ] || fail "M did not follow branch B after $try checkpoints"
   read -r _ BNA _ < <(checkpoint H)
   echo "M rooted branch A again before branch B arrived, so H commits slot $BNA"
-  mine "$K"
+  mine "$RESTART_BLOCKS"
 done
 wait_log M "moves the root from [0-9]+ to anchor $BNA\$" "$MARK_M" 120
 wait_log H "moves the root from [0-9]+ to anchor $BNA\$" "$MARK_H" 120
@@ -924,7 +927,7 @@ in_ns "$NS_M" "$D" publish-pair --solana-rpc-url "$(url_of M)" --height "$H11" -
 d bid-bmm "${E[@]}" --commitment "$FAKE_COMMITMENT" --sats 1000 >/dev/null
 mine 1
 [ "$(tip)" = "$H11" ] || fail "the fake commitment did not land at eCash height $H11"
-mine "$K"
+mine "$RESTART_BLOCKS"
 sleep 30
 mine "$L"
 for _ in $(seq 1 600); do
