@@ -91,10 +91,11 @@ pub fn can_credit(config: &Config, block_hash: &[u8; 32], prev_hash: &[u8; 32]) 
 }
 
 /// True when a leader takes a credit of `height` at eCash tip `tip_height`:
-/// the block needs D confirmations, and the leader asks for one more.
+/// the tip is at least D + 1 blocks above the block.
 pub fn credit_is_ready(height: u64, tip_height: u64, deposit_confirmations: u64) -> bool {
     height
         .checked_add(deposit_confirmations)
+        .and_then(|needed| needed.checked_add(1))
         .is_some_and(|needed| tip_height >= needed)
 }
 
@@ -252,11 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn a_credit_waits_for_d_confirmations_and_one_more_block() {
-        assert!(!credit_is_ready(100, 105, 6));
-        assert!(credit_is_ready(100, 106, 6));
-        assert!(credit_is_ready(100, 101, 1));
-        assert!(!credit_is_ready(100, 100, 1));
+    fn a_credit_waits_for_d_plus_one_blocks_on_top() {
+        assert!(!credit_is_ready(100, 106, 6));
+        assert!(credit_is_ready(100, 107, 6));
+        assert!(credit_is_ready(100, 102, 1));
+        assert!(!credit_is_ready(100, 101, 1));
+        assert!(!credit_is_ready(u64::MAX - 6, u64::MAX, 6));
     }
 
     #[test]
