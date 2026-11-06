@@ -266,7 +266,7 @@ start_bid_loop() {
 start_bid_loop
 
 deposit --pubkey "$USER_PUBKEY" --sats "$DEPOSIT_SATS"
-"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
+"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 2)) --address "$COINBASE" >/dev/null
 
 # The credit loop credits every eCash height in order, and the empty heights
 # since the bridge start come first.
@@ -288,7 +288,7 @@ wait "$PEG_PID" 2>/dev/null || true
 DOWN_SATS=1500000
 DOWN_PUBKEY="$("$D" seed-pubkey --mnemonic-file "$MNEMONIC_FILE" --account 1 | awk '{print $2}')"
 deposit --pubkey "$DOWN_PUBKEY" --sats "$DOWN_SATS"
-"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
+"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 2)) --address "$COINBASE" >/dev/null
 start_peg
 
 WANT_DOWN=$((DOWN_SATS * 10))
@@ -404,7 +404,7 @@ echo "the second validator replays at slot $SECOND_SLOT_BEFORE"
 
 
 # Each block gives the loop a new tip to bid on, and the loop publishes the
-# pair of each bid. A win settles N + 1 blocks later, so the whole round takes
+# pair of each bid. A win settles N + 2 blocks later, so the whole round takes
 # about ten blocks.
 PAID=no
 for _ in $(seq 1 120); do
@@ -545,14 +545,14 @@ SOLANA_BLOCK="$("$D" bmm-block --solana-rpc-url "$SOLANA_URL" | awk 'END {print 
 if "$D" settle-bmm --solana-rpc-url "$SOLANA_URL" --program-id "$PROGRAM_ID" \
     --identity "$ROOT/keys/oracle.json" --height "$TIP_HEIGHT" \
     --block-hash "$TIP_HASH" --solana-block "$SOLANA_BLOCK" > "$ROOT/settle-new.log" 2>&1; then
-  fail "a settle for the tip landed, and it must wait for N + 1 blocks"
+  fail "a settle for the tip landed, and it must wait for N + 2 blocks on top"
 fi
 grep -qi "restricted" "$ROOT/settle-new.log" || {
   cat "$ROOT/settle-new.log" >&2
   fail "the validator gave another error than a restricted program"
 }
 [ "$(bridge_value "bmm next height")" = "$NEXT_BEFORE" ] || fail "the height settled anyway"
-echo "PASS: the leader holds back a settle until the block is N + 1 deep"
+echo "PASS: the leader holds back a settle until N + 2 blocks are on top"
 
 step "BMM: a settle for a stale block never lands"
 # A block that a reorg drops is not on the active chain, so its settle fails
@@ -604,7 +604,7 @@ done
 echo "PASS: the loop settled eCash height $STALE_HEIGHT from the new chain"
 
 step "BMM: a reorg deeper than N over a settled height leaves the chain alive"
-# The settles take heights about N + 1 below the tip, so a reorg of 9 blocks
+# The settles take heights about N + 2 below the tip, so a reorg of 9 blocks
 # drops at least one settled eCash block. The migration below replays this
 # ledger from the genesis through those settles.
 for _ in $(seq 1 10); do
@@ -795,7 +795,7 @@ start_bid_loop
 NEW_SATS=700000
 NEW_PUBKEY="$("$D" seed-pubkey --mnemonic-file "$MNEMONIC_FILE" --account 2 | awk '{print $2}')"
 deposit --pubkey "$NEW_PUBKEY" --sats "$NEW_SATS"
-"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 1)) --address "$COINBASE" >/dev/null
+"$D" mine $E --blocks $((DEPOSIT_CONFIRMATIONS + 2)) --address "$COINBASE" >/dev/null
 for _ in $(seq 1 60); do
   [ "$(lamports_of "$NEW_PUBKEY")" = $((NEW_SATS * 10)) ] && break
   sleep 3
