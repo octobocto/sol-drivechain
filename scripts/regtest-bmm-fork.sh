@@ -292,11 +292,21 @@ settle() {
 # passed since the cursor reached it. Each skip waits about 2 minutes, so the
 # walk has a 30 minute deadline.
 settle_through() {
-  local height=$1 next deadline=$((SECONDS + 1800))
+  local height=$1 next block deadline=$((SECONDS + 1800))
   while [ "$SECONDS" -lt "$deadline" ]; do
     next="$(bridge_value "bmm next height")"
     [ "$next" -ge "$height" ] && return 0
-    settle "$next" 11111111111111111111111111111111 >/dev/null 2>&1 || sleep 2
+    # A height with a published pair settles at once. Only a height without
+    # one waits for the skip grace.
+    block="$(grep -ahoE "a new pair for eCash height $next: block [1-9A-HJ-NP-Za-km-z]+" \
+      "$(log_of M)" "$(log_of H)" | tail -1 | awk '{print $NF}' || true)"
+    if [ -n "$block" ] && settle "$next" "$block" >/dev/null 2>&1; then
+      continue
+    fi
+    settle "$next" 11111111111111111111111111111111 >/dev/null 2>&1 || {
+      echo "the cursor waits at eCash height $next"
+      sleep 10
+    }
   done
   fail "the cursor did not reach eCash height $height in 30 minutes"
 }
@@ -761,6 +771,9 @@ wait_log H "head Some\($SN\)" "$MARK_H" 60 >/dev/null
 mine $((N + 1))
 sleep 3
 settle_through "$HN"
+# The settles below HW pay their own checkpoints, so the fees that roll over
+# to HN are the treasury at this point.
+TREASURY_N="$(lamports "$TREASURY")"
 PAID_BEFORE="$(bridge_value "bmm paid total")"
 for _ in $(seq 1 20); do
   settle "$HN" "$SN_HASH" > "$ROOT/settle-next.log" 2>&1 && break
@@ -768,9 +781,9 @@ for _ in $(seq 1 20); do
 done
 grep -q "settled" "$ROOT/settle-next.log" || { cat "$ROOT/settle-next.log" >&2; fail "the next checkpoint did not settle"; }
 PAID=$(( $(bridge_value "bmm paid total") - PAID_BEFORE ))
-[ "$PAID" -ge $((TREASURY_W - TREASURY_LAMPORTS)) ] || fail "the payee got $PAID, less than the fees before the withheld height"
+[ "$PAID" -ge $((TREASURY_N - TREASURY_LAMPORTS)) ] || fail "the payee got $PAID, less than the fees that rolled over past the withheld height"
 [ "$(bridge_value "bmm next height")" = $((HN + 1)) ] || fail "the cursor is not past eCash height $HN"
-echo "eCash height $HN paid $PAID lamports; the fees before the withheld height $HW were $((TREASURY_W - TREASURY_LAMPORTS))"
+echo "eCash height $HN paid $PAID lamports; the fees that rolled over past the withheld height $HW were $((TREASURY_N - TREASURY_LAMPORTS))"
 if settle "$HW" "$SW_HASH" > "$ROOT/settle-late.log" 2>&1; then
   fail "the withheld height settled after the cursor passed it"
 fi
