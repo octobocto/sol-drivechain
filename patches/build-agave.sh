@@ -28,8 +28,10 @@
 #    for the fork choice only after this node replayed its bank. A branch that
 #    splits behind the root and holds more checkpoints, also for banks that
 #    this node does not hold, stops the validator with exit code 75, and the
-#    next start loads an older snapshot. Each restart needs a new checkpoint
-#    K blocks deep.
+#    next start loads an older snapshot. After a restart the stake votes move
+#    no root until its bank arrives or the next eCash block comes, and a
+#    hold that brings no bank blocks a new hold for one block. Each restart
+#    needs a new checkpoint K blocks deep.
 #    The RPC `finalized` commitment is the newest root that BMM moved.
 # 8. A commitment h* counts only when a pair (bank hash, payee) with
 #    SHA-256(bank hash ‖ payee) = h* is known. The RPC method `bmmPublishPairs`

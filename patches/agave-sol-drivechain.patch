@@ -253,10 +253,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..44fe65c
+index 0000000..6b88027
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,532 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -519,6 +519,18 @@ index 0000000..44fe65c
 +            tip_height,
 +            fork_choice::params(),
 +        );
++        let mut saved = self.saved.clone();
++        let banks = &self.banks;
++        let holds = |bank_hash: &BankHash| {
++            banks.iter().any(|bank| bank.hash == *bank_hash) || below_root.holds(bank_hash)
++        };
++        if fork_choice::apply_hold(&mut choice, &mut saved, holds, tip_height) {
++            info!("BMM: the restart hold ends at eCash tip {tip_height}");
++            match saved.store(&self.ledger) {
++                Ok(()) => self.saved = saved,
++                Err(error) => error!("cannot write the BMM fork choice state: {error}"),
++            }
++        }
 +        if choice.head != self.choice.head
 +            || choice.fallback != self.choice.fallback
 +            || choice.tied != self.choice.tied
@@ -672,6 +684,16 @@ index 0000000..44fe65c
 +        let mut saved = self.saved.clone();
 +        saved.handled_height = restart.trigger_height;
 +        saved.restart_to = Some(restart.anchor.slot);
++        let waited: Vec<BankHash> = self
++            .absent
++            .iter()
++            .filter(|checkpoint| {
++                checkpoint.height > restart.anchor.height
++                    && checkpoint.height <= restart.trigger_height
++            })
++            .map(|checkpoint| checkpoint.bank_hash)
++            .collect();
++        fork_choice::start_hold(&mut saved, waited, self.tip_height);
 +        saved.store(&self.ledger)?;
 +        self.saved = saved;
 +        Ok(Some(restart))
@@ -5199,10 +5221,10 @@ index 0000000..248a0d1
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..20df244
+index 0000000..1588ccc
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2498 @@
+@@ -0,0 +1,2613 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -6072,6 +6094,54 @@ index 0000000..20df244
 +    pub handled_height: u64,
 +    /// The next start must load a snapshot at or below this slot.
 +    pub restart_to: Option<Slot>,
++    /// While a restart waits for its banks, the stake votes move no root.
++    pub hold: Option<Hold>,
++    /// No restart starts a hold below this eCash height.
++    pub hold_pause_until: u64,
++}
++
++/// The banks that a restart waits for, and the eCash tip at the restart.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Hold {
++    pub tip_height: u64,
++    pub bank_hashes: Vec<BankHash>,
++}
++
++/// Starts a hold for a restart to `bank_hashes` at eCash tip `tip_height`,
++/// unless the pause after a hold that brought no bank still runs.
++pub fn start_hold(saved: &mut Saved, bank_hashes: Vec<BankHash>, tip_height: u64) {
++    if tip_height >= saved.hold_pause_until && !bank_hashes.is_empty() {
++        saved.hold = Some(Hold {
++            tip_height,
++            bank_hashes,
++        });
++    }
++}
++
++/// Stops the fallback while the hold waits. A bank of the hold that this node
++/// holds ends it. The next eCash block ends it too, and then no hold starts for
++/// one block, so fakes cannot keep the stake votes from the root. True when
++/// `saved` changed.
++pub fn apply_hold(
++    choice: &mut Choice,
++    saved: &mut Saved,
++    holds: impl Fn(&BankHash) -> bool,
++    tip_height: u64,
++) -> bool {
++    let Some(hold) = &saved.hold else {
++        return false;
++    };
++    if hold.bank_hashes.iter().any(holds) {
++        saved.hold = None;
++        return true;
++    }
++    if tip_height > hold.tip_height {
++        saved.hold = None;
++        saved.hold_pause_until = tip_height.saturating_add(1);
++        return true;
++    }
++    choice.fallback = false;
++    false
 +}
 +
 +impl Saved {
@@ -6136,6 +6206,13 @@ index 0000000..20df244
 +        if let Some(slot) = self.restart_to {
 +            text.push_str(&format!("restart {slot}\n"));
 +        }
++        if let Some(hold) = &self.hold {
++            let banks: Vec<String> = hold.bank_hashes.iter().map(to_hex).collect();
++            text.push_str(&format!("hold {} {}\n", hold.tip_height, banks.join(",")));
++        }
++        if self.hold_pause_until > 0 {
++            text.push_str(&format!("pause {}\n", self.hold_pause_until));
++        }
 +        text
 +    }
 +
@@ -6175,6 +6252,13 @@ index 0000000..20df244
 +                }
 +                ["handled", height] => saved.handled_height = height.parse().ok()?,
 +                ["restart", slot] => saved.restart_to = Some(slot.parse().ok()?),
++                ["hold", tip_height, banks] => {
++                    saved.hold = Some(Hold {
++                        tip_height: tip_height.parse().ok()?,
++                        bank_hashes: banks.split(',').map(from_hex).collect::<Option<Vec<_>>>()?,
++                    })
++                }
++                ["pause", height] => saved.hold_pause_until = height.parse().ok()?,
 +                // State files from older versions hold these lines.
 +                ["proof", ..] | ["distrust", ..] => {}
 +                _ => return None,
@@ -7201,6 +7285,54 @@ index 0000000..20df244
 +    }
 +
 +    #[test]
++    fn a_hold_stops_the_fallback_until_its_bank_arrives() {
++        let mut saved = Saved::default();
++        start_hold(&mut saved, vec![[0xee; 32]], 120);
++        let mut choice = Choice {
++            fallback: true,
++            ..Choice::default()
++        };
++        assert!(!apply_hold(&mut choice, &mut saved, |_| false, 120));
++        assert!(!choice.fallback);
++        let mut choice = Choice {
++            fallback: true,
++            ..Choice::default()
++        };
++        assert!(apply_hold(
++            &mut choice,
++            &mut saved,
++            |bank| *bank == [0xee; 32],
++            120
++        ));
++        assert!(choice.fallback);
++        assert_eq!(saved.hold, None);
++        assert_eq!(saved.hold_pause_until, 0);
++    }
++
++    #[test]
++    fn a_hold_ends_at_the_next_ecash_block_and_pauses_one_block() {
++        let mut saved = Saved::default();
++        start_hold(&mut saved, vec![[0xee; 32]], 120);
++        let mut choice = Choice {
++            fallback: true,
++            ..Choice::default()
++        };
++        assert!(apply_hold(&mut choice, &mut saved, |_| false, 121));
++        assert!(choice.fallback);
++        assert_eq!(saved.hold, None);
++        start_hold(&mut saved, vec![[0xef; 32]], 121);
++        assert_eq!(saved.hold, None, "the pause block starts no hold");
++        start_hold(&mut saved, vec![[0xef; 32]], 122);
++        assert_eq!(
++            saved.hold,
++            Some(Hold {
++                tip_height: 122,
++                bank_hashes: vec![[0xef; 32]],
++            })
++        );
++    }
++
++    #[test]
 +    fn handled_checkpoints_cause_no_second_restart() {
 +        let checkpoints = [checkpoint(100, 5), unknown(101), unknown(102)];
 +        let anchors = [anchor(100, 5)];
@@ -7623,6 +7755,11 @@ index 0000000..20df244
 +            base: Some(base(3, 90)),
 +            handled_height: 102,
 +            restart_to: Some(5),
++            hold: Some(Hold {
++                tip_height: 110,
++                bank_hashes: vec![[0xee; 32], [0xef; 32]],
++            }),
++            hold_pause_until: 98,
 +        };
 +        saved.store(&dir).unwrap();
 +        assert_eq!(Saved::load(&dir).unwrap(), saved);
