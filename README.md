@@ -331,7 +331,9 @@ only makes blocks.
 
 A settle or a credit that the bridge refuses from its config alone runs at
 once, fails, and pays its fee. A leader drops a "not ready" settle or credit,
-and the daemon sends it again in its next round, 2 seconds later. On replay,
+and the daemon sends it again in its next round, 2 seconds later. When the
+local preflight passes but the view of the leader lags, the send waits until
+its blockhash expires, about one minute, before the next try. On replay,
 the questions of one slot wait 10 seconds in all for a late eCash block, and
 then the block is dead. The slots of one leader in one epoch wait 60 seconds
 in all. While the enforcer does not answer, the replay waits and marks no
@@ -342,7 +344,9 @@ A replay of a slot of the ledger at the start takes the answer from
 `bmm-answers`, not from the enforcer, when this node ran that block before. An eCash reorg deeper than N or D after that run can remove the eCash
 block that a settle or a credit names. Without the kept answer, a restart or a
 replay from the genesis marks that slot dead. A slot that comes after the start
-always asks the enforcer, so no new block can use a kept answer. A node that
+always asks the enforcer. The file keys the answers by slot, so after a
+restart a duplicate block of an equivocating leader above the root can take a
+kept answer. This costs only that node a repair. A node that
 replays from the genesis without the file of the node that ran the slot still
 needs the enforcer answer.
 
