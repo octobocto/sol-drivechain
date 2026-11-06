@@ -253,10 +253,10 @@ index 9c1e4e5..96459bb 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..6b88027
+index 0000000..89a0513
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,532 @@
+@@ -0,0 +1,537 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -633,7 +633,12 @@ index 0000000..6b88027
 +        let candidates: Vec<Checkpoint> = self
 +            .checkpoints
 +            .iter()
-+            .chain(self.absent.iter())
++            // A checkpoint that failed rule 3 stays out after a root move prunes its bank.
++            .chain(self.absent.iter().filter(|checkpoint| {
++                !self
++                    .rejected
++                    .contains(&(checkpoint.height, checkpoint.bank_hash))
++            }))
 +            .copied()
 +            .collect();
 +        let restart = fork_choice::restart(
