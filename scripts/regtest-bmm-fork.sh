@@ -887,6 +887,10 @@ grep -aE "checkpoint at eCash height ($X1|$X2) fails rule 3" "$(log_of H)" | tai
 start_credit M
 sleep 10
 read -r C9B C9B_HASH < <(confirmed_frozen M)
+for _ in $(seq 1 30); do
+  [ "$(frozen_hash H "$C9B")" = "$C9B_HASH" ] && break
+  sleep 2
+done
 [ "$(frozen_hash H "$C9B")" = "$C9B_HASH" ] || fail "M and H froze slot $C9B with other hashes"
 pass "two checkpoints of the censoring branch failed rule 3; one honest checkpoint at eCash height $Y9 won, and M follows H at slot $C9B"
 
