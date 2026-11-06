@@ -172,6 +172,15 @@ wait_log() {
   done
   fail "node $node logged no line that matches '$pattern' in $seconds seconds"
 }
+# True when the node logs a line that matches within the seconds.
+logs_within() {
+  local node=$1 pattern=$2 since=$3 seconds=$4
+  for _ in $(seq 1 "$seconds"); do
+    tail -n +"$((since + 1))" "$(log_of "$node")" | grep -aqE -m1 "$pattern" && return 0
+    sleep 1
+  done
+  return 1
+}
 
 # The bank hash that a node froze for a slot, in base58.
 frozen_hash() {
@@ -658,7 +667,15 @@ heal
 wait_log M "select a branch that splits behind root" "$MARK_M" 60
 wait_log M "the validator stopped with exit code 75" "$MARK_M" 60
 wait_log M "BMM restart: the start loads a snapshot at or below slot $ANCHOR4" "$MARK_M" 120
-wait_log M "head Some\($B5\)" "$MARK_M" 600
+# The stake votes can root branch A again before M replays branch B. The next
+# checkpoint on branch B then restarts M again, so H bids again.
+for try in 1 2 3 4; do
+  logs_within M "head Some\($B5\)" "$MARK_M" 240 && break
+  [ "$try" -lt 4 ] || fail "M did not follow branch B after $try checkpoints"
+  read -r _ B5 _ < <(checkpoint H)
+  echo "M rooted branch A again before branch B arrived, so H commits slot $B5"
+  mine "$K"
+done
 wait_log M "moves the root from [0-9]+ to anchor $B5\$" "$MARK_M" 120
 wait_log H "moves the root from [0-9]+ to anchor $B5\$" "$MARK_H" 120
 sleep 10
@@ -797,7 +814,15 @@ heal
 wait_log M "select a branch that splits behind root" "$MARK_M" 60
 wait_log M "the validator stopped with exit code 75" "$MARK_M" 60
 RESTARTNA="$(wait_log M "BMM restart: the start loads a snapshot at or below slot [0-9]+" "$MARK_M" 120)"
-wait_log M "head Some\($BNA\)" "$MARK_M" 600
+# The stake votes can root branch A again before M replays branch B. The next
+# checkpoint on branch B then restarts M again, so H bids again.
+for try in 1 2 3 4; do
+  logs_within M "head Some\($BNA\)" "$MARK_M" 240 && break
+  [ "$try" -lt 4 ] || fail "M did not follow branch B after $try checkpoints"
+  read -r _ BNA _ < <(checkpoint H)
+  echo "M rooted branch A again before branch B arrived, so H commits slot $BNA"
+  mine "$K"
+done
 wait_log M "moves the root from [0-9]+ to anchor $BNA\$" "$MARK_M" 120
 wait_log H "moves the root from [0-9]+ to anchor $BNA\$" "$MARK_H" 120
 sleep 10
