@@ -176,7 +176,8 @@ wait_log() {
 logs_within() {
   local node=$1 pattern=$2 since=$3 seconds=$4
   for _ in $(seq 1 "$seconds"); do
-    tail -n +"$((since + 1))" "$(log_of "$node")" | grep -aqE -m1 "$pattern" && return 0
+    # grep -q would end the pipe early, and pipefail turns that SIGPIPE into a miss.
+    [ -n "$(tail -n +"$((since + 1))" "$(log_of "$node")" | grep -aE -m1 "$pattern" || true)" ] && return 0
     sleep 1
   done
   return 1
@@ -592,7 +593,7 @@ read -r H3 B3 _ < <(checkpoint H)
 echo "eCash height $H3 commits slot $B3, which only H holds, and only H has the pair"
 wait_log H "head Some\($B3\)" "$MARK_H" >/dev/null
 sleep 10
-if tail -n +"$((MARK_M + 1))" "$(log_of M)" | grep -aqE "head Some\($B3\)"; then
+if [ -n "$(tail -n +"$((MARK_M + 1))" "$(log_of M)" | grep -aE -m1 "head Some\($B3\)" || true)" ]; then
   fail "M counted a checkpoint for a block that it does not hold"
 fi
 [ -z "$(frozen_hash M "$B3")" ] || fail "M holds slot $B3 before the link is up"
@@ -699,7 +700,7 @@ wait_rpc M
 # The stop took every process of the namespace, the credit loop too.
 start_credit M
 wait_log M "BMM fork choice is on" "$MARK_M" 60
-if tail -n +"$((MARK_M + 1))" "$(log_of M)" | grep -aq "found new cluster confirmed root"; then
+if [ -n "$(tail -n +"$((MARK_M + 1))" "$(log_of M)" | grep -a -m1 "found new cluster confirmed root" || true)" ]; then
   fail "M took a root from the stake votes at start"
 fi
 MARK_M=$(lines M) MARK_H=$(lines H)
