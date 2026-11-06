@@ -1201,11 +1201,7 @@ async fn bid(
                 "the node refused the bid, so the wallet scans the chain, and the next round bids again"
             );
             let mut scanner = enforcer.clone();
-            tokio::spawn(async move {
-                if let Err(error) = scanner.full_scan().await {
-                    tracing::error!(%error, "the wallet scan failed");
-                }
-            });
+            start_scan(async move { scanner.full_scan().await });
             Ok(Bid::Rejected)
         }
         Err(error) => {
@@ -1215,6 +1211,27 @@ async fn bid(
             Ok(Bid::Unknown)
         }
     }
+}
+
+/// True while a wallet scan runs.
+static SCAN_RUNS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Starts `scan` in the background unless a scan runs, and gives true when it
+/// started one.
+fn start_scan(
+    scan: impl Future<Output = Result<(), crate::enforcer::EnforcerError>> + Send + 'static,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if SCAN_RUNS.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    tokio::spawn(async move {
+        if let Err(error) = scan.await {
+            tracing::error!(%error, "the wallet scan failed");
+        }
+        SCAN_RUNS.store(false, Ordering::SeqCst);
+    });
+    true
 }
 
 /// True when the round bids for the eCash tip `tip`, read after the settles:
@@ -1634,6 +1651,33 @@ mod tests {
         assert!(!bids_again(&Ok(Bid::Unknown)));
         let kept = memory.lock().await.pairs_to_publish(400, 505, 6);
         assert_eq!(kept, vec![pair]);
+    }
+
+    #[tokio::test]
+    async fn one_wallet_scan_runs_at_a_time() {
+        let (done, wait) = tokio::sync::oneshot::channel::<()>();
+        assert!(start_scan(async move {
+            let _ = wait.await;
+            Ok(())
+        }));
+        assert!(!start_scan(async { Ok(()) }), "a scan runs");
+        done.send(()).unwrap();
+        let mut started = false;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if start_scan(async { Err(crate::enforcer::EnforcerError::MissingField("scan")) }) {
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "the end of a scan clears the gate");
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if !SCAN_RUNS.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+        }
+        panic!("a failed scan clears the gate");
     }
 
     #[test]
