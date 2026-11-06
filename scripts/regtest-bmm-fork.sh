@@ -22,8 +22,9 @@ ROOT="${ROOT:-$HOME/bmm-fork-regtest}"
 SLOT="${SLOT:-8}"
 K="${BMM_ROOT_DEPTH:-2}"
 L="${BMM_FALLBACK_BLOCKS:-8}"
-# D, the eCash confirmations before a credit, and the lag of rule 3. A short
-# lag lets a censoring branch lose its checkpoints within a few blocks.
+# D, the eCash confirmations before a credit, and the lag of rule 3. A leader
+# credits a height at D + 1 blocks on top. A short lag lets a censoring branch
+# lose its checkpoints within a few blocks.
 DEPOSIT_D="${DEPOSIT_D:-2}"
 LAG="${DEPOSIT_LAG:-5}"
 # N, the eCash blocks on top of a commitment before its settle.
@@ -527,9 +528,9 @@ for id in "$M_ID" "$H_ID"; do
 done
 start_credit M
 start_credit H
-mine "$DEPOSIT_D"
-wait_credited M "$(( $(tip) - DEPOSIT_D ))"
-wait_credited H "$(( $(tip) - DEPOSIT_D ))"
+mine $((DEPOSIT_D + 1))
+wait_credited M "$(( $(tip) - DEPOSIT_D - 1 ))"
+wait_credited H "$(( $(tip) - DEPOSIT_D - 1 ))"
 pass "M at slot $M_SLOT and H at slot $H_SLOT; the bridge settles from eCash height $(bridge_value "bmm next height"), and both credit loops run"
 
 # ---------------------------------------------------------------------------
@@ -766,8 +767,12 @@ pay_fees 2
 read -r HN SN SN_HASH < <(checkpoint M)
 wait_log M "head Some\($SN\)" "$MARK_M" 60 >/dev/null
 wait_log H "head Some\($SN\)" "$MARK_H" 60 >/dev/null
-mine $((N + 1))
-sleep 3
+# The settle of HN needs N + 2 blocks on top. The skip of HW needs the credits,
+# which reach the tip - D - 1, at HW + BMM_SKIP_BLOCKS.
+MINE_8=$((HW + BMM_SKIP_BLOCKS + DEPOSIT_D + 1 - HN))
+[ "$MINE_8" -ge $((N + 2)) ] || MINE_8=$((N + 2))
+mine "$MINE_8"
+wait_credited M "$((HW + BMM_SKIP_BLOCKS))"
 settle_through "$HN"
 # The settles below HW pay their own checkpoints, so the fees that roll over
 # to HN are the treasury at this point.

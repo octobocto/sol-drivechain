@@ -1794,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    fn a_settle_waits_for_n_plus_one_blocks_on_top() {
+    fn a_settle_waits_for_n_plus_two_blocks_on_top() {
         assert!(!settle_is_ready(100, 107, 6));
         assert!(settle_is_ready(100, 108, 6));
     }
