@@ -607,11 +607,12 @@ step "BMM: a reorg deeper than N over a settled height leaves the chain alive"
 # The settles take heights about N + 2 below the tip, so a reorg of 9 blocks
 # drops at least one settled eCash block. The migration below replays this
 # ledger from the genesis through those settles.
+# The settle of the newest height needs time after each block.
 for _ in $(seq 1 10); do
-  [ "$(bridge_value "bmm next height")" -gt $(( $(btc getblockcount) - 8 )) ] && break
-  sleep 3
   earn_fees
   "$D" mine $E --blocks 1 --address "$COINBASE" >/dev/null
+  sleep 6
+  [ "$(bridge_value "bmm next height")" -gt $(( $(btc getblockcount) - 8 )) ] && break
 done
 # A node that has not replayed a settle before a reorg drops its eCash block
 # cannot check it later, so the second validator catches up first.
