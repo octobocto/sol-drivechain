@@ -776,11 +776,14 @@ MINE_8=$((HW + BMM_SKIP_BLOCKS + DEPOSIT_D + 1 - HN))
 [ "$MINE_8" -ge $((N + 2)) ] || MINE_8=$((N + 2))
 mine "$MINE_8"
 wait_credited M "$((HW + BMM_SKIP_BLOCKS))"
+settle_through "$HW"
+PAID_AT_HW="$(bridge_value "bmm paid total")"
 settle_through "$HN"
+PAID_BEFORE="$(bridge_value "bmm paid total")"
+[ "$PAID_BEFORE" = "$PAID_AT_HW" ] || fail "the skip of the withheld height $HW paid $((PAID_BEFORE - PAID_AT_HW)) lamports"
 # The settles below HW pay their own checkpoints, so the fees that roll over
 # to HN are the treasury at this point.
 TREASURY_N="$(lamports "$TREASURY")"
-PAID_BEFORE="$(bridge_value "bmm paid total")"
 for _ in $(seq 1 20); do
   settle "$HN" "$SN_HASH" > "$ROOT/settle-next.log" 2>&1 && break
   sleep 3
