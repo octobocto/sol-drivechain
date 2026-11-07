@@ -682,15 +682,10 @@ heal
 wait_log M "select a branch that splits behind root" "$MARK_M" 60
 wait_log M "the validator stopped with exit code 75" "$MARK_M" 60
 wait_log M "BMM restart: the start loads a snapshot at or below slot $ANCHOR4" "$MARK_M" 120
-# The stake votes can root branch A again before M replays branch B. The next
-# checkpoint on branch B then restarts M again, so H bids again.
-for try in 1 2 3 4; do
-  logs_within M "head Some\($B5\)" "$MARK_M" 240 && break
-  [ "$try" -lt 4 ] || fail "M did not follow branch B after $try checkpoints"
-  read -r _ B5 _ < <(checkpoint H)
-  echo "M rooted branch A again before branch B arrived, so H commits slot $B5"
-  mine "$RESTART_BLOCKS"
-done
+# No eCash block comes before branch B arrives, so the restart hold keeps the
+# stake votes from rooting branch A again.
+logs_within M "head Some\($B5\)" "$MARK_M" 240 || fail "M did not follow branch B after the restart"
+logs_within M "the restart hold ends" "$MARK_M" 60 || fail "M had no restart hold"
 wait_log M "moves the root from [0-9]+ to anchor $B5\$" "$MARK_M" 120
 wait_log H "moves the root from [0-9]+ to anchor $B5\$" "$MARK_H" 120
 sleep 10
@@ -839,15 +834,8 @@ heal
 wait_log M "select a branch that splits behind root" "$MARK_M" 60
 wait_log M "the validator stopped with exit code 75" "$MARK_M" 60
 RESTARTNA="$(wait_log M "BMM restart: the start loads a snapshot at or below slot [0-9]+" "$MARK_M" 120)"
-# The stake votes can root branch A again before M replays branch B. The next
-# checkpoint on branch B then restarts M again, so H bids again.
-for try in 1 2 3 4; do
-  logs_within M "head Some\($BNA\)" "$MARK_M" 240 && break
-  [ "$try" -lt 4 ] || fail "M did not follow branch B after $try checkpoints"
-  read -r _ BNA _ < <(checkpoint H)
-  echo "M rooted branch A again before branch B arrived, so H commits slot $BNA"
-  mine "$RESTART_BLOCKS"
-done
+logs_within M "head Some\($BNA\)" "$MARK_M" 240 || fail "M did not follow branch B after the restart"
+logs_within M "the restart hold ends" "$MARK_M" 60 || fail "M had no restart hold"
 wait_log M "moves the root from [0-9]+ to anchor $BNA\$" "$MARK_M" 120
 wait_log H "moves the root from [0-9]+ to anchor $BNA\$" "$MARK_H" 120
 sleep 10
