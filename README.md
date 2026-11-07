@@ -137,12 +137,6 @@ and an account below its rent reserve after the credit. A target outside that
 list must come writable, or the tx fails, so no sender can strand a deposit on
 purpose.
 
-An eCash reorg can replace a block after its first parts. The bank then holds
-credits of a dropped block, the same as a dropped `credited_block`: its
-checkpoints fail rule 3, and no leader builds on it. The leaders build on the
-newest bank before the first part, and that branch credits the new block from
-index 0.
-
 ## The books
 
 Three equations hold at all times:
