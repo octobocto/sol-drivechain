@@ -895,7 +895,6 @@ fn main() -> Result<(), CliError> {
             println!("paid through      {}", config.paid_through);
             println!("bundled through   {}", config.bundled_through);
             println!("bundle sealed at  {}", config.bundle_sealed_height);
-            println!("bundle sealed slot {}", config.bundle_sealed_slot);
             println!("withdrawal fee    {} sats", bridge::MIN_FEE_SATS);
             if !books {
                 return Ok(());
@@ -1831,7 +1830,6 @@ mod tests {
             paid_through: 0,
             bundled_through: 0,
             bundle_sealed_height: 0,
-            bundle_sealed_slot: 0,
             bmm_skip_blocks: 0,
             bmm_next_since_slot: 0,
             bundle_m6id: [0u8; 32],

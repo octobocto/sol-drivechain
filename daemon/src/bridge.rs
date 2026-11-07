@@ -183,14 +183,13 @@ pub struct Config {
     pub paid_through: u64,
     pub bundled_through: u64,
     pub bundle_sealed_height: u64,
-    pub bundle_sealed_slot: u64,
     pub bmm_skip_blocks: u64,
     pub bmm_next_since_slot: u64,
     pub bundle_m6id: [u8; 32],
 }
 
 impl Config {
-    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 8 + 32;
+    pub const LEN: usize = 8 + 32 + 8 * 5 + 8 * 3 + 32 + 8 + 32 + 8 + 1 + 1 + 1 + 8 * 7 + 32;
 
     /// The record indices of the live bundle, if one is live.
     pub fn live_bundle(&self) -> Option<std::ops::Range<u64>> {
@@ -239,7 +238,6 @@ impl Config {
             self.paid_through,
             self.bundled_through,
             self.bundle_sealed_height,
-            self.bundle_sealed_slot,
             self.bmm_skip_blocks,
             self.bmm_next_since_slot,
         ] {
@@ -286,7 +284,6 @@ impl Config {
             paid_through: reader.u64().ok_or_else(|| cut("paid_through"))?,
             bundled_through: reader.u64().ok_or_else(|| cut("bundled_through"))?,
             bundle_sealed_height: reader.u64().ok_or_else(|| cut("bundle_sealed_height"))?,
-            bundle_sealed_slot: reader.u64().ok_or_else(|| cut("bundle_sealed_slot"))?,
             bmm_skip_blocks: reader.u64().ok_or_else(|| cut("bmm_skip_blocks"))?,
             bmm_next_since_slot: reader.u64().ok_or_else(|| cut("bmm_next_since_slot"))?,
             bundle_m6id: reader.array32().ok_or_else(|| cut("bundle_m6id"))?,
@@ -637,7 +634,6 @@ mod tests {
             paid_through: 4,
             bundled_through: 9,
             bundle_sealed_height: 990,
-            bundle_sealed_slot: 77,
             bmm_skip_blocks: 6,
             bmm_next_since_slot: 600,
             bundle_m6id: [6u8; 32],
@@ -911,7 +907,7 @@ mod tests {
     fn the_config_sits_at_the_offsets_that_the_validator_reads() {
         let data = a_config().encode();
         let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        assert_eq!(data.len(), 283);
+        assert_eq!(data.len(), 275);
         assert_eq!(&data[8..40], &[7u8; 32]);
         assert_eq!(at(64), 900);
         assert_eq!(at(80), 6);
@@ -926,10 +922,9 @@ mod tests {
         assert_eq!(at(203), 4);
         assert_eq!(at(211), 9);
         assert_eq!(at(219), 990);
-        assert_eq!(at(227), 77);
-        assert_eq!(at(235), 6);
-        assert_eq!(at(243), 600);
-        assert_eq!(&data[251..283], &[6u8; 32]);
+        assert_eq!(at(227), 6);
+        assert_eq!(at(235), 600);
+        assert_eq!(&data[243..275], &[6u8; 32]);
     }
 
     #[test]

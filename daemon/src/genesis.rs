@@ -212,7 +212,6 @@ pub fn accounts(
         paid_through: 0,
         bundled_through: 0,
         bundle_sealed_height: 0,
-        bundle_sealed_slot: 0,
         bmm_skip_blocks: params.bmm_skip_blocks,
         bmm_next_since_slot: 0,
         bundle_m6id: [0u8; 32],
@@ -730,7 +729,7 @@ mod tests {
         let accounts = accounts(&params(), None, &[]).unwrap();
         let config = find(&accounts, &bridge::config_pda(&params().program_id).0);
         assert_eq!(config.data.len(), Config::LEN);
-        assert_eq!(config.lamports, (128 + 283) * 4);
+        assert_eq!(config.lamports, (128 + 275) * 4);
         assert_eq!(config.owner, params().program_id);
         let record = find(&accounts, &bridge::BMM_BLOCKS_ID);
         assert_eq!(record.data, vec![0u8; bridge::BLOCK_RECORD_LEN]);
@@ -828,7 +827,6 @@ mod tests {
         assert_eq!((config.paid_through, config.bundled_through), (1, 2));
         assert_eq!(config.bundle_sealed_height, 470);
         assert_eq!(config.bundle_m6id, [6u8; 32]);
-        assert_eq!(config.bundle_sealed_slot, 0);
     }
 
     #[test]

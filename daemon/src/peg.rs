@@ -826,7 +826,6 @@ mod tests {
             paid_through,
             bundled_through,
             bundle_sealed_height: 50,
-            bundle_sealed_slot: 1_000,
             bmm_skip_blocks: 0,
             bmm_next_since_slot: 0,
             bundle_m6id: [0u8; 32],
@@ -1451,20 +1450,6 @@ mod tests {
         let config = a_config(3, 1, 3);
         let view = a_view(config, config, BundleStatus::Succeeded { height: 100 });
         assert_eq!(decide(&view), Action::Wait);
-    }
-
-    #[test]
-    fn a_paid_bundle_needs_no_age_after_its_seal() {
-        let mut config = a_config(3, 1, 3);
-        config.bundle_sealed_slot = u64::MAX;
-        let view = a_view(config, config, BundleStatus::Succeeded { height: 80 });
-        assert_eq!(
-            decide(&view),
-            Action::MarkPaid {
-                through: 3,
-                height: 80
-            }
-        );
     }
 
     #[test]
