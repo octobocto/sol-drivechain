@@ -228,6 +228,74 @@ index 9c1e4e5..69ffe66 100644
      struct TestFrame {
          mint_keypair: Keypair,
          bank: Arc<Bank>,
+diff --git a/core/src/block_creation_loop/rewards/certs_builder/entry.rs b/core/src/block_creation_loop/rewards/certs_builder/entry.rs
+index aa891a1..2592f37 100644
+--- a/core/src/block_creation_loop/rewards/certs_builder/entry.rs
++++ b/core/src/block_creation_loop/rewards/certs_builder/entry.rs
+@@ -211,6 +211,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[ignore = "sol-drivechain: alpenglow is never active"]
+     fn validate_build_skip_cert() {
+         let slot = 123;
+         let max_validators = 5;
+@@ -232,6 +233,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[ignore = "sol-drivechain: alpenglow is never active"]
+     fn validate_build_notar_cert() {
+         let slot = 123;
+         let max_validators = 5;
+diff --git a/core/src/block_creation_loop/rewards/certs_builder/entry/notar_entry.rs b/core/src/block_creation_loop/rewards/certs_builder/entry/notar_entry.rs
+index 2d383fb..7c75b1a 100644
+--- a/core/src/block_creation_loop/rewards/certs_builder/entry/notar_entry.rs
++++ b/core/src/block_creation_loop/rewards/certs_builder/entry/notar_entry.rs
+@@ -105,6 +105,7 @@ mod tests {
+     };
+ 
+     #[test]
++    #[ignore = "sol-drivechain: alpenglow is never active"]
+     fn validator_add_vote() {
+         let slot = 123;
+         let max_validators = 5;
+@@ -156,6 +157,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[ignore = "sol-drivechain: alpenglow is never active"]
+     fn validate_build_cert() {
+         let slot = 123;
+         let max_validators = 5;
+diff --git a/core/src/block_creation_loop/rewards/certs_builder/entry/partial_cert.rs b/core/src/block_creation_loop/rewards/certs_builder/entry/partial_cert.rs
+index 0d4a055..4c53368 100644
+--- a/core/src/block_creation_loop/rewards/certs_builder/entry/partial_cert.rs
++++ b/core/src/block_creation_loop/rewards/certs_builder/entry/partial_cert.rs
+@@ -125,6 +125,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[ignore = "sol-drivechain: alpenglow is never active"]
+     fn validate_build_sig_bitmap() {
+         let slot = 123;
+         let max_validators = 2;
+@@ -147,6 +148,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[ignore = "sol-drivechain: alpenglow is never active"]
+     fn validate_add_vote() {
+         let slot = 123;
+         let max_validators = 2;
+@@ -179,6 +181,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[ignore = "sol-drivechain: alpenglow is never active"]
+     fn validate_wants_vote() {
+         let slot = 123;
+         let max_validators = 2;
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
 index 0000000..fb1f200
@@ -1127,6 +1195,117 @@ index c5a5f4d..c882afd 100644
      #[allow(clippy::too_many_arguments)]
      /// A wrapper around `root_utils::check_and_handle_new_root` which:
      /// - calls into `root_utils::set_bank_forks_root`
+diff --git a/core/src/replay_stage/tests.rs b/core/src/replay_stage/tests.rs
+index 047e227..094448d 100644
+--- a/core/src/replay_stage/tests.rs
++++ b/core/src/replay_stage/tests.rs
+@@ -2830,7 +2830,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
+ }
+ 
+ #[test]
+-fn test_update_parent_restart() {
++fn test_update_parent_restarts_no_slot() {
+     let ReplayBlockstoreComponents {
+         blockstore,
+         vote_simulator,
+@@ -2872,7 +2872,7 @@ fn test_update_parent_restart() {
+         tx.send(UpdateParentSignal { slot }).unwrap();
+     }
+ 
+-    let cleared_bank_id = bank_forks.read().unwrap().get(4).unwrap().bank_id();
++    let kept_bank_id = bank_forks.read().unwrap().get(4).unwrap().bank_id();
+     let (replay_vote_sender, replay_vote_receiver) = bounded(1024);
+     let mut async_verification_freelist = Vec::new();
+     handle_update_parent_interrupts(
+@@ -2886,14 +2886,15 @@ fn test_update_parent_restart() {
+         &post_migration_status_for_tests(),
+     );
+ 
+-    assert!(progress.get(&4).is_none()); // cleared: 5 < 32
+-    assert!(progress.get(&8).is_some()); // skipped: 40 >= 32
+-    assert_eq!(
+-        replay_vote_receiver.try_recv(),
+-        Ok(ReplayVoteMessage::InvalidBank {
+-            replay_bank_id: cleared_bank_id,
+-            replay_slot: 4,
+-        })
++    // sol-drivechain: alpenglow_fast_leader_handover is never active.
++    assert!(progress.get(&4).is_some());
++    assert!(progress.get(&8).is_some());
++    assert!(
++        bank_forks
++            .read()
++            .unwrap()
++            .get(4)
++            .is_some_and(|bank| bank.bank_id() == kept_bank_id)
+     );
+     assert!(replay_vote_receiver.try_recv().is_err());
+ }
+@@ -3114,7 +3115,7 @@ fn test_update_parent_keeps_hard() {
+ }
+ 
+ #[test]
+-fn test_pre_update_soft_dead() {
++fn test_pre_update_failure_hard_dead() {
+     let ReplayBlockstoreComponents {
+         blockstore,
+         vote_simulator,
+@@ -3158,10 +3159,11 @@ fn test_pre_update_soft_dead() {
+         &mut dead_slot_context,
+     );
+ 
+-    assert!(!blockstore.is_dead(slot));
++    // sol-drivechain: alpenglow_fast_leader_handover is never active.
++    assert!(blockstore.is_dead(slot));
+     assert!(matches!(
+         progress.get(&slot).unwrap().dead_reason,
+-        Some(DeadSlotReason::ReplayFailureBeforeUpdateParent)
++        Some(DeadSlotReason::Hard)
+     ));
+     assert_eq!(
+         replay_vote_receiver.try_recv(),
+@@ -3225,7 +3227,7 @@ fn test_after_update_hard_dead() {
+ }
+ 
+ #[test]
+-fn test_before_update_soft_dead() {
++fn test_before_update_failure_hard_dead() {
+     let ReplayBlockstoreComponents {
+         blockstore,
+         vote_simulator,
+@@ -3282,15 +3284,16 @@ fn test_before_update_soft_dead() {
+         &mut dead_slot_context,
+     );
+ 
+-    assert!(!blockstore.is_dead(slot));
++    // sol-drivechain: alpenglow_fast_leader_handover is never active.
++    assert!(blockstore.is_dead(slot));
+     assert!(matches!(
+         progress.get(&slot).unwrap().dead_reason,
+-        Some(DeadSlotReason::ReplayFailureBeforeUpdateParent)
++        Some(DeadSlotReason::Hard)
+     ));
+ }
+ 
+ #[test]
+-fn test_soft_dead_restarts() {
++fn test_soft_dead_does_not_restart() {
+     let ReplayBlockstoreComponents {
+         blockstore,
+         vote_simulator,
+@@ -3328,9 +3331,10 @@ fn test_soft_dead_restarts() {
+         &post_migration_status_for_tests(),
+     );
+ 
++    // sol-drivechain: alpenglow_fast_leader_handover is never active.
+     assert!(!blockstore.is_dead(slot));
+-    assert!(progress.get(&slot).is_none());
+-    assert!(bank_forks.read().unwrap().get(slot).is_none());
++    assert!(progress.get(&slot).is_some());
++    assert!(bank_forks.read().unwrap().get(slot).is_some());
+ }
+ 
+ #[test]
 diff --git a/core/src/validator.rs b/core/src/validator.rs
 index 400ad25..1021348 100644
 --- a/core/src/validator.rs
