@@ -26,7 +26,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
           ref: ${{ github.event.inputs.tag || github.ref }}
@@ -42,10 +42,10 @@ jobs:
 
       - name: Install the Agave CLI
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          sh -c "$(curl -sSfL https://release.anza.xyz/v4.2.2/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: |
             .
@@ -57,17 +57,9 @@ jobs:
       - name: Build the daemon
         run: cargo build --release --manifest-path daemon/Cargo.toml
 
-      # A joiner takes the two patched binaries from the release, so it starts
-      # in minutes and never builds Agave itself.
-      - name: Cache the patched Agave build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/src/agave/target
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: agave-${{ env.AGAVE_TAG }}-${{ hashFiles('patches/agave-sol-drivechain.patch') }}
-
+      # A joiner takes the patched binaries from the release, so it never
+      # builds Agave itself. The test jobs write the Agave cache, so the release
+      # builds Agave from source.
       - name: Build the patched Agave binaries
         run: bash patches/build-agave.sh
 
@@ -95,7 +87,7 @@ jobs:
           echo "hashid2 (build commit)    $GITHUB_SHA"
 
       - name: Publish the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: ${{ steps.pack.outputs.name }}
           body: |
