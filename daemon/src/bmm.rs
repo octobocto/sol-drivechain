@@ -976,6 +976,7 @@ async fn round(
         .await
         .forget_fees_below(tip_height.saturating_sub(settings.confirmations + 1));
     // The settles and the pairs go first, so a slow bid never holds them back.
+    // A bid waits on the wallet lock of a scan, so no bid goes out during one.
     let settled = settle(live, settings, identity, tip).await;
     // The settles can take long, and a bid must name the newest tip.
     let tip = enforcer.tip().await?;
@@ -1009,6 +1010,8 @@ pub enum Bid {
     Rejected,
     /// The bid tx may have gone out, and its answer was lost.
     Unknown,
+    /// A wallet scan runs, so the bid waits for a later round.
+    Busy,
 }
 
 /// Keeps and publishes the pair of a bid before the bid goes out. A bid with
@@ -1176,6 +1179,10 @@ async fn bid(
         tracing::debug!(height, "the fees of one block give no bid");
         return Ok(Bid::Declined);
     }
+    if scan_runs() {
+        tracing::info!(height, "a wallet scan runs, so the bid waits");
+        return Ok(Bid::Busy);
+    }
     keep_pair(memory, &live.rpc, pair).await;
     match enforcer
         .create_bmm_request(bid, tip, &pair.commitment())
@@ -1216,6 +1223,10 @@ async fn bid(
 /// True while a wallet scan runs.
 static SCAN_RUNS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+fn scan_runs() -> bool {
+    SCAN_RUNS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Starts `scan` in the background unless a scan runs, and gives true when it
 /// started one.
 fn start_scan(
@@ -1241,10 +1252,14 @@ pub fn bids_for(no_bid: bool, last_bid_tip: Option<BlockHash>, tip: BlockHash) -
 }
 
 /// True when the next round bids for the same tip again: no recorded block
-/// passes rule 3 yet, the node refused the bid tx, or the round failed before
-/// any bid tx. A bid whose outcome is unknown gets no second try.
+/// passes rule 3 yet, the node refused the bid tx, a wallet scan runs, or the
+/// round failed before any bid tx. A bid whose outcome is unknown gets no
+/// second try.
 pub fn bids_again(result: &Result<Bid, BmmError>) -> bool {
-    matches!(result, Ok(Bid::NoBlock | Bid::Rejected) | Err(_))
+    matches!(
+        result,
+        Ok(Bid::NoBlock | Bid::Rejected | Bid::Busy) | Err(_)
+    )
 }
 
 /// True when a failed round must stop the loop. The enforcer and the Solana
@@ -1661,6 +1676,7 @@ mod tests {
             Ok(())
         }));
         assert!(!start_scan(async { Ok(()) }), "a scan runs");
+        assert!(scan_runs(), "a bid waits for the scan");
         done.send(()).unwrap();
         let mut started = false;
         for _ in 0..100 {
@@ -1673,7 +1689,7 @@ mod tests {
         assert!(started, "the end of a scan clears the gate");
         for _ in 0..100 {
             tokio::task::yield_now().await;
-            if !SCAN_RUNS.load(std::sync::atomic::Ordering::SeqCst) {
+            if !scan_runs() {
                 return;
             }
         }
@@ -1699,6 +1715,7 @@ mod tests {
         assert!(bids_again(&Err(stale)));
         assert!(bids_again(&Ok(Bid::NoBlock)));
         assert!(bids_again(&Ok(Bid::Rejected)));
+        assert!(bids_again(&Ok(Bid::Busy)), "a running scan delays the bid");
         assert!(
             !bids_again(&Ok(Bid::Unknown)),
             "a lost answer gets no second bid"
