@@ -18,7 +18,8 @@ RestrictRealtime=yes
 LockPersonality=yes
 CapabilityBoundingSet=
 ProtectSystem=strict
-ProtectHome=read-only
+TemporaryFileSystem=/root:ro /home:ro /run/user:ro
+BindReadOnlyPaths=/root/src/sol-drivechain
 ProtectKernelTunables=yes
 PrivateDevices=yes
 RestrictNamespaces=yes
@@ -26,6 +27,9 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+# Each peer is on this host, so no key leaves it.
+IPAddressDeny=any
+IPAddressAllow=localhost
 TemporaryFileSystem=/root/src/sol-drivechain/keys:ro
 BindReadOnlyPaths=/root/src/sol-drivechain/keys/validator-identity.json /root/src/sol-drivechain/keys/bridge-program.pubkey
 Environment=HOME=/root

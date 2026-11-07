@@ -29,28 +29,31 @@ cleanup() {
     rm -f "/etc/systemd/system/$unit.service"
   done
   systemctl daemon-reload
-  rm -rf "$TREE" /root/sol-regtest
+  rm -rf "$TREE" /root/sol-regtest /root/home-secret
 }
 trap cleanup EXIT
 
 mkdir -p "$TREE/keys" "$TREE/genesis/ledger" "$TREE/daemon/target/release" "$TREE/scripts"
-for key in validator-identity.json validator-vote.json oracle.json oracle.bundles.json \
-  faucet.json user.json mnemonic.txt bridge-program.pubkey; do
+for key in validator-identity.json validator-vote.json validator-stake.json oracle.json \
+  oracle.bundles.json faucet.json user.json mnemonic.txt bridge-program.pubkey; do
   echo secret >"$TREE/keys/$key"
 done
+echo secret >/root/home-secret
 
 PROBE="$TREE/probe.sh"
 cat >"$PROBE" <<'EOF'
 #!/usr/bin/env bash
 TREE=/root/src/sol-drivechain
-for key in validator-identity.json validator-vote.json oracle.json oracle.bundles.json \
-  faucet.json user.json mnemonic.txt bridge-program.pubkey; do
+for key in validator-identity.json validator-vote.json validator-stake.json oracle.json \
+  oracle.bundles.json faucet.json user.json mnemonic.txt bridge-program.pubkey; do
   if cat "$TREE/keys/$key" >/dev/null 2>&1; then echo "PROBE read $key yes"; else echo "PROBE read $key no"; fi
 done
 write() {
   if : >"$2/.probe" 2>/dev/null && rm -f "$2/.probe"; then echo "PROBE write $1 yes"; else echo "PROBE write $1 no"; fi
 }
+if cat /root/home-secret >/dev/null 2>&1; then echo "PROBE read home yes"; else echo "PROBE read home no"; fi
 write etc /etc
+write daemon "$TREE/daemon/target/release"
 write usr /usr
 write keys "$TREE/keys"
 write ledger "$TREE/genesis/ledger"
@@ -127,21 +130,24 @@ check() {
 check sol-validator \
   "read validator-identity.json yes" "read validator-vote.json yes" "read bridge-program.pubkey yes" \
   "read oracle.json no" "read oracle.bundles.json no" "read mnemonic.txt no" \
-  "read faucet.json no" "read user.json no" \
-  "write etc no" "write usr no" "write keys no" "write ledger yes" "nonewprivs 1"
+  "read faucet.json no" "read user.json no" "read validator-stake.json no" "read home no" \
+  "write etc no" "write usr no" "write keys no" "write daemon no" "write ledger yes" \
+  "write regtest no" \
+  "nonewprivs 1" "capeff 0000000000000000"
 
 check sol-bmm \
   "read validator-identity.json yes" "read bridge-program.pubkey yes" \
   "read validator-vote.json no" "read oracle.json no" "read oracle.bundles.json no" \
   "read mnemonic.txt no" "read faucet.json no" "read user.json no" \
-  "write etc no" "write keys no" "write ledger no" "write regtest no" \
+  "read validator-stake.json no" "read home no" \
+  "write etc no" "write keys no" "write daemon no" "write ledger no" "write regtest no" \
   "nonewprivs 1" "capeff 0000000000000000"
 
 check sol-peg \
   "read oracle.json yes" "read oracle.bundles.json yes" "read bridge-program.pubkey yes" \
   "read validator-identity.json no" "read validator-vote.json no" "read mnemonic.txt no" \
-  "read faucet.json no" "read user.json no" \
-  "write etc no" "write ledger no" "write regtest no" "rename bundles yes" \
+  "read faucet.json no" "read user.json no" "read validator-stake.json no" "read home no" \
+  "write etc no" "write daemon no" "write ledger no" "write regtest no" "rename bundles yes" \
   "nonewprivs 1" "capeff 0000000000000000"
 
 check sol-regtest "write etc no" "write usr no" "write regtest yes" "nonewprivs 1"
