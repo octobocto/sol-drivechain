@@ -230,10 +230,10 @@ index 9c1e4e5..69ffe66 100644
          bank: Arc<Bank>,
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..9b2f329
+index 0000000..fb1f200
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,515 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -356,8 +356,9 @@ index 0000000..9b2f329
 +
 +    /// Computes the choice again when the eCash view, the pairs, or the
 +    /// frozen banks changed. `frozen_banks` holds the root and the frozen
-+    /// banks above it.
-+    pub(crate) fn update(&mut self, root: Slot, frozen_banks: &[Arc<Bank>]) {
++    /// banks above it. An error means that the state file did not take the
++    /// end of a hold.
++    pub(crate) fn update(&mut self, root: Slot, frozen_banks: &[Arc<Bank>]) -> io::Result<()> {
 +        sol_drivechain_bmm::answers::answers().prune_noted_below(root);
 +        let highest = frozen_banks
 +            .iter()
@@ -372,10 +373,10 @@ index 0000000..9b2f329
 +            highest,
 +        );
 +        if self.key == Some(key) {
-+            return;
++            return Ok(());
 +        }
 +        let Some((tip_height, checkpoints, unmatched)) = checkpoints() else {
-+            return;
++            return Ok(());
 +        };
 +        let recent = tip_height.saturating_sub(fork_choice::params().fallback_blocks);
 +        for height in unmatched
@@ -464,18 +465,17 @@ index 0000000..9b2f329
 +            tip_height,
 +            fork_choice::params(),
 +        );
-+        let mut saved = self.saved.clone();
 +        let banks = &self.banks;
 +        let holds = |bank_hash: &BankHash| {
 +            banks.iter().any(|bank| bank.hash == *bank_hash) || below_root.holds(bank_hash)
 +        };
-+        if fork_choice::apply_hold(&mut choice, &mut saved, holds, tip_height) {
-+            info!("BMM: the restart hold ends at eCash tip {tip_height}");
-+            match saved.store(&self.ledger) {
-+                Ok(()) => self.saved = saved,
-+                Err(error) => error!("cannot write the BMM fork choice state: {error}"),
-+            }
-+        }
++        let stored = apply_hold(
++            &mut choice,
++            &mut self.saved,
++            &self.ledger,
++            holds,
++            tip_height,
++        );
 +        if choice.head != self.choice.head
 +            || choice.fallback != self.choice.fallback
 +            || choice.tied != self.choice.tied
@@ -487,6 +487,7 @@ index 0000000..9b2f329
 +            );
 +        }
 +        self.choice = choice;
++        stored
 +    }
 +
 +    /// The deposit credits of each frozen bank, checked against the active
@@ -668,9 +669,29 @@ index 0000000..9b2f329
 +    last
 +}
 +
++/// Applies the restart hold to `choice`, and writes `saved` when the hold
++/// ends. The end stays in memory when the write fails, so the pause after it
++/// still holds.
++fn apply_hold(
++    choice: &mut Choice,
++    saved: &mut Saved,
++    ledger: &Path,
++    holds: impl Fn(&BankHash) -> bool,
++    tip_height: u64,
++) -> io::Result<()> {
++    if !fork_choice::apply_hold(choice, saved, holds, tip_height) {
++        return Ok(());
++    }
++    info!("BMM: the restart hold ends at eCash tip {tip_height}");
++    saved.store(ledger)
++}
++
 +#[cfg(test)]
 +mod tests {
-+    use {super::*, sol_drivechain_bmm::fork_choice::Anchor};
++    use {
++        super::*,
++        sol_drivechain_bmm::fork_choice::{Anchor, Hold},
++    };
 +
 +    fn bmm_with(choice: Choice) -> BmmForkChoice {
 +        BmmForkChoice {
@@ -706,6 +727,26 @@ index 0000000..9b2f329
 +        });
 +        assert!(bmm.take_new_root(10).is_err());
 +        assert_ne!(fork_choice::final_root(), 777_777);
++    }
++
++    #[test]
++    fn a_failed_store_keeps_the_end_of_a_hold() {
++        let mut saved = Saved {
++            hold: Some(Hold {
++                tip_height: 50,
++                bank_hashes: vec![[3; 32]],
++            }),
++            ..Saved::default()
++        };
++        let mut choice = Choice {
++            fallback: true,
++            ..Choice::default()
++        };
++        let ledger = PathBuf::from("/nonexistent/bmm-ledger");
++        assert!(apply_hold(&mut choice, &mut saved, &ledger, |_| false, 51).is_err());
++        assert_eq!(saved.hold, None);
++        assert_eq!(saved.hold_pause_until, 52);
++        assert!(choice.fallback);
 +    }
 +}
 diff --git a/core/src/commitment_service.rs b/core/src/commitment_service.rs
@@ -806,7 +847,7 @@ index 5180157..7eafc97 100644
  pub mod cluster_slots_service;
  pub mod commitment_service;
 diff --git a/core/src/replay_stage.rs b/core/src/replay_stage.rs
-index c5a5f4d..7a8761b 100644
+index c5a5f4d..c882afd 100644
 --- a/core/src/replay_stage.rs
 +++ b/core/src/replay_stage.rs
 @@ -4,6 +4,7 @@ use {
@@ -836,7 +877,7 @@ index c5a5f4d..7a8761b 100644
              // Thread pool to (maybe) replay multiple threads in parallel
              let replay_mode = if replay_forks_threads.get() == 1 {
                  ForkReplayMode::Serial
-@@ -1255,9 +1268,37 @@ impl ReplayStage {
+@@ -1255,9 +1268,39 @@ impl ReplayStage {
                      compute_slot_stats_time.stop();
  
                      let mut select_forks_time = Measure::start("select_forks_time");
@@ -845,7 +886,9 @@ index c5a5f4d..7a8761b 100644
                          .heaviest_subtree_fork_choice
                          .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
 +                    if let Some(bmm) = bmm_choice.as_mut() {
-+                        bmm.update(forks_root, &frozen_banks);
++                        if let Err(error) = bmm.update(forks_root, &frozen_banks) {
++                            error!("cannot write the BMM fork choice state: {error}");
++                        }
 +                        let bmm_heaviest =
 +                            bmm.heaviest(&tbft_structs.heaviest_subtree_fork_choice, &bank_forks);
 +                        if let Some(bmm_heaviest) = &bmm_heaviest
@@ -875,7 +918,7 @@ index c5a5f4d..7a8761b 100644
                      select_forks_time.stop();
  
                      let mut select_vote_and_reset_forks_time =
-@@ -1276,6 +1317,9 @@ impl ReplayStage {
+@@ -1276,6 +1319,9 @@ impl ReplayStage {
                          &latest_validator_votes_for_frozen_banks,
                          &tbft_structs.heaviest_subtree_fork_choice,
                      );
@@ -885,7 +928,7 @@ index c5a5f4d..7a8761b 100644
                      select_vote_and_reset_forks_time.stop();
  
                      if vote_bank.is_none() {
-@@ -1347,8 +1391,31 @@ impl ReplayStage {
+@@ -1347,8 +1393,31 @@ impl ReplayStage {
                              wait_to_vote_slot,
                              migration_status.as_ref(),
                              &mut tbft_structs,
@@ -917,7 +960,7 @@ index c5a5f4d..7a8761b 100644
                      voting_time.stop();
  
                      let mut reset_bank_time = Measure::start("reset_bank");
-@@ -1433,6 +1500,21 @@ impl ReplayStage {
+@@ -1433,6 +1502,21 @@ impl ReplayStage {
                                  last_reset_bank_descendants = vec![];
                              }
  
@@ -939,7 +982,7 @@ index c5a5f4d..7a8761b 100644
                              if let Some(last_voted_slot) = tower.last_voted_slot() {
                                  // If the current heaviest bank is not a descendant of the last voted slot,
                                  // there must be a partition
-@@ -2038,6 +2120,13 @@ impl ReplayStage {
+@@ -2038,6 +2122,13 @@ impl ReplayStage {
          // confirmed, what happens then? Should probably keep track of dumped list and skip things
          // in `duplicate_slots_to_repair` that have already been dumped. Add test.
          duplicate_slots_to_repair.retain(|duplicate_slot, correct_hash| {
@@ -953,7 +996,7 @@ index c5a5f4d..7a8761b 100644
              // Should not dump duplicate slots if there is currently a poh bank building
              // on top of that slot, as BankingStage might still be referencing/touching that state
              // concurrently.
-@@ -2911,7 +3000,11 @@ impl ReplayStage {
+@@ -2911,7 +3002,11 @@ impl ReplayStage {
                  ("leader", next_leader_id.to_string(), String),
              );
  
@@ -966,7 +1009,7 @@ index c5a5f4d..7a8761b 100644
                  let latest_unconfirmed_leader_slot = progress_map
                      .get_latest_leader_slot_must_exist(parent_slot)
                      .expect(
-@@ -3047,16 +3140,21 @@ impl ReplayStage {
+@@ -3047,16 +3142,21 @@ impl ReplayStage {
          wait_to_vote_slot: Option<Slot>,
          migration_status: &MigrationStatus,
          tbft_structs: &mut TowerBFTStructures,
@@ -992,7 +1035,7 @@ index c5a5f4d..7a8761b 100644
  
          if let Some(new_root) = new_root {
              let highest_super_majority_root = Some(
-@@ -4955,6 +5053,91 @@ impl ReplayStage {
+@@ -4955,6 +5055,91 @@ impl ReplayStage {
          duplicate_confirmed_forks
      }
  
