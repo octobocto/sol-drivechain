@@ -8,7 +8,14 @@ Type=simple
 User=root
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=full
+CapabilityBoundingSet=
+ProtectSystem=strict
+TemporaryFileSystem=/root:ro /home:ro /run/user:ro
+ProtectKernelTunables=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
@@ -17,13 +24,18 @@ ProtectHostname=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
-# The RPC answers the world, so the validator sees only its own keys.
+# The RPC answers the world, so the validator sees only its own keys, and it
+# writes only its ledger.
+BindReadOnlyPaths=/root/src/sol-drivechain -/root/src/agave/target/release -/root/.local/share/solana/install
+BindPaths=/root/src/sol-drivechain/genesis/ledger
 TemporaryFileSystem=/root/src/sol-drivechain/keys:ro
 BindReadOnlyPaths=/root/src/sol-drivechain/keys/validator-identity.json -/root/src/sol-drivechain/keys/validator-vote.json /root/src/sol-drivechain/keys/bridge-program.pubkey
 Environment=HOME=/root
 Environment=AGAVE_VALIDATOR=/root/src/agave/target/release/agave-validator
 Environment=ENFORCER_URL=http://127.0.0.1:50051
 Environment=SIDECHAIN_SLOT=8
+# XDP needs network capabilities, and one validator gains nothing from it.
+Environment=XDP=0
 # NETWORK sets N, K, and L. eCash takes N = 6, K = 3, and L = 12.
 Environment=NETWORK=ecash
 # The address that a joiner reaches. A first validator cannot learn it, so it
