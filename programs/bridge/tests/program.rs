@@ -106,7 +106,7 @@ impl Chain {
         let mut config_data = genesis_config(oracle.pubkey(), float_lamports);
         // The cursor of the genesis moved at the first slot of the chain.
         let start_slot = svm.get_sysvar::<anchor_lang::prelude::Clock>().slot;
-        config_data[243..251].copy_from_slice(&start_slot.to_le_bytes());
+        config_data[235..243].copy_from_slice(&start_slot.to_le_bytes());
         let config_lamports = svm.minimum_balance_for_rent_exemption(config_data.len());
         svm.set_account(
             config,
@@ -689,7 +689,6 @@ fn genesis_config(oracle: Pubkey, float_lamports: u64) -> Vec<u8> {
         paid_through: 0,
         bundled_through: 0,
         bundle_sealed_height: 0,
-        bundle_sealed_slot: 0,
         bmm_skip_blocks: BMM_SKIP_BLOCKS,
         bmm_next_since_slot: 0,
         bundle_m6id: [0; 32],
@@ -805,7 +804,7 @@ fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
     let oracle = Pubkey::new_from_array([5u8; 32]);
     let data = genesis_config(oracle, 7);
     let at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-    assert_eq!(data.len(), 283);
+    assert_eq!(data.len(), 275);
     assert_eq!(&data[..8], Config::DISCRIMINATOR);
     assert_eq!(&data[8..40], oracle.as_ref());
     assert_eq!(at(64), BMM_START);
@@ -820,9 +819,9 @@ fn the_genesis_config_has_the_layout_that_the_daemon_writes() {
     );
     assert_eq!(at(187), VAULT_LAMPORTS);
     assert_eq!(at(195), 7);
-    assert_eq!(at(235), BMM_SKIP_BLOCKS);
-    assert_eq!(at(243), 0);
-    assert_eq!(data[251..283], [0; 32]);
+    assert_eq!(at(227), BMM_SKIP_BLOCKS);
+    assert_eq!(at(235), 0);
+    assert_eq!(data[243..275], [0; 32]);
 }
 
 #[test]
@@ -1650,7 +1649,7 @@ fn a_paid_bundle_is_marked_paid_in_the_slot_of_its_seal() {
         .withdraw(0, 5_000_000, 1_000, &A_P2WPKH)
         .expect("the withdrawal lands");
     chain.seal().expect("the bundle seals");
-    let sealed = chain.config().bundle_sealed_slot;
+    let sealed = chain.svm.get_sysvar::<anchor_lang::prelude::Clock>().slot;
     chain
         .bundle_paid(1)
         .expect("the paid proof alone marks the bundle paid");

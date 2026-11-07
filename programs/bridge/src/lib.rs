@@ -425,7 +425,6 @@ pub mod bridge {
         config.bundled_through = through;
         config.bundle_m6id = m6id;
         config.bundle_sealed_height = config.credited_height;
-        config.bundle_sealed_slot = Clock::get()?.slot;
         msg!(
             "the bundle holds records {} to {}",
             config.paid_through,
@@ -871,8 +870,6 @@ pub struct Config {
     pub bundled_through: u64,
     /// `credited_height` when the live bundle was sealed. Its M3 comes later.
     pub bundle_sealed_height: u64,
-    /// The slot that sealed the live bundle.
-    pub bundle_sealed_slot: u64,
     /// A commitment at eCash height H that no pair matches can settle with no
     /// payout once `credited_height` reaches H + `bmm_skip_blocks`.
     pub bmm_skip_blocks: u64,
