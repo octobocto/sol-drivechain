@@ -397,12 +397,19 @@ pub mod bridge {
         )
     }
 
-    /// Puts the open records from `paid_through` up to `through` into the
-    /// live bundle, whose blinded M6 has the ID `m6id`. Only one bundle is
-    /// live at a time, and a record never leaves its bundle, so no two
-    /// bundles that eCash can pay hold the same record.
-    pub fn seal_bundle(ctx: Context<SealBundle>, through: u64, m6id: [u8; 32]) -> Result<()> {
+    /// Puts the open records from `first` up to `through` into the live
+    /// bundle, whose blinded M6 has the ID `m6id`. `first` must be
+    /// `paid_through`. Only one bundle is live at a time, and a record never
+    /// leaves its bundle, so no two bundles that eCash can pay hold the same
+    /// record.
+    pub fn seal_bundle(
+        ctx: Context<SealBundle>,
+        first: u64,
+        through: u64,
+        m6id: [u8; 32],
+    ) -> Result<()> {
         let config = &mut ctx.accounts.config;
+        require_eq!(first, config.paid_through, BridgeError::BadBundleStart);
         require_eq!(
             config.bundled_through,
             config.paid_through,
@@ -968,4 +975,6 @@ pub enum BridgeError {
     NotTheSealedM6id,
     #[msg("The eCash block holds no Succeeded event for the M6ID.")]
     BundleNotPaid,
+    #[msg("The first record of the bundle is not paid_through.")]
+    BadBundleStart,
 }

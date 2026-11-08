@@ -431,15 +431,18 @@ pub fn transfer_ix(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
     }
 }
 
-/// Puts the open records up to `through` into the live bundle, whose blinded
-/// M6 has the ID `m6id` in the internal byte order. The oracle signs.
+/// Puts the open records from `first` up to `through` into the live bundle,
+/// whose blinded M6 has the ID `m6id` in the internal byte order. The bridge
+/// takes it only when `first` is its `paid_through`. The oracle signs.
 pub fn seal_bundle_ix(
     program_id: &Pubkey,
     oracle: &Pubkey,
+    first: u64,
     through: u64,
     m6id: &[u8; 32],
 ) -> Instruction {
     let mut data = discriminator("global", "seal_bundle").to_vec();
+    data.extend_from_slice(&first.to_le_bytes());
     data.extend_from_slice(&through.to_le_bytes());
     data.extend_from_slice(m6id);
     Instruction {
@@ -1005,10 +1008,11 @@ mod tests {
     fn the_oracle_signs_the_seal_and_the_payment() {
         let program_id = a_program_id();
         let oracle = Pubkey::new_from_array([1u8; 32]);
-        let seal = seal_bundle_ix(&program_id, &oracle, 9, &[6u8; 32]);
+        let seal = seal_bundle_ix(&program_id, &oracle, 4, 9, &[6u8; 32]);
         assert_eq!(seal.data[..8], discriminator("global", "seal_bundle"));
-        assert_eq!(seal.data[8..16], 9u64.to_le_bytes());
-        assert_eq!(seal.data[16..], [6u8; 32]);
+        assert_eq!(seal.data[8..16], 4u64.to_le_bytes());
+        assert_eq!(seal.data[16..24], 9u64.to_le_bytes());
+        assert_eq!(seal.data[24..], [6u8; 32]);
         let paid = bundle_paid_ix(&program_id, &oracle, 9, 300, &[4u8; 32], &[6u8; 32]);
         // The patch reads `bundle_paid_question` in this order.
         assert_eq!(paid.data.len(), 88);
