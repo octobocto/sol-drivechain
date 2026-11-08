@@ -129,6 +129,11 @@ that a credit may still use. A credit must name the child of `credited_block`,
 and each part of a height must name the block of the first part, so one bank
 credits one eCash chain only.
 
+One credit holds at most 16 deposits. The daemon makes a part smaller when
+its targets hold more account data than one tx can load. Each close tx of
+paid records stays under the same data limit. When the same part fails 100
+times in a row, the credit loop stops with an error.
+
 A deposit whose target cannot take the lamports stays in the vault. The bridge
 counts it in `stranded_lamports`. The key and the account decide this, not the
 tx: a reserved account key (a sysvar, a builtin program, a BMM answer), an
@@ -161,9 +166,10 @@ as eCash pays it.
    flood of records can delay the payouts. The script must be a byte-exact P2PKH, P2SH, P2WPKH, P2WSH, or P2TR template.
    The enforcer reads any other output as a treasury or a deposit, and then
    it refuses the whole M6.
-2. When no bundle is live, the oracle sends `seal_bundle(through, M6ID)`. It
+2. When no bundle is live, the oracle sends `seal_bundle(first, through, M6ID)`. It
    takes the records from `paid_through` up to the withdrawal count at
-   `finalized`, and it reads them at `finalized`. The
+   `finalized`, and it reads them at `finalized`. The bridge refuses the
+   seal when `first` is not its `paid_through`. The
    live bundle is the records from `paid_through` to `bundled_through`, at
    most 1500, and the bridge keeps the M6ID of their blinded M6. One
    bundle is live at a time, and a record never leaves its bundle, so no two
@@ -310,7 +316,7 @@ only makes blocks.
 | Part | What it does |
 |---|---|
 | Treasury | Every fee goes to the treasury, not to the leader. |
-| Vote fee | A simple vote pays no signature fee only when its vote account holds at least 0.1% of the epoch stake and its authorized voter signs it. Every other tx pays. Alpenglow stays off, so votes are txs. |
+| Vote fee | A simple vote with one TowerSync or UpdateVoteState instruction pays no signature fee only when its vote account holds at least 0.1% of the epoch stake and its authorized voter signs it. Such a vote lands only when it succeeds, and a block that holds a free vote that fails is dead. Every other tx pays. Alpenglow stays off, so votes are txs. |
 | `sol-drivechain-bmm` | A view of the active eCash chain, filled from the local enforcer. |
 | Settle check | For each tx with a top-level `settle_bmm(H, M, S)`, the bank asks the view. It passes only when M is the active block at H. A leader needs N + 2 blocks on top, and replay needs N. |
 | Credit check | For each tx with a top-level `credit_deposits(H, M, ...)`, the bank asks the view for the deposits of M, after D confirmations. A leader needs two more. |
@@ -338,9 +344,9 @@ A replay of a slot of the ledger at the start takes the answer from
 `bmm-answers`, not from the enforcer, when this node ran that block before. An eCash reorg deeper than N or D after that run can remove the eCash
 block that a settle or a credit names. Without the kept answer, a restart or a
 replay from the genesis marks that slot dead. A slot that comes after the start
-always asks the enforcer. The file keys the answers by slot, so after a
-restart a duplicate block of an equivocating leader above the root can take a
-kept answer. This costs only that node a repair. A node that
+always asks the enforcer. The file keys the answers by slot, parent bank
+hash, and signature, so a duplicate block of an equivocating leader on another
+parent never takes a kept answer. A node that
 replays from the genesis without the file of the node that ran the slot still
 needs the enforcer answer.
 
@@ -393,10 +399,12 @@ An existing chain cannot change the value.
   fallback. `finalized` stays at the last BMM root. Each read at
   `finalized` then fails, because the node no longer holds the state of
   that slot. When checkpoints come back and name another branch, BMM still
-  overrules the stake roots with a restart. After a restart, the stake votes
-  move no root until a bank of the BMM branch arrives or the next eCash block
-  comes. A hold that brings no bank blocks a new hold for one block, so fake
-  pairs cannot keep the stake votes from the root. A late branch waits for the
+  overrules the stake roots with a restart. After a restart, neither the stake
+  votes nor the checkpoints move the root until the banks of the BMM branch
+  arrive, or until the next eCash block after the first tip that the node
+  sees. A hold that ends without its banks blocks a new hold for one block, so
+  fake pairs cannot keep the root still. A checkpoint for a bank that the hold
+  waits for causes no second restart. A late branch waits for the
   next checkpoint and its restart. A checkpoint for a bank that
   this node does not hold never stops the fallback.
 - **Join.** A node that starts from a snapshot shows no `finalized` block
@@ -404,9 +412,11 @@ An existing chain cannot change the value.
   root.
 
 A conflict above the root is a normal fork switch. A branch that splits behind
-the root wins only after an eCash reorg deeper than K, or after a fallback
-root. Then the validator stops with exit code 75. The next start loads a
-snapshot at or below the newest valid anchor, removes the newer roots and the
+the root wins only after an eCash reorg deeper than K, after a fallback root,
+or after this node rooted its own checkpoint while it did not have the branch
+with more checkpoints. Then the validator stops with exit code 75. The next
+start loads a snapshot at or below the newest valid anchor below the root,
+removes the newer roots and the
 tower, and replays the winning branch. systemd starts the validator again, and
 no operator acts. A node without a saved anchor, for example after a snapshot
 join, takes each checkpoint in the block record of its root as an anchor.
@@ -592,7 +602,8 @@ treasury. More stages prove the hard cases:
 `scripts/regtest-bmm-fork.sh` proves the fork choice with two staked
 validators in network namespaces: the root, a switch, a pending checkpoint, a
 tie, the fallback and its restart, a restart from disk, a commitment without a
-pair, a withheld pair, and a censoring stake majority.
+pair, a withheld pair, a censoring stake majority, and a node that rooted its
+own checkpoint on the losing branch.
 
 It never touches a chain that already runs on the host.
 
