@@ -935,5 +935,54 @@ for node in "M $START_M" "H $START_H"; do
 done
 pass "the fake pair at eCash height $H11 restarted each node at most once, and the stake root went from $ROOT11 to $(last_root M)"
 
+# ---------------------------------------------------------------------------
+step "12. a node that rooted its own checkpoint restarts onto a branch with more checkpoints"
+MARK_M=$(lines M) MARK_H=$(lines H)
+read -r _ S12 _ < <(checkpoint H)
+wait_log M "head Some\($S12\)" "$MARK_M" >/dev/null
+wait_log H "head Some\($S12\)" "$MARK_H" >/dev/null
+mine "$K"
+wait_log M "moves the root from [0-9]+ to anchor $S12\$" "$MARK_M"
+wait_log H "moves the root from [0-9]+ to anchor $S12\$" "$MARK_H"
+echo "both nodes rooted anchor $S12"
+partition
+SPLIT12="$(sol M slot)"
+sleep 20
+wait_recorded_above M "$SPLIT12"
+wait_recorded_above H "$SPLIT12"
+MARK_M=$(lines M) MARK_H=$(lines H)
+read -r X12 A12 _ < <(checkpoint M)
+read -r _ B12 _ < <(checkpoint H)
+read -r _ C12 _ < <(checkpoint H)
+for slot in "$A12" "$B12" "$C12"; do
+  [ "$slot" -gt "$SPLIT12" ] || fail "a bid names slot $slot, which is not after the split"
+done
+echo "eCash height $X12 commits slot $A12 on M, and the next two heights commit slots $B12 and $C12 on H"
+# M holds only its own checkpoint, so M roots it while H's branch gets two.
+wait_log M "moves the root from [0-9]+ to anchor $A12\$" "$MARK_M" 120
+mine "$RESTART_BLOCKS"
+wait_log H "moves the root from [0-9]+ to anchor $C12\$" "$MARK_H" 120
+heal
+wait_log M "select a branch that splits behind root" "$MARK_M" 120
+wait_log M "the validator stopped with exit code 75" "$MARK_M" 60
+wait_log M "BMM restart: the start loads a snapshot at or below slot $S12" "$MARK_M" 120
+# No eCash block comes, so the restart hold keeps the root still until the
+# blocks of H's branch arrive by repair.
+logs_within M "the restart hold starts" "$MARK_M" 120 || fail "M had no restart hold"
+logs_within M "the restart hold ends" "$MARK_M" 240 || fail "the blocks of H's branch never came to M"
+wait_log M "moves the root from [0-9]+ to anchor $C12\$" "$MARK_M" 240
+RESTARTS12="$(log_since M "$MARK_M" | grep -ac "the validator stopped with exit code 75" || true)"
+[ "$RESTARTS12" = 1 ] || fail "M restarted $RESTARTS12 times for one branch"
+OWN_ROOTS="$(log_since M "$MARK_M" | grep -acE "moves the root from [0-9]+ to anchor $A12\$" || true)"
+[ "$OWN_ROOTS" = 1 ] || fail "M rooted its own checkpoint slot $A12 $OWN_ROOTS times, so the restart rooted the losing branch again"
+sleep 10
+read -r C12F C12F_HASH < <(confirmed_frozen H)
+for _ in $(seq 1 30); do
+  [ "$(frozen_hash M "$C12F")" = "$C12F_HASH" ] && break
+  sleep 2
+done
+[ "$(frozen_hash M "$C12F")" = "$C12F_HASH" ] || fail "M and H froze slot $C12F with other hashes"
+pass "M rooted slot $A12, restarted from a snapshot at or below anchor $S12, held its root until H's branch arrived, and rooted anchor $C12"
+
 echo
-echo "PASS: BMM checkpoints select the fork and move the root in all eleven cases."
+echo "PASS: BMM checkpoints select the fork and move the root in all twelve cases."

@@ -134,7 +134,7 @@ index 57ac688..6392ac8 100644
  solana-accounts-db = { workspace = true }
  solana-address-lookup-table-interface = { workspace = true }
 diff --git a/core/src/banking_stage/consumer.rs b/core/src/banking_stage/consumer.rs
-index 9c1e4e5..69ffe66 100644
+index 9c1e4e5..d9287fa 100644
 --- a/core/src/banking_stage/consumer.rs
 +++ b/core/src/banking_stage/consumer.rs
 @@ -478,12 +478,17 @@ impl Consumer {
@@ -161,7 +161,7 @@ index 9c1e4e5..69ffe66 100644
          let (mut fee_payer_account, _slot) = bank
              .rc
              .accounts
-@@ -552,6 +557,66 @@ mod tests {
+@@ -552,6 +557,78 @@ mod tests {
          test_case::test_case,
      };
  
@@ -171,7 +171,10 @@ index 9c1e4e5..69ffe66 100644
 +            solana_runtime::genesis_utils::{
 +                ValidatorVoteKeypairs, create_genesis_config_with_vote_accounts,
 +            },
-+            solana_vote_program::{vote_instruction, vote_state::TowerSync},
++            solana_vote_program::{
++                vote_instruction,
++                vote_state::{TowerSync, Vote},
++            },
 +        };
 +        let staked = ValidatorVoteKeypairs::new_rand();
 +        let unstaked = ValidatorVoteKeypairs::new_rand();
@@ -200,18 +203,26 @@ index 9c1e4e5..69ffe66 100644
 +                _ => keys.vote_keypair.insecure_clone(),
 +            }
 +        };
-+        let fee_check = |keys: &ValidatorVoteKeypairs| {
++        let fee_check = |keys: &ValidatorVoteKeypairs, legacy: bool| {
 +            let voter = voter_of(keys);
 +            let minimum = bank.get_minimum_balance_for_rent_exemption(0);
 +            bank.store_account(
 +                &voter.pubkey(),
 +                &AccountSharedData::new(minimum, 0, &system_program::id()),
 +            );
-+            let instruction = vote_instruction::tower_sync(
-+                &keys.vote_keypair.pubkey(),
-+                &voter.pubkey(),
-+                TowerSync::new_from_slot(0, Hash::default()),
-+            );
++            let instruction = if legacy {
++                vote_instruction::vote(
++                    &keys.vote_keypair.pubkey(),
++                    &voter.pubkey(),
++                    Vote::new(vec![0], Hash::default()),
++                )
++            } else {
++                vote_instruction::tower_sync(
++                    &keys.vote_keypair.pubkey(),
++                    &voter.pubkey(),
++                    TowerSync::new_from_slot(0, Hash::default()),
++                )
++            };
 +            let tx =
 +                RuntimeTransaction::from_transaction_for_tests(Transaction::new_signed_with_payer(
 +                    &[instruction],
@@ -221,8 +232,9 @@ index 9c1e4e5..69ffe66 100644
 +                ));
 +            Consumer::check_fee_payer_unlocked(&bank, &tx, &mut TransactionErrorMetrics::default())
 +        };
-+        assert_eq!(fee_check(&staked), Ok(()));
-+        assert!(fee_check(&unstaked).is_err());
++        assert_eq!(fee_check(&staked, false), Ok(()));
++        assert!(fee_check(&staked, true).is_err());
++        assert!(fee_check(&unstaked, false).is_err());
 +    }
 +
      struct TestFrame {
@@ -298,10 +310,10 @@ index 0d4a055..4c53368 100644
          let max_validators = 2;
 diff --git a/core/src/bmm_fork_choice.rs b/core/src/bmm_fork_choice.rs
 new file mode 100644
-index 0000000..fb1f200
+index 0000000..7af5fd0
 --- /dev/null
 +++ b/core/src/bmm_fork_choice.rs
-@@ -0,0 +1,515 @@
+@@ -0,0 +1,518 @@
 +//! sol-drivechain: BMM checkpoints select the fork and move the root. The
 +//! decision logic is in `sol_drivechain_bmm::fork_choice`. This module feeds it
 +//! the bank forks, the deposit credits of each bank, and the eCash view, and
@@ -678,8 +690,7 @@ index 0000000..fb1f200
 +            .absent
 +            .iter()
 +            .filter(|checkpoint| {
-+                checkpoint.height > restart.anchor.height
-+                    && checkpoint.height <= restart.trigger_height
++                checkpoint.height > restart.anchor.height.max(self.saved.handled_height)
 +            })
 +            .map(|checkpoint| checkpoint.bank_hash)
 +            .collect();
@@ -738,8 +749,8 @@ index 0000000..fb1f200
 +}
 +
 +/// Applies the restart hold to `choice`, and writes `saved` when the hold
-+/// ends. The end stays in memory when the write fails, so the pause after it
-+/// still holds.
++/// takes its first tip or ends. The change stays in memory when the write
++/// fails, so the pause after an end still holds.
 +fn apply_hold(
 +    choice: &mut Choice,
 +    saved: &mut Saved,
@@ -750,7 +761,11 @@ index 0000000..fb1f200
 +    if !fork_choice::apply_hold(choice, saved, holds, tip_height) {
 +        return Ok(());
 +    }
-+    info!("BMM: the restart hold ends at eCash tip {tip_height}");
++    if saved.hold.is_some() {
++        info!("BMM: the restart hold starts at eCash tip {tip_height}");
++    } else {
++        info!("BMM: the restart hold ends at eCash tip {tip_height}");
++    }
 +    saved.store(ledger)
 +}
 +
@@ -801,7 +816,7 @@ index 0000000..fb1f200
 +    fn a_failed_store_keeps_the_end_of_a_hold() {
 +        let mut saved = Saved {
 +            hold: Some(Hold {
-+                tip_height: 50,
++                tip_height: Some(50),
 +                bank_hashes: vec![[3; 32]],
 +            }),
 +            ..Saved::default()
@@ -915,7 +930,7 @@ index 5180157..7eafc97 100644
  pub mod cluster_slots_service;
  pub mod commitment_service;
 diff --git a/core/src/replay_stage.rs b/core/src/replay_stage.rs
-index c5a5f4d..c882afd 100644
+index c5a5f4d..637f10c 100644
 --- a/core/src/replay_stage.rs
 +++ b/core/src/replay_stage.rs
 @@ -4,6 +4,7 @@ use {
@@ -955,7 +970,7 @@ index c5a5f4d..c882afd 100644
                          .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
 +                    if let Some(bmm) = bmm_choice.as_mut() {
 +                        if let Err(error) = bmm.update(forks_root, &frozen_banks) {
-+                            error!("cannot write the BMM fork choice state: {error}");
++                            panic!("cannot write the BMM fork choice state: {error}");
 +                        }
 +                        let bmm_heaviest =
 +                            bmm.heaviest(&tbft_structs.heaviest_subtree_fork_choice, &bank_forks);
@@ -1103,7 +1118,7 @@ index c5a5f4d..c882afd 100644
  
          if let Some(new_root) = new_root {
              let highest_super_majority_root = Some(
-@@ -4955,6 +5055,91 @@ impl ReplayStage {
+@@ -4955,6 +5055,88 @@ impl ReplayStage {
          duplicate_confirmed_forks
      }
  
@@ -1141,15 +1156,12 @@ index c5a5f4d..c882afd 100644
 +                );
 +                std::process::exit(bmm_fork_choice::RESTART_EXIT_CODE);
 +            }
-+            Err(error) => error!("cannot write the BMM restart request: {error}"),
++            Err(error) => panic!("cannot make the BMM restart request: {error}"),
 +        }
 +        let new_root = match bmm.take_new_root(root) {
 +            Ok(Some(new_root)) => new_root,
 +            Ok(None) => return None,
-+            Err(error) => {
-+                error!("cannot write the BMM anchors, so the root stays at {root}: {error}");
-+                return None;
-+            }
++            Err(error) => panic!("cannot write the BMM anchors: {error}"),
 +        };
 +        info!("BMM fork choice moves the root from {root} to anchor {new_root}");
 +        let highest_super_majority_root = Some(
@@ -2348,7 +2360,7 @@ index 2c2292f..52634d7 100644
  solana-account-info = { workspace = true }
  solana-accounts-db = { workspace = true }
 diff --git a/runtime/src/bank.rs b/runtime/src/bank.rs
-index c8399cb..e65b4e8 100644
+index c8399cb..ba8e983 100644
 --- a/runtime/src/bank.rs
 +++ b/runtime/src/bank.rs
 @@ -233,6 +233,7 @@ use {
@@ -2418,12 +2430,29 @@ index c8399cb..e65b4e8 100644
 +            processing_config.strict_nonce_size_check,
 +        );
 +        let check_results = self.check_bmm_settles(sanitized_txs, check_results, bmm_check);
-+        let check_results = self.waive_staked_vote_fees(sanitized_txs, check_results);
++        let (check_results, free_votes) = self.waive_staked_vote_fees(sanitized_txs, check_results);
 +
          let (blockhash, blockhash_lamports_per_signature) =
              self.last_blockhash_and_lamports_per_signature();
          let effective_epoch_of_deployments =
-@@ -4473,14 +4503,9 @@ impl Bank {
+@@ -4021,7 +4051,7 @@ impl Bank {
+             rent: self.rent_collector.rent.clone(),
+         };
+ 
+-        let sanitized_output = self
++        let mut sanitized_output = self
+             .transaction_processor
+             .load_and_execute_sanitized_transactions(
+                 self,
+@@ -4030,6 +4060,7 @@ impl Bank {
+                 &processing_environment,
+                 &processing_config,
+             );
++        bmm::drop_failed_free_votes(&mut sanitized_output.processing_results, &free_votes);
+ 
+         // Accumulate the errors returned by the batch processor.
+         error_counters.accumulate(&sanitized_output.error_metrics);
+@@ -4473,14 +4504,9 @@ impl Bank {
              .collect()
      }
  
@@ -2441,7 +2470,7 @@ index c8399cb..e65b4e8 100644
  
      /// Returns the accounts, sorted by pubkey, that were part of accounts lt hash calculation
      /// This is used when writing a bank hash details file.
-@@ -5143,6 +5168,7 @@ impl Bank {
+@@ -5143,6 +5169,7 @@ impl Bank {
      }
  
      // if you want get_account_modified_since_parent without fixed_root, please define so...
@@ -2449,7 +2478,7 @@ index c8399cb..e65b4e8 100644
      fn get_account_modified_since_parent_with_fixed_root(
          &self,
          pubkey: &Pubkey,
-@@ -6296,7 +6322,16 @@ impl Bank {
+@@ -6296,7 +6323,16 @@ impl Bank {
          let mut pending = AHashSet::new();
          let slot = self.slot();
  
@@ -2468,10 +2497,10 @@ index c8399cb..e65b4e8 100644
                  && let Some(feature) = feature::state::from_account(&account)
 diff --git a/runtime/src/bank/bmm.rs b/runtime/src/bank/bmm.rs
 new file mode 100644
-index 0000000..513df3f
+index 0000000..ab6acc7
 --- /dev/null
 +++ b/runtime/src/bank/bmm.rs
-@@ -0,0 +1,966 @@
+@@ -0,0 +1,1155 @@
 +//! sol-drivechain: the settle and credit pre-checks.
 +//!
 +//! `settle_bmm(H, M, S)` pays the payee of the commitment in eCash block M at
@@ -2493,6 +2522,7 @@ index 0000000..513df3f
 +
 +use {
 +    super::Bank,
++    bincode::Options,
 +    sol_drivechain_bmm::{
 +        BLOCK_RECORD_LEN, BLOCK_RECORD_STRIDE, BMM_ANSWER_ID, BMM_BLOCKS_ID, BMM_PAID_ID,
 +        BMM_PARAMS_ID, ChainParams, CreditQuestion, Credits, DEFAULT_CONFIRMATIONS,
@@ -2504,10 +2534,18 @@ index 0000000..513df3f
 +    },
 +    solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
 +    solana_hash::Hash,
++    solana_packet::PACKET_DATA_SIZE,
 +    solana_pubkey::Pubkey,
 +    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
-+    solana_svm::account_loader::TransactionCheckResult,
++    solana_svm::{
++        account_loader::TransactionCheckResult,
++        transaction_processing_result::{
++            TransactionProcessingResult, TransactionProcessingResultExtensions,
++        },
++    },
++    solana_svm_transaction::svm_message::SVMMessage,
 +    solana_transaction_error::TransactionError,
++    solana_vote_interface::instruction::VoteInstruction,
 +};
 +
 +/// Who runs the batch, which sets the depth and the wait of the check.
@@ -2651,38 +2689,36 @@ index 0000000..513df3f
 +
 +    /// A simple vote pays no signature fee when its vote account holds stake
 +    /// in the epoch stakes and the authorized voter of that account signs
-+    /// it. Every other tx pays, so a free vote needs stake.
++    /// it. Every other tx pays, so a free vote needs stake. The second value
++    /// marks each tx without a fee for `drop_failed_free_votes`.
 +    pub(super) fn waive_staked_vote_fees(
 +        &self,
 +        sanitized_txs: &[impl TransactionWithMeta],
 +        check_results: Vec<TransactionCheckResult>,
-+    ) -> Vec<TransactionCheckResult> {
++    ) -> (Vec<TransactionCheckResult>, Vec<bool>) {
 +        check_results
 +            .into_iter()
 +            .zip(sanitized_txs)
-+            .map(|(result, tx)| {
-+                let details = result?;
-+                Ok(if self.is_staked_vote(tx) {
-+                    details.without_signature_fee()
-+                } else {
-+                    details
-+                })
++            .map(|(result, tx)| match result {
++                Ok(details) if self.is_staked_vote(tx) => {
++                    (Ok(details.without_signature_fee()), true)
++                }
++                result => (result, false),
 +            })
-+            .collect()
++            .unzip()
 +    }
 +
-+    /// True for a simple vote that pays no signature fee: its vote account
-+    /// holds at least 1/`MIN_VOTE_STAKE_PARTS` of the epoch stake and its
-+    /// authorized voter signs it.
++    /// True for a simple vote that pays no signature fee: one vote state
++    /// update, whose vote account holds at least 1/`MIN_VOTE_STAKE_PARTS` of
++    /// the epoch stake and whose authorized voter signs it.
 +    pub fn is_staked_vote(&self, tx: &impl TransactionWithMeta) -> bool {
-+        tx.is_simple_vote_transaction() && self.is_staked_vote_message(tx)
++        tx.is_simple_vote_transaction()
++            && is_vote_state_update(tx)
++            && self.is_staked_vote_message(tx)
 +    }
 +
 +    /// The same rule for a message alone, as a fee estimate sees it.
-+    pub(super) fn is_staked_simple_vote_message(
-+        &self,
-+        message: &impl solana_svm_transaction::svm_message::SVMMessage,
-+    ) -> bool {
++    pub(super) fn is_staked_simple_vote_message(&self, message: &impl SVMMessage) -> bool {
 +        let signatures = vec![
 +            solana_signature::Signature::default();
 +            usize::try_from(message.num_transaction_signatures())
@@ -2696,13 +2732,10 @@ index 0000000..513df3f
 +                    .program_instructions_iter()
 +                    .map(|(program_id, _)| program_id),
 +            );
-+        simple && self.is_staked_vote_message(message)
++        simple && is_vote_state_update(message) && self.is_staked_vote_message(message)
 +    }
 +
-+    fn is_staked_vote_message(
-+        &self,
-+        tx: &impl solana_svm_transaction::svm_message::SVMMessage,
-+    ) -> bool {
++    fn is_staked_vote_message(&self, tx: &impl SVMMessage) -> bool {
 +        let Some((_, instruction)) = tx.program_instructions_iter().next() else {
 +            return false;
 +        };
@@ -2741,7 +2774,7 @@ index 0000000..513df3f
 +        if check != BmmCheck::Replay {
 +            return None;
 +        }
-+        let answer = answers().recorded(self.slot(), signature?)?;
++        let answer = answers().recorded(self.slot(), &self.parent_hash.to_bytes(), signature?)?;
 +        log::debug!(
 +            "the replay of slot {} takes the answer of its first run",
 +            self.slot()
@@ -2796,6 +2829,7 @@ index 0000000..513df3f
 +        {
 +            answers().note(
 +                self.slot(),
++                &self.parent_hash.to_bytes(),
 +                signature,
 +                &tx.recent_blockhash().to_bytes(),
 +                &key,
@@ -2951,19 +2985,52 @@ index 0000000..513df3f
 +    pub(super) fn keep_bmm_answers(&self) {
 +        let slot = self.slot();
 +        let status_cache = self.status_cache.read().unwrap();
-+        let kept = answers().freeze(slot, |signature, blockhash| {
-+            status_cache
-+                .get_status(
-+                    solana_signature::Signature::from(*signature),
-+                    &Hash::new_from_array(*blockhash),
-+                    &self.ancestors,
-+                )
-+                .is_some_and(|(status_slot, _)| status_slot == slot)
-+        });
++        let kept = answers().freeze(
++            slot,
++            &self.parent_hash.to_bytes(),
++            |signature, blockhash| {
++                status_cache
++                    .get_status(
++                        solana_signature::Signature::from(*signature),
++                        &Hash::new_from_array(*blockhash),
++                        &self.ancestors,
++                    )
++                    .is_some_and(|(status_slot, _)| status_slot == slot)
++            },
++        );
 +        if let Err(error) = kept {
 +            panic!("cannot keep the BMM answers of slot {slot}: {error}");
 +        }
 +    }
++}
++
++/// A vote without a fee lands only when it succeeds. A failed one does not
++/// land: a leader drops it, and a replay marks its block dead.
++pub(super) fn drop_failed_free_votes(
++    processing_results: &mut [TransactionProcessingResult],
++    waived: &[bool],
++) {
++    for (result, waived) in processing_results.iter_mut().zip(waived) {
++        if *waived && let Err(error) = result.flattened_result() {
++            *result = Err(error);
++        }
++    }
++}
++
++/// True when the first instruction is one TowerSync or UpdateVoteState, in
++/// any of their forms.
++fn is_vote_state_update(message: &impl SVMMessage) -> bool {
++    message
++        .program_instructions_iter()
++        .next()
++        .is_some_and(|(_, instruction)| {
++            bincode::options()
++                .with_limit(PACKET_DATA_SIZE as u64)
++                .with_fixint_encoding()
++                .allow_trailing_bytes()
++                .deserialize_from::<_, VoteInstruction>(instruction.data)
++                .is_ok_and(|instruction| instruction.is_single_vote_state_update())
++        })
 +}
 +
 +struct Answer {
@@ -3018,13 +3085,24 @@ index 0000000..513df3f
 +mod tests {
 +    use {
 +        super::*,
-+        crate::{bank::SlotLeader, genesis_utils::create_genesis_config},
++        crate::{
++            bank::SlotLeader,
++            genesis_utils::{
++                ValidatorVoteKeypairs, create_genesis_config,
++                create_genesis_config_with_vote_accounts,
++            },
++        },
++        solana_clock::Slot,
 +        solana_instruction::{AccountMeta, Instruction},
 +        solana_keypair::Keypair,
 +        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
 +        solana_signer::Signer,
 +        solana_svm::account_loader::CheckedTransactionDetails,
 +        solana_transaction::{Transaction, sanitized::SanitizedTransaction},
++        solana_vote_program::{
++            vote_instruction,
++            vote_state::{TowerSync, Vote, VoteStateUpdate},
++        },
 +    };
 +
 +    fn config_data(next_height: u64, credited_height: u64, index: u64) -> Vec<u8> {
@@ -3308,6 +3386,7 @@ index 0000000..513df3f
 +        let tx = RuntimeTransaction::from_transaction_for_tests(tx);
 +        let fee = bank
 +            .waive_staked_vote_fees(&[tx], vec![Ok(details)])
++            .0
 +            .pop()
 +            .unwrap()
 +            .unwrap()
@@ -3318,12 +3397,6 @@ index 0000000..513df3f
 +
 +    #[test]
 +    fn only_a_vote_of_a_staked_authority_is_free() {
-+        use {
-+            crate::genesis_utils::{
-+                ValidatorVoteKeypairs, create_genesis_config_with_vote_accounts,
-+            },
-+            solana_vote_program::{vote_instruction, vote_state::TowerSync},
-+        };
 +        let staked = ValidatorVoteKeypairs::new_rand();
 +        let unstaked = ValidatorVoteKeypairs::new_rand();
 +        let tiny = ValidatorVoteKeypairs::new_rand();
@@ -3425,6 +3498,151 @@ index 0000000..513df3f
 +            estimate(tiny.vote_keypair.pubkey(), &tiny_authority),
 +            Some(5_000)
 +        );
++    }
++
++    fn voter_of(bank: &Bank, keys: &ValidatorVoteKeypairs) -> Keypair {
++        let voter = bank
++            .get_current_epoch_vote_accounts()
++            .get(&keys.vote_keypair.pubkey())
++            .and_then(|(_, account)| {
++                account
++                    .vote_state_view()
++                    .get_authorized_voter(bank.epoch())
++                    .copied()
++            });
++        match voter {
++            Some(voter) if voter == keys.node_keypair.pubkey() => {
++                keys.node_keypair.insecure_clone()
++            }
++            _ => keys.vote_keypair.insecure_clone(),
++        }
++    }
++
++    fn signed(instruction: Instruction, signer: &Keypair, blockhash: Hash) -> Transaction {
++        Transaction::new_signed_with_payer(
++            &[instruction],
++            Some(&signer.pubkey()),
++            &[signer],
++            blockhash,
++        )
++    }
++
++    #[test]
++    fn only_a_vote_state_update_is_free() {
++        let staked = ValidatorVoteKeypairs::new_rand();
++        let mut genesis = create_genesis_config_with_vote_accounts(
++            1_000_000_000_000,
++            &[&staked],
++            vec![1_000_000_000],
++        );
++        genesis.genesis_config.fee_rate_governor =
++            solana_fee_calculator::FeeRateGovernor::new(5_000, 0);
++        let bank = Bank::new_for_tests(&genesis.genesis_config);
++        let authority = voter_of(&bank, &staked);
++        let vote_key = staked.vote_keypair.pubkey();
++        let legacy = vote_instruction::vote(
++            &vote_key,
++            &authority.pubkey(),
++            Vote::new(vec![0], Hash::default()),
++        );
++        assert_eq!(
++            vote_fee(&bank, signed(legacy, &authority, Hash::default())),
++            5_000
++        );
++        let mut garbage = vote_instruction::tower_sync(
++            &vote_key,
++            &authority.pubkey(),
++            TowerSync::new_from_slot(0, Hash::default()),
++        );
++        garbage.data = vec![0xff; 8];
++        assert_eq!(
++            vote_fee(&bank, signed(garbage, &authority, Hash::default())),
++            5_000
++        );
++        let update = vote_instruction::update_vote_state(
++            &vote_key,
++            &authority.pubkey(),
++            VoteStateUpdate::from(vec![(0, 1)]),
++        );
++        assert_eq!(
++            vote_fee(&bank, signed(update, &authority, Hash::default())),
++            0
++        );
++    }
++
++    #[test]
++    fn a_free_vote_lands_only_when_it_succeeds() {
++        let staked = ValidatorVoteKeypairs::new_rand();
++        let unstaked = ValidatorVoteKeypairs::new_rand();
++        let mut genesis = create_genesis_config_with_vote_accounts(
++            1_000_000_000_000,
++            &[&staked, &unstaked],
++            vec![1_000_000_000, 0],
++        );
++        genesis.genesis_config.fee_rate_governor =
++            solana_fee_calculator::FeeRateGovernor::new(5_000, 0);
++        let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis.genesis_config);
++        let bank = Bank::new_from_parent_with_bank_forks(
++            bank_forks.as_ref(),
++            bank0.clone(),
++            SlotLeader::default(),
++            1,
++        );
++        let paid_by_node = |keys: &ValidatorVoteKeypairs, instruction: Instruction| {
++            let authority = voter_of(&bank, keys);
++            let payer = &keys.node_keypair;
++            let mut signers = vec![payer];
++            if authority.pubkey() != payer.pubkey() {
++                signers.push(&authority);
++            }
++            Transaction::new_signed_with_payer(
++                &[instruction],
++                Some(&payer.pubkey()),
++                &signers,
++                bank.last_blockhash(),
++            )
++        };
++        let tower_sync = |keys: &ValidatorVoteKeypairs, slot: Slot, hash: Hash| {
++            let authority = voter_of(&bank, keys);
++            let instruction = vote_instruction::tower_sync(
++                &keys.vote_keypair.pubkey(),
++                &authority.pubkey(),
++                TowerSync::new_from_slot(slot, hash),
++            );
++            paid_by_node(keys, instruction)
++        };
++        let landed = |tx: &Transaction| {
++            let _ = bank.process_transaction(tx);
++            bank.get_signature_status(&tx.signatures[0])
++        };
++
++        let payer = staked.node_keypair.pubkey();
++        let balance = bank.get_balance(&payer);
++        let count = bank.transaction_count();
++        assert_eq!(landed(&tower_sync(&staked, 5, Hash::default())), None);
++        assert_eq!(bank.get_balance(&payer), balance);
++        assert_eq!(bank.transaction_count(), count);
++
++        assert_eq!(landed(&tower_sync(&staked, 0, bank0.hash())), Some(Ok(())));
++        assert_eq!(bank.get_balance(&payer), balance);
++
++        let mut repeat = vote_instruction::tower_sync(
++            &staked.vote_keypair.pubkey(),
++            &voter_of(&bank, &staked).pubkey(),
++            TowerSync::new_from_slot(0, bank0.hash()),
++        );
++        repeat.accounts.push(AccountMeta::new_readonly(
++            solana_sdk_ids::sysvar::clock::id(),
++            false,
++        ));
++        assert_eq!(landed(&paid_by_node(&staked, repeat)), None);
++        assert_eq!(bank.get_balance(&payer), balance);
++
++        let unstaked_payer = unstaked.node_keypair.pubkey();
++        let unstaked_balance = bank.get_balance(&unstaked_payer);
++        let paid = tower_sync(&unstaked, 5, Hash::default());
++        assert!(matches!(landed(&paid), Some(Err(_))));
++        assert!(bank.get_balance(&unstaked_payer) < unstaked_balance);
 +    }
 +
 +    #[test]
@@ -3594,16 +3812,19 @@ index 0000000..a75986f
 +workspace = true
 diff --git a/sol-drivechain-bmm/src/answers.rs b/sol-drivechain-bmm/src/answers.rs
 new file mode 100644
-index 0000000..9546c9f
+index 0000000..920d738
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/answers.rs
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,587 @@
 +//! The answers of the pre-check, per tx. A replay of a rooted slot uses the
 +//! answer of its first run, because a later eCash reorg can drop the block
 +//! that the tx names, and the view then has no answer for it.
 +//!
 +//! The check of a tx only notes its answer. When the bank of the slot
 +//! freezes, the answers of the committed txs go to the file in one write.
++//!
++//! The parent bank hash is part of the key. A leader can make two blocks for
++//! one slot on two parents, and each block must get its own answer.
 +
 +use {
 +    solana_pubkey::Pubkey,
@@ -3619,8 +3840,13 @@ index 0000000..9546c9f
 +/// The file in the ledger directory that keeps the answers.
 +pub const ANSWERS_FILE: &str = "bmm-answers";
 +
-+/// The slot and the first signature of a tx.
-+type TxKey = (u64, [u8; 64]);
++/// The slot, the parent bank hash, and the first signature of a tx.
++type TxKey = (u64, [u8; 32], [u8; 64]);
++
++/// The parent bank hash and the first signature of a tx in one slot.
++type SlotTxKey = ([u8; 32], [u8; 64]);
++
++type Kept = HashMap<TxKey, (Pubkey, Vec<u8>)>;
 +
 +/// An answer that a check gave and that waits for the freeze of its bank.
 +#[derive(Clone, Debug, PartialEq, Eq)]
@@ -3632,8 +3858,8 @@ index 0000000..9546c9f
 +
 +#[derive(Default)]
 +struct State {
-+    by_tx: HashMap<TxKey, (Pubkey, Vec<u8>)>,
-+    noted: BTreeMap<u64, HashMap<[u8; 64], Noted>>,
++    by_tx: Kept,
++    noted: BTreeMap<u64, HashMap<SlotTxKey, Noted>>,
 +    path: Option<PathBuf>,
 +    file: crate::Sink,
 +    /// The blockstore root at the start. Only a slot at or below it takes a
@@ -3656,19 +3882,20 @@ index 0000000..9546c9f
 +impl AnswerStore {
 +    /// Reads the answers file in `ledger`, and adds each new answer to it
 +    /// from now on. A crash in a write can leave a part of the last line,
-+    /// and the open drops that part.
++    /// and the open drops that part. The open also drops each line without a
++    /// parent bank hash, from a version before the parent was in the key.
 +    pub fn open(&self, ledger: &Path) -> io::Result<()> {
 +        let path = ledger.join(ANSWERS_FILE);
 +        let (by_tx, file) = match fs::read_to_string(&path) {
 +            Ok(text) => {
 +                let complete = text.rfind('\n').map_or("", |end| &text[..=end]);
-+                let by_tx = parse(complete).ok_or_else(|| {
++                let (by_tx, old_lines) = parse(complete).ok_or_else(|| {
 +                    io::Error::new(
 +                        io::ErrorKind::InvalidData,
 +                        format!("{} holds a bad line", path.display()),
 +                    )
 +                })?;
-+                let file = if complete.len() != text.len() {
++                let file = if complete.len() != text.len() || old_lines > 0 {
 +                    crate::replace_file(&path, &render(&by_tx))?
 +                } else {
 +                    OpenOptions::new().append(true).open(&path)?
@@ -3694,20 +3921,27 @@ index 0000000..9546c9f
 +        self.state.lock().unwrap().replay_root = Some(slot);
 +    }
 +
-+    /// The answer of the first run of a tx in a slot from before the start.
-+    pub fn recorded(&self, slot: u64, signature: &[u8; 64]) -> Option<(Pubkey, Vec<u8>)> {
++    /// The answer of the first run of a tx in a slot from before the start,
++    /// in a bank with the parent `parent_hash`.
++    pub fn recorded(
++        &self,
++        slot: u64,
++        parent_hash: &[u8; 32],
++        signature: &[u8; 64],
++    ) -> Option<(Pubkey, Vec<u8>)> {
 +        let state = self.state.lock().unwrap();
 +        if state.replay_root.is_none_or(|root| slot > root) {
 +            return None;
 +        }
-+        state.by_tx.get(&(slot, *signature)).cloned()
++        state.by_tx.get(&(slot, *parent_hash, *signature)).cloned()
 +    }
 +
-+    /// Notes the answer that a tx in `slot` gets. `freeze` keeps it when the
-+    /// tx commits.
++    /// Notes the answer that a tx in `slot` on the parent `parent_hash` gets.
++    /// `freeze` keeps it when the tx commits.
 +    pub fn note(
 +        &self,
 +        slot: u64,
++        parent_hash: &[u8; 32],
 +        signature: &[u8; 64],
 +        blockhash: &[u8; 32],
 +        key: &Pubkey,
@@ -3715,7 +3949,7 @@ index 0000000..9546c9f
 +    ) {
 +        let mut state = self.state.lock().unwrap();
 +        state.noted.entry(slot).or_default().insert(
-+            *signature,
++            (*parent_hash, *signature),
 +            Noted {
 +                blockhash: *blockhash,
 +                key: *key,
@@ -3724,27 +3958,31 @@ index 0000000..9546c9f
 +        );
 +    }
 +
-+    /// Keeps the noted answers of `slot` whose tx `committed` gives true for,
-+    /// with one write and one sync.
++    /// Keeps the noted answers of `slot` on the parent `parent_hash` whose tx
++    /// `committed` gives true for, with one write and one sync. The noted
++    /// answers of the slot on another parent belong to a bank that did not
++    /// freeze, so they go.
 +    pub fn freeze(
 +        &self,
 +        slot: u64,
++        parent_hash: &[u8; 32],
 +        mut committed: impl FnMut(&[u8; 64], &[u8; 32]) -> bool,
 +    ) -> io::Result<()> {
 +        let mut state = self.state.lock().unwrap();
 +        let noted = state.noted.remove(&slot).unwrap_or_default();
 +        let mut text = String::new();
 +        let mut kept = Vec::new();
-+        for (signature, noted) in noted {
-+            if !committed(&signature, &noted.blockhash) {
++        for ((parent, signature), noted) in noted {
++            if parent != *parent_hash || !committed(&signature, &noted.blockhash) {
 +                continue;
 +            }
++            let tx_key = (slot, parent, signature);
 +            let entry = (noted.key, noted.data);
-+            if state.by_tx.get(&(slot, signature)) == Some(&entry) {
++            if state.by_tx.get(&tx_key) == Some(&entry) {
 +                continue;
 +            }
-+            text.push_str(&line(slot, &signature, &entry.0, &entry.1));
-+            kept.push(((slot, signature), entry));
++            text.push_str(&line(&tx_key, &entry.0, &entry.1));
++            kept.push((tx_key, entry));
 +        }
 +        if text.is_empty() {
 +            return Ok(());
@@ -3768,7 +4006,7 @@ index 0000000..9546c9f
 +    pub fn prune_below(&self, slot: u64) -> io::Result<()> {
 +        let mut state = self.state.lock().unwrap();
 +        let before = state.by_tx.len();
-+        state.by_tx.retain(|(tx_slot, _), _| *tx_slot >= slot);
++        state.by_tx.retain(|(tx_slot, _, _), _| *tx_slot >= slot);
 +        if state.by_tx.len() == before {
 +            return Ok(());
 +        }
@@ -3786,26 +4024,27 @@ index 0000000..9546c9f
 +            .unwrap()
 +            .by_tx
 +            .keys()
-+            .map(|(slot, _)| *slot)
++            .map(|(slot, _, _)| *slot)
 +            .min()
 +    }
 +}
 +
-+fn line(slot: u64, signature: &[u8; 64], key: &Pubkey, data: &[u8]) -> String {
++fn line((slot, parent_hash, signature): &TxKey, key: &Pubkey, data: &[u8]) -> String {
 +    format!(
-+        "answer {slot} {} {} {}\n",
++        "answer {slot} {} {} {} {}\n",
++        to_hex(parent_hash),
 +        to_hex(signature),
 +        to_hex(key.as_ref()),
 +        to_hex(data)
 +    )
 +}
 +
-+fn render(by_tx: &HashMap<TxKey, (Pubkey, Vec<u8>)>) -> Vec<u8> {
++fn render(by_tx: &Kept) -> Vec<u8> {
 +    let mut entries: Vec<_> = by_tx.iter().collect();
-+    entries.sort_by_key(|((slot, signature), _)| (*slot, *signature));
++    entries.sort_by_key(|(tx_key, _)| **tx_key);
 +    let mut text = String::new();
-+    for ((slot, signature), (key, data)) in entries {
-+        text.push_str(&line(*slot, signature, key, data));
++    for (tx_key, (key, data)) in entries {
++        text.push_str(&line(tx_key, key, data));
 +    }
 +    text.into_bytes()
 +}
@@ -3824,27 +4063,39 @@ index 0000000..9546c9f
 +        .collect()
 +}
 +
-+/// A later line for the same tx takes the place of an earlier one.
-+fn parse(text: &str) -> Option<HashMap<TxKey, (Pubkey, Vec<u8>)>> {
++/// A later line for the same tx takes the place of an earlier one. Also
++/// gives the count of lines without a parent bank hash, which it skips.
++fn parse(text: &str) -> Option<(Kept, usize)> {
 +    let mut by_tx = HashMap::new();
++    let mut old_lines = 0usize;
 +    for line in text.lines().filter(|line| !line.trim().is_empty()) {
 +        let words: Vec<&str> = line.split_whitespace().collect();
-+        let ["answer", slot, signature, key, data] = words.as_slice() else {
-+            return None;
++        let (slot, parent_hash, signature, key, data) = match words.as_slice() {
++            ["answer", slot, parent_hash, signature, key, data] => {
++                (slot, parent_hash, signature, key, data)
++            }
++            ["answer", _, _, _, _] => {
++                old_lines = old_lines.saturating_add(1);
++                continue;
++            }
++            _ => return None,
 +        };
++        let parent_hash: [u8; 32] = from_hex(parent_hash)?.try_into().ok()?;
 +        let signature: [u8; 64] = from_hex(signature)?.try_into().ok()?;
 +        let key: [u8; 32] = from_hex(key)?.try_into().ok()?;
 +        by_tx.insert(
-+            (slot.parse().ok()?, signature),
++            (slot.parse().ok()?, parent_hash, signature),
 +            (Pubkey::new_from_array(key), from_hex(data)?),
 +        );
 +    }
-+    Some(by_tx)
++    Some((by_tx, old_lines))
 +}
 +
 +#[cfg(test)]
 +mod tests {
 +    use {super::*, crate::BMM_ANSWER_ID};
++
++    const PARENT: [u8; 32] = [5; 32];
 +
 +    fn temp_dir(name: &str) -> std::path::PathBuf {
 +        let dir = std::env::temp_dir().join(format!("bmm-answers-{name}-{}", std::process::id()));
@@ -3854,8 +4105,8 @@ index 0000000..9546c9f
 +    }
 +
 +    fn keep(store: &AnswerStore, slot: u64, signature: [u8; 64], data: &[u8]) {
-+        store.note(slot, &signature, &[0; 32], &BMM_ANSWER_ID, data);
-+        store.freeze(slot, |_, _| true).unwrap();
++        store.note(slot, &PARENT, &signature, &[0; 32], &BMM_ANSWER_ID, data);
++        store.freeze(slot, &PARENT, |_, _| true).unwrap();
 +    }
 +
 +    fn lines(dir: &Path) -> usize {
@@ -3877,10 +4128,10 @@ index 0000000..9546c9f
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(40);
 +        assert_eq!(
-+            again.recorded(40, &[7; 64]),
++            again.recorded(40, &PARENT, &[7; 64]),
 +            Some((BMM_ANSWER_ID, vec![1, 2, 3]))
 +        );
-+        assert_eq!(again.recorded(40, &[8; 64]), None);
++        assert_eq!(again.recorded(40, &PARENT, &[8; 64]), None);
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
@@ -3888,11 +4139,14 @@ index 0000000..9546c9f
 +    fn a_slot_above_the_root_never_takes_a_recorded_answer() {
 +        let store = AnswerStore::default();
 +        keep(&store, 41, [8; 64], &[4]);
-+        assert_eq!(store.recorded(41, &[8; 64]), None);
++        assert_eq!(store.recorded(41, &PARENT, &[8; 64]), None);
 +        store.set_replay_root(40);
-+        assert_eq!(store.recorded(41, &[8; 64]), None);
++        assert_eq!(store.recorded(41, &PARENT, &[8; 64]), None);
 +        store.set_replay_root(41);
-+        assert_eq!(store.recorded(41, &[8; 64]), Some((BMM_ANSWER_ID, vec![4])));
++        assert_eq!(
++            store.recorded(41, &PARENT, &[8; 64]),
++            Some((BMM_ANSWER_ID, vec![4]))
++        );
 +    }
 +
 +    #[test]
@@ -3905,7 +4159,10 @@ index 0000000..9546c9f
 +        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(40);
-+        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![2])));
++        assert_eq!(
++            again.recorded(40, &PARENT, &[7; 64]),
++            Some((BMM_ANSWER_ID, vec![2]))
++        );
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
@@ -3914,19 +4171,19 @@ index 0000000..9546c9f
 +        let dir = temp_dir("committed");
 +        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
-+        store.note(40, &[7; 64], &[1; 32], &BMM_ANSWER_ID, &[1]);
-+        store.note(40, &[8; 64], &[2; 32], &BMM_ANSWER_ID, &[2]);
-+        store.note(40, &[8; 64], &[2; 32], &BMM_ANSWER_ID, &[2]);
++        store.note(40, &PARENT, &[7; 64], &[1; 32], &BMM_ANSWER_ID, &[1]);
++        store.note(40, &PARENT, &[8; 64], &[2; 32], &BMM_ANSWER_ID, &[2]);
++        store.note(40, &PARENT, &[8; 64], &[2; 32], &BMM_ANSWER_ID, &[2]);
 +        store
-+            .freeze(40, |signature, blockhash| {
++            .freeze(40, &PARENT, |signature, blockhash| {
 +                signature == &[7; 64] && blockhash == &[1; 32]
 +            })
 +            .unwrap();
 +        assert_eq!(lines(&dir), 1);
-+        store.freeze(40, |_, _| true).unwrap();
++        store.freeze(40, &PARENT, |_, _| true).unwrap();
 +        assert_eq!(lines(&dir), 1);
 +        store.set_replay_root(40);
-+        assert_eq!(store.recorded(40, &[8; 64]), None);
++        assert_eq!(store.recorded(40, &PARENT, &[8; 64]), None);
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
@@ -3955,21 +4212,27 @@ index 0000000..9546c9f
 +        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(60);
-+        assert_eq!(again.recorded(40, &[7; 64]), None);
-+        assert_eq!(again.recorded(60, &[9; 64]), Some((BMM_ANSWER_ID, vec![3])));
++        assert_eq!(again.recorded(40, &PARENT, &[7; 64]), None);
++        assert_eq!(
++            again.recorded(60, &PARENT, &[9; 64]),
++            Some((BMM_ANSWER_ID, vec![3]))
++        );
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
 +    #[test]
 +    fn a_noted_answer_waits_for_its_bank_until_the_root_passes_it() {
 +        let store = AnswerStore::default();
-+        store.note(10, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
-+        store.freeze(10_000, |_, _| true).unwrap();
++        store.note(10, &PARENT, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
++        store.freeze(10_000, &PARENT, |_, _| true).unwrap();
 +        store.prune_noted_below(10);
-+        store.freeze(10, |_, _| true).unwrap();
++        store.freeze(10, &PARENT, |_, _| true).unwrap();
 +        store.set_replay_root(10);
-+        assert_eq!(store.recorded(10, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
-+        store.note(20, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
++        assert_eq!(
++            store.recorded(10, &PARENT, &[7; 64]),
++            Some((BMM_ANSWER_ID, vec![1]))
++        );
++        store.note(20, &PARENT, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
 +        store.prune_noted_below(21);
 +        assert!(store.state.lock().unwrap().noted.is_empty());
 +    }
@@ -3988,7 +4251,10 @@ index 0000000..9546c9f
 +        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(41);
-+        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
++        assert_eq!(
++            again.recorded(40, &PARENT, &[7; 64]),
++            Some((BMM_ANSWER_ID, vec![1]))
++        );
 +        assert!(
 +            fs::read_to_string(dir.join(ANSWERS_FILE))
 +                .unwrap()
@@ -4016,8 +4282,14 @@ index 0000000..9546c9f
 +        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(42);
-+        assert_eq!(again.recorded(40, &[7; 64]), Some((BMM_ANSWER_ID, vec![1])));
-+        assert_eq!(again.recorded(42, &[9; 64]), Some((BMM_ANSWER_ID, vec![3])));
++        assert_eq!(
++            again.recorded(40, &PARENT, &[7; 64]),
++            Some((BMM_ANSWER_ID, vec![1]))
++        );
++        assert_eq!(
++            again.recorded(42, &PARENT, &[9; 64]),
++            Some((BMM_ANSWER_ID, vec![3]))
++        );
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
@@ -4027,10 +4299,10 @@ index 0000000..9546c9f
 +        let store = AnswerStore::default();
 +        store.open(&dir).unwrap();
 +        store.state.lock().unwrap().file = crate::Sink::Broken;
-+        store.note(40, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
-+        assert!(store.freeze(40, |_, _| true).is_err());
-+        store.note(41, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
-+        assert!(store.freeze(41, |_, _| true).is_err());
++        store.note(40, &PARENT, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
++        assert!(store.freeze(40, &PARENT, |_, _| true).is_err());
++        store.note(41, &PARENT, &[8; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
++        assert!(store.freeze(41, &PARENT, |_, _| true).is_err());
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
@@ -4048,7 +4320,78 @@ index 0000000..9546c9f
 +        let again = AnswerStore::default();
 +        again.open(&dir).unwrap();
 +        again.set_replay_root(60);
-+        assert_eq!(again.recorded(60, &[9; 64]), Some((BMM_ANSWER_ID, vec![3])));
++        assert_eq!(
++            again.recorded(60, &PARENT, &[9; 64]),
++            Some((BMM_ANSWER_ID, vec![3]))
++        );
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_second_version_of_a_slot_on_another_parent_takes_no_kept_answer() {
++        let dir = temp_dir("duplicate");
++        let store = AnswerStore::default();
++        store.open(&dir).unwrap();
++        let first_parent = [1; 32];
++        let second_parent = [2; 32];
++        store.note(40, &first_parent, &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
++        store.freeze(40, &first_parent, |_, _| true).unwrap();
++        store.freeze(40, &second_parent, |_, _| true).unwrap();
++
++        let again = AnswerStore::default();
++        again.open(&dir).unwrap();
++        again.set_replay_root(40);
++        assert_eq!(again.recorded(40, &second_parent, &[7; 64]), None);
++        assert_eq!(
++            again.recorded(40, &first_parent, &[7; 64]),
++            Some((BMM_ANSWER_ID, vec![1]))
++        );
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn the_freeze_keeps_only_the_answers_of_its_own_parent() {
++        let dir = temp_dir("own-parent");
++        let store = AnswerStore::default();
++        store.open(&dir).unwrap();
++        store.note(40, &[1; 32], &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[1]);
++        store.note(40, &[2; 32], &[7; 64], &[0; 32], &BMM_ANSWER_ID, &[2]);
++        store.freeze(40, &[2; 32], |_, _| true).unwrap();
++        assert_eq!(lines(&dir), 1);
++        store.set_replay_root(40);
++        assert_eq!(store.recorded(40, &[1; 32], &[7; 64]), None);
++        assert_eq!(
++            store.recorded(40, &[2; 32], &[7; 64]),
++            Some((BMM_ANSWER_ID, vec![2]))
++        );
++        assert!(store.state.lock().unwrap().noted.is_empty());
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn the_open_drops_the_lines_without_a_parent() {
++        let dir = temp_dir("old-lines");
++        let store = AnswerStore::default();
++        store.open(&dir).unwrap();
++        keep(&store, 40, [7; 64], &[1]);
++        let old = format!(
++            "answer 41 {} {} 04\n",
++            to_hex(&[8; 64]),
++            to_hex(BMM_ANSWER_ID.as_ref())
++        );
++        let mut file = OpenOptions::new()
++            .append(true)
++            .open(dir.join(ANSWERS_FILE))
++            .unwrap();
++        file.write_all(old.as_bytes()).unwrap();
++        let again = AnswerStore::default();
++        again.open(&dir).unwrap();
++        assert_eq!(lines(&dir), 1);
++        again.set_replay_root(41);
++        assert_eq!(
++            again.recorded(40, &PARENT, &[7; 64]),
++            Some((BMM_ANSWER_ID, vec![1]))
++        );
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
@@ -4941,10 +5284,10 @@ index 0000000..248a0d1
 +}
 diff --git a/sol-drivechain-bmm/src/fork_choice.rs b/sol-drivechain-bmm/src/fork_choice.rs
 new file mode 100644
-index 0000000..0574c28
+index 0000000..4ba39d4
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/fork_choice.rs
-@@ -0,0 +1,2474 @@
+@@ -0,0 +1,2742 @@
 +//! BMM fork choice. eCash checkpoints select the Solana branch, and they move
 +//! the Solana root.
 +//!
@@ -5557,14 +5900,18 @@ index 0000000..0574c28
 +/// checkpoints above the split name banks that this node does not know, the
 +/// node must replay from a snapshot at or below an anchor below the split.
 +/// Unknown checkpoints at or below `saved.handled_height` caused an earlier
-+/// restart, and they cannot cause another. `ancestors` is the block record of
++/// restart, so they cannot cause another, and they do not set the split. A
++/// restart loses the record of which checkpoints failed rule 3, so an old
++/// one can look unknown. A checkpoint for a bank that the hold waits for
++/// causes no restart while the hold runs. `ancestors` is the block record of
 +/// the root.
 +///
 +/// No shared data gives the slot of the split, so the eCash height of the
 +/// first unknown checkpoint stands for it. The anchor is the newest active
-+/// anchor below that height. Without one, it is the newest saved anchor below
-+/// that height. A node without a saved anchor replays from `saved.base`, the
-+/// root of its first start.
++/// anchor below that height and below the root, because the root can be an
++/// anchor on the losing branch. Without one, it is the newest saved anchor
++/// below both. Without one, the node replays from `saved.base`, the root of
++/// its first start.
 +///
 +/// `credited_tip` is the highest eCash height that a frozen bank credited. An
 +/// unknown checkpoint above it can name a bank that a node in catch-up did
@@ -5581,17 +5928,13 @@ index 0000000..0574c28
 +    params: Params,
 +) -> Option<Restart> {
 +    let anchors = known_anchors(saved, ancestors, checkpoints);
-+    let base = saved
-+        .anchors
-+        .is_empty()
-+        .then_some(saved.base)
-+        .flatten()
-+        .map(|base| Anchor {
-+            slot: base.slot,
-+            bank_hash: [0u8; 32],
-+            height: base.credited_height,
-+            block_hash: [0u8; 32],
-+        });
++    let saved_base = saved.base.map(|base| Anchor {
++        slot: base.slot,
++        bank_hash: [0u8; 32],
++        height: base.credited_height,
++        block_hash: [0u8; 32],
++    });
++    let base = saved_base.filter(|_| saved.anchors.is_empty());
 +    let floor = anchors
 +        .iter()
 +        .chain(base.iter())
@@ -5610,11 +5953,17 @@ index 0000000..0574c28
 +        .chain(ancestors.iter().map(|block| block.bank_hash))
 +        .chain(lost.iter().copied())
 +        .collect();
++    let waited: HashSet<BankHash> = saved
++        .hold
++        .iter()
++        .flat_map(|hold| hold.bank_hashes.iter().copied())
++        .collect();
 +    let theirs: Vec<u64> = checkpoints
 +        .iter()
 +        .filter(|checkpoint| {
-+            checkpoint.height > floor
++            checkpoint.height > floor.max(saved.handled_height)
 +                && !known.contains(&checkpoint.bank_hash)
++                && !waited.contains(&checkpoint.bank_hash)
 +                && checkpoint.height <= credited_tip
 +                && tip_height.saturating_sub(checkpoint.height) >= params.root_depth
 +        })
@@ -5639,26 +5988,23 @@ index 0000000..0574c28
 +        .enumerate()
 +        .find(|(index, height)| heights.len().saturating_sub(*index) > ours_above(**height))
 +        .map(|(_, height)| *height)?;
-+    let below_split = |anchor: &&Anchor| anchor.height < split_height;
++    let usable = |anchor: &&Anchor| anchor.height < split_height && anchor.slot < root;
 +    let anchor = anchors
 +        .iter()
-+        .filter(below_split)
++        .filter(usable)
 +        .filter(|anchor| anchor.is_active(checkpoints))
 +        .max_by_key(|anchor| anchor.slot)
 +        .or_else(|| {
 +            saved
 +                .anchors
 +                .iter()
-+                .filter(below_split)
++                .filter(usable)
 +                .max_by_key(|anchor| anchor.slot)
 +        })
-+        .or(base.as_ref().filter(below_split))
++        .or(saved_base.as_ref().filter(usable))
 +        .copied()?;
-+    if anchor.slot >= root {
-+        return None;
-+    }
 +    let trigger_height = *heights.last()?;
-+    (trigger_height > saved.handled_height).then_some(Restart {
++    Some(Restart {
 +        anchor,
 +        trigger_height,
 +    })
@@ -5761,54 +6107,80 @@ index 0000000..0574c28
 +    pub handled_height: u64,
 +    /// The next start must load a snapshot at or below this slot.
 +    pub restart_to: Option<Slot>,
-+    /// While a restart waits for its banks, the stake votes move no root.
++    /// While a restart waits for its banks, nothing moves the root.
 +    pub hold: Option<Hold>,
 +    /// No restart starts a hold below this eCash height.
 +    pub hold_pause_until: u64,
 +}
 +
-+/// The banks that a restart waits for, and the eCash tip at the restart.
++/// The banks that a restart waits for, and the first eCash tip that the node
++/// saw after the restart. An eCash block can come while the node starts, so
++/// the tip at the stop does not count.
 +#[derive(Clone, Debug, PartialEq, Eq)]
 +pub struct Hold {
-+    pub tip_height: u64,
++    pub tip_height: Option<u64>,
 +    pub bank_hashes: Vec<BankHash>,
 +}
 +
 +/// Starts a hold for a restart to `bank_hashes` at eCash tip `tip_height`,
-+/// unless the pause after a hold that brought no bank still runs.
++/// unless the pause after a hold that brought no bank still runs. A restart
++/// during a hold adds its banks, and the hold keeps its first tip.
 +pub fn start_hold(saved: &mut Saved, bank_hashes: Vec<BankHash>, tip_height: u64) {
-+    if tip_height >= saved.hold_pause_until && !bank_hashes.is_empty() {
-+        saved.hold = Some(Hold {
-+            tip_height,
-+            bank_hashes,
-+        });
++    if bank_hashes.is_empty() {
++        return;
++    }
++    match &mut saved.hold {
++        Some(hold) => {
++            for bank_hash in bank_hashes {
++                if !hold.bank_hashes.contains(&bank_hash) {
++                    hold.bank_hashes.push(bank_hash);
++                }
++            }
++        }
++        None if tip_height >= saved.hold_pause_until => {
++            saved.hold = Some(Hold {
++                tip_height: None,
++                bank_hashes,
++            });
++        }
++        None => (),
 +    }
 +}
 +
-+/// Stops the fallback while the hold waits. A bank of the hold that this node
-+/// holds ends it. The next eCash block ends it too, and then no hold starts for
-+/// one block, so fakes cannot keep the stake votes from the root. True when
-+/// `saved` changed.
++/// Stops the fallback and the BMM root moves while the hold waits, because a
++/// waited bank can be on any branch above the root. The hold ends when this
++/// node holds each of its banks, because a bank that is still absent causes a
++/// restart after the end. The first eCash block after the first tip that
++/// the node saw ends it too, and then no hold starts for one block, so fakes
++/// cannot keep the root still. True when `saved` changed.
 +pub fn apply_hold(
 +    choice: &mut Choice,
 +    saved: &mut Saved,
 +    holds: impl Fn(&BankHash) -> bool,
 +    tip_height: u64,
 +) -> bool {
-+    let Some(hold) = &saved.hold else {
++    let Some(hold) = &mut saved.hold else {
 +        return false;
 +    };
-+    if hold.bank_hashes.iter().any(holds) {
++    if hold.bank_hashes.iter().all(holds) {
 +        saved.hold = None;
 +        return true;
 +    }
-+    if tip_height > hold.tip_height {
-+        saved.hold = None;
-+        saved.hold_pause_until = tip_height.saturating_add(1);
-+        return true;
-+    }
++    let changed = match hold.tip_height {
++        Some(first) if tip_height > first => {
++            saved.hold = None;
++            saved.hold_pause_until = tip_height.saturating_add(1);
++            return true;
++        }
++        Some(_) => false,
++        None => {
++            hold.tip_height = Some(tip_height);
++            true
++        }
++    };
 +    choice.fallback = false;
-+    false
++    choice.new_root = None;
++    changed
 +}
 +
 +impl Saved {
@@ -5839,7 +6211,8 @@ index 0000000..0574c28
 +        let mut file = fs::File::create(&temp)?;
 +        file.write_all(self.render().as_bytes())?;
 +        file.sync_all()?;
-+        fs::rename(temp, path)
++        fs::rename(temp, &path)?;
++        crate::sync_parent(&path)
 +    }
 +
 +    fn render(&self) -> String {
@@ -5873,7 +6246,10 @@ index 0000000..0574c28
 +        }
 +        if let Some(hold) = &self.hold {
 +            let banks: Vec<String> = hold.bank_hashes.iter().map(to_hex).collect();
-+            text.push_str(&format!("hold {} {}\n", hold.tip_height, banks.join(",")));
++            let tip = hold
++                .tip_height
++                .map_or_else(|| "-".to_string(), |tip| tip.to_string());
++            text.push_str(&format!("hold {tip} {}\n", banks.join(",")));
 +        }
 +        if self.hold_pause_until > 0 {
 +            text.push_str(&format!("pause {}\n", self.hold_pause_until));
@@ -5917,7 +6293,10 @@ index 0000000..0574c28
 +                ["restart", slot] => saved.restart_to = Some(slot.parse().ok()?),
 +                ["hold", tip_height, banks] => {
 +                    saved.hold = Some(Hold {
-+                        tip_height: tip_height.parse().ok()?,
++                        tip_height: match *tip_height {
++                            "-" => None,
++                            tip => Some(tip.parse().ok()?),
++                        },
 +                        bank_hashes: banks.split(',').map(from_hex).collect::<Option<Vec<_>>>()?,
 +                    })
 +                }
@@ -6893,20 +7272,29 @@ index 0000000..0574c28
 +        );
 +    }
 +
-+    #[test]
-+    fn a_hold_stops_the_fallback_until_its_bank_arrives() {
-+        let mut saved = Saved::default();
-+        start_hold(&mut saved, vec![[0xee; 32]], 120);
-+        let mut choice = Choice {
++    fn held(new_root: Option<Slot>) -> Choice {
++        Choice {
++            new_root,
 +            fallback: true,
 +            ..Choice::default()
-+        };
++        }
++    }
++
++    /// A hold whose node saw eCash tip `tip` after the restart.
++    fn seen_hold(saved: &mut Saved, bank_hashes: Vec<BankHash>, tip: u64) {
++        start_hold(saved, bank_hashes, tip);
++        assert!(apply_hold(&mut held(None), saved, |_| false, tip));
++    }
++
++    #[test]
++    fn a_hold_stops_the_fallback_and_the_root_until_its_bank_arrives() {
++        let mut saved = Saved::default();
++        seen_hold(&mut saved, vec![[0xee; 32]], 120);
++        let mut choice = held(Some(12));
 +        assert!(!apply_hold(&mut choice, &mut saved, |_| false, 120));
 +        assert!(!choice.fallback);
-+        let mut choice = Choice {
-+            fallback: true,
-+            ..Choice::default()
-+        };
++        assert_eq!(choice.new_root, None);
++        let mut choice = held(Some(12));
 +        assert!(apply_hold(
 +            &mut choice,
 +            &mut saved,
@@ -6914,6 +7302,7 @@ index 0000000..0574c28
 +            120
 +        ));
 +        assert!(choice.fallback);
++        assert_eq!(choice.new_root, Some(12));
 +        assert_eq!(saved.hold, None);
 +        assert_eq!(saved.hold_pause_until, 0);
 +    }
@@ -6921,13 +7310,11 @@ index 0000000..0574c28
 +    #[test]
 +    fn a_hold_ends_at_the_next_ecash_block_and_pauses_one_block() {
 +        let mut saved = Saved::default();
-+        start_hold(&mut saved, vec![[0xee; 32]], 120);
-+        let mut choice = Choice {
-+            fallback: true,
-+            ..Choice::default()
-+        };
++        seen_hold(&mut saved, vec![[0xee; 32]], 120);
++        let mut choice = held(Some(12));
 +        assert!(apply_hold(&mut choice, &mut saved, |_| false, 121));
 +        assert!(choice.fallback);
++        assert_eq!(choice.new_root, Some(12));
 +        assert_eq!(saved.hold, None);
 +        start_hold(&mut saved, vec![[0xef; 32]], 121);
 +        assert_eq!(saved.hold, None, "the pause block starts no hold");
@@ -6935,10 +7322,225 @@ index 0000000..0574c28
 +        assert_eq!(
 +            saved.hold,
 +            Some(Hold {
-+                tip_height: 122,
++                tip_height: None,
 +                bank_hashes: vec![[0xef; 32]],
 +            })
 +        );
++    }
++
++    #[test]
++    fn the_hold_starts_at_the_first_tip_after_the_restart() {
++        let mut saved = Saved::default();
++        start_hold(&mut saved, vec![[0xee; 32]], 120);
++        let mut choice = held(Some(12));
++        assert!(apply_hold(&mut choice, &mut saved, |_| false, 121));
++        assert_eq!(
++            choice.new_root, None,
++            "a block during the start ends no hold"
++        );
++        assert!(!choice.fallback);
++        assert_eq!(
++            saved.hold,
++            Some(Hold {
++                tip_height: Some(121),
++                bank_hashes: vec![[0xee; 32]],
++            })
++        );
++        let mut choice = held(Some(12));
++        assert!(!apply_hold(&mut choice, &mut saved, |_| false, 121));
++        assert_eq!(choice.new_root, None);
++        let mut choice = held(Some(12));
++        assert!(apply_hold(&mut choice, &mut saved, |_| false, 122));
++        assert_eq!(choice.new_root, Some(12));
++        assert_eq!(saved.hold, None);
++        assert_eq!(saved.hold_pause_until, 123);
++    }
++
++    #[test]
++    fn a_restart_during_a_hold_adds_its_banks_and_keeps_the_first_tip() {
++        let mut saved = Saved::default();
++        seen_hold(&mut saved, vec![[0xee; 32]], 120);
++        start_hold(&mut saved, vec![[0xee; 32], [0xef; 32]], 120);
++        assert_eq!(
++            saved.hold,
++            Some(Hold {
++                tip_height: Some(120),
++                bank_hashes: vec![[0xee; 32], [0xef; 32]],
++            })
++        );
++        let mut choice = held(None);
++        assert!(apply_hold(&mut choice, &mut saved, |_| false, 121));
++        assert_eq!(saved.hold, None);
++    }
++
++    /// Root 10. Blocks 11 and 12 have parent 10, and 13 has parent 11. eCash
++    /// 99 commits 10, 100 commits 12, 101 commits 11, and 102 commits 13.
++    fn rooted_own_checkpoint() -> (Vec<Checkpoint>, Saved) {
++        let checkpoints = vec![
++            checkpoint(99, 10),
++            checkpoint(100, 12),
++            checkpoint(101, 11),
++            checkpoint(102, 13),
++        ];
++        let saved = saved(&[anchor(99, 10), anchor(100, 12)], &[], 0);
++        (checkpoints, saved)
++    }
++
++    #[test]
++    fn checkpoints_of_an_earlier_restart_do_not_pull_the_split_down() {
++        let stale = |height: u64, byte: u8| Checkpoint {
++            height,
++            block_hash: block(height),
++            bank_hash: [byte; 32],
++        };
++        let checkpoints = [
++            checkpoint(170, 5),
++            stale(176, 0xd1),
++            stale(177, 0xd2),
++            checkpoint(178, 10),
++            stale(189, 0xd3),
++            checkpoint(201, 12),
++            checkpoint(204, 20),
++            unknown(205),
++        ];
++        let saved = saved(
++            &[
++                anchor(170, 5),
++                anchor(178, 10),
++                anchor(201, 12),
++                anchor(204, 20),
++            ],
++            &[],
++            189,
++        );
++        assert_eq!(
++            restart(
++                20,
++                &tree(&[(20, 0)]),
++                &checkpoints,
++                207,
++                &saved,
++                &[],
++                u64::MAX,
++                PARAMS
++            ),
++            Some(Restart {
++                anchor: anchor(201, 12),
++                trigger_height: 205,
++            })
++        );
++    }
++
++    #[test]
++    fn a_bank_that_the_hold_waits_for_causes_no_second_restart() {
++        let checkpoints = [checkpoint(100, 5), unknown(101), unknown(102)];
++        let mut saved = saved(&[anchor(100, 5)], &[], 101);
++        let at = |saved: &Saved| restart_at_saved(&checkpoints, 105, saved);
++        assert_eq!(
++            at(&saved),
++            Some(Restart {
++                anchor: anchor(100, 5),
++                trigger_height: 102,
++            })
++        );
++        start_hold(&mut saved, vec![[0xee; 32]], 104);
++        assert_eq!(at(&saved), None);
++        saved.hold = None;
++        assert!(at(&saved).is_some(), "a hold that ended stops no restart");
++    }
++
++    fn restart_at_saved(
++        checkpoints: &[Checkpoint],
++        tip_height: u64,
++        saved: &Saved,
++    ) -> Option<Restart> {
++        restart(
++            10,
++            &split(),
++            checkpoints,
++            tip_height,
++            saved,
++            &[],
++            u64::MAX,
++            PARAMS,
++        )
++    }
++
++    #[test]
++    fn a_restart_picks_an_anchor_below_the_root() {
++        let (checkpoints, saved) = rooted_own_checkpoint();
++        let banks = tree(&[(12, 0)]);
++        assert_eq!(
++            restart(12, &banks, &checkpoints, 104, &saved, &[], u64::MAX, PARAMS),
++            Some(Restart {
++                anchor: anchor(99, 10),
++                trigger_height: 102,
++            })
++        );
++    }
++
++    #[test]
++    fn a_restart_goes_to_the_base_when_each_anchor_is_at_or_above_the_root() {
++        let (checkpoints, mut saved) = rooted_own_checkpoint();
++        saved.anchors = vec![anchor(100, 12)];
++        saved.base = Some(base(0, 0));
++        assert_eq!(
++            restart(
++                12,
++                &tree(&[(12, 0)]),
++                &checkpoints,
++                104,
++                &saved,
++                &[],
++                u64::MAX,
++                PARAMS
++            ),
++            Some(Restart {
++                anchor: base_anchor(0),
++                trigger_height: 102,
++            })
++        );
++        saved.base = None;
++        assert_eq!(
++            restart(
++                12,
++                &tree(&[(12, 0)]),
++                &checkpoints,
++                104,
++                &saved,
++                &[],
++                u64::MAX,
++                PARAMS
++            ),
++            None
++        );
++    }
++
++    #[test]
++    fn after_a_restart_the_hold_keeps_the_root_off_the_losing_branch_until_repair() {
++        let (checkpoints, mut saved) = rooted_own_checkpoint();
++        start_hold(&mut saved, vec![hash(11), hash(13)], 104);
++        let replayed = tree(&[(10, 0), (12, 10)]);
++        let mut choice = choose(10, &replayed, &checkpoints, 104, PARAMS);
++        assert_eq!(choice.new_root, Some(12));
++        assert!(apply_hold(&mut choice, &mut saved, |_| false, 105));
++        assert_eq!(choice.new_root, None);
++
++        let part = tree(&[(10, 0), (12, 10), (11, 10)]);
++        let mut choice = choose(10, &part, &checkpoints, 105, PARAMS);
++        let holds = |bank: &BankHash| part.iter().any(|fork| fork.hash == *bank);
++        assert!(!apply_hold(&mut choice, &mut saved, holds, 105));
++        assert_eq!(
++            choice.new_root, None,
++            "the hold waits for each of its banks"
++        );
++
++        let repaired = tree(&[(10, 0), (12, 10), (11, 10), (13, 11)]);
++        let mut choice = choose(10, &repaired, &checkpoints, 105, PARAMS);
++        let holds = |bank: &BankHash| repaired.iter().any(|fork| fork.hash == *bank);
++        assert!(apply_hold(&mut choice, &mut saved, holds, 105));
++        assert_eq!(choice.head, Some(13));
++        assert_eq!(choice.new_root, Some(13));
 +    }
 +
 +    #[test]
@@ -7356,13 +7958,22 @@ index 0000000..0574c28
 +            handled_height: 102,
 +            restart_to: Some(5),
 +            hold: Some(Hold {
-+                tip_height: 110,
++                tip_height: Some(110),
 +                bank_hashes: vec![[0xee; 32], [0xef; 32]],
 +            }),
 +            hold_pause_until: 98,
 +        };
 +        saved.store(&dir).unwrap();
 +        assert_eq!(Saved::load(&dir).unwrap(), saved);
++        let unseen = Saved {
++            hold: Some(Hold {
++                tip_height: None,
++                bank_hashes: vec![[0xee; 32]],
++            }),
++            ..saved
++        };
++        unseen.store(&dir).unwrap();
++        assert_eq!(Saved::load(&dir).unwrap(), unseen);
 +        fs::remove_dir_all(&dir).unwrap();
 +    }
 +
@@ -7421,10 +8032,10 @@ index 0000000..0574c28
 +}
 diff --git a/sol-drivechain-bmm/src/lib.rs b/sol-drivechain-bmm/src/lib.rs
 new file mode 100644
-index 0000000..45b0a84
+index 0000000..e872bc8
 --- /dev/null
 +++ b/sol-drivechain-bmm/src/lib.rs
-@@ -0,0 +1,2116 @@
+@@ -0,0 +1,2126 @@
 +//! The eCash view of a SOL drivechain validator.
 +//!
 +//! Each validator reads the active eCash chain from its own enforcer. Before a
@@ -7695,7 +8306,17 @@ index 0000000..45b0a84
 +    out.sync_all()?;
 +    let handle = std::fs::OpenOptions::new().append(true).open(&temp)?;
 +    std::fs::rename(&temp, path)?;
++    sync_parent(path)?;
 +    Ok(handle)
++}
++
++/// Syncs the directory of `path`, so a rename into it survives a crash.
++pub(crate) fn sync_parent(path: &std::path::Path) -> std::io::Result<()> {
++    let parent = path
++        .parent()
++        .filter(|parent| !parent.as_os_str().is_empty())
++        .unwrap_or_else(|| std::path::Path::new("."));
++    std::fs::File::open(parent)?.sync_all()
 +}
 +
 +/// `N` bytes from base58 text. Text longer than the base58 of `N` bytes fails
