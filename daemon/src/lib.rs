@@ -7,6 +7,7 @@ pub mod credit;
 pub mod enforcer;
 pub mod genesis;
 pub mod hex;
+pub mod loaded;
 pub mod m6;
 pub mod migrate;
 pub mod network;

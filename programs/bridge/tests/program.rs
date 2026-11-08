@@ -322,9 +322,10 @@ impl Chain {
         self.send(instruction, &user)
     }
 
-    fn seal_through_as(
+    fn seal_from_as(
         &mut self,
         signer: &Keypair,
+        first: u64,
         through: u64,
         m6id: [u8; 32],
     ) -> Result<(), String> {
@@ -334,23 +335,33 @@ impl Chain {
                 oracle: signer.pubkey(),
             }
             .to_account_metas(None),
-            instruction::SealBundle { through, m6id }.data(),
+            instruction::SealBundle {
+                first,
+                through,
+                m6id,
+            }
+            .data(),
         );
         let signer = signer.insecure_clone();
         self.svm.expire_blockhash();
         self.send(instruction, &signer)
     }
 
-    fn seal_through(&mut self, through: u64) -> Result<(), String> {
+    fn seal_from(&mut self, first: u64, through: u64) -> Result<(), String> {
         let oracle = self.oracle.insecure_clone();
-        self.seal_through_as(&oracle, through, m6id_of(through))
+        self.seal_from_as(&oracle, first, through, m6id_of(through))
+    }
+
+    fn seal_through(&mut self, through: u64) -> Result<(), String> {
+        let first = self.config().paid_through;
+        self.seal_from(first, through)
     }
 
     /// Seals the oldest open records, at most `MAX_BUNDLE_RECORDS` of them.
     fn seal_as(&mut self, signer: &Keypair) -> Result<(), String> {
         let config = self.config();
         let through = (config.paid_through + MAX_BUNDLE_RECORDS).min(config.withdrawal_count);
-        self.seal_through_as(signer, through, m6id_of(through))
+        self.seal_from_as(signer, config.paid_through, through, m6id_of(through))
     }
 
     fn seal(&mut self) -> Result<(), String> {
@@ -1688,6 +1699,48 @@ fn a_seal_ends_above_paid_through_and_within_the_cap_and_the_count() {
     chain.bundle_paid(1).expect("the bundle pays");
     assert!(chain.seal_through(1).is_err());
     chain.seal_through(2).expect("the next record seals");
+}
+
+#[test]
+fn a_seal_from_paid_through_seals() {
+    let mut chain = Chain::start();
+    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    for index in 0..3 {
+        chain
+            .withdraw(index, 2_000_000, MIN_FEE_SATS, &A_P2WPKH)
+            .expect("the withdrawal lands");
+    }
+    chain.seal_from(0, 1).expect("the first bundle seals");
+    chain.bundle_paid(1).expect("the first bundle pays");
+    chain
+        .seal_from(1, 3)
+        .expect("the next bundle seals from record 1");
+    let config = chain.config();
+    assert_eq!((config.paid_through, config.bundled_through), (1, 3));
+    assert_eq!(config.bundle_m6id, m6id_of(3));
+}
+
+#[test]
+fn a_seal_from_another_first_record_fails() {
+    let mut chain = Chain::start();
+    chain.deposit(0, A_DEPOSIT_SATS).expect("the deposit lands");
+    for index in 0..3 {
+        chain
+            .withdraw(index, 2_000_000, MIN_FEE_SATS, &A_P2WPKH)
+            .expect("the withdrawal lands");
+    }
+    chain.seal_from(0, 1).expect("the first bundle seals");
+    chain.bundle_paid(1).expect("the first bundle pays");
+    let bad_start = format!(
+        "Custom({})",
+        u32::from(sol_drivechain_bridge::BridgeError::BadBundleStart)
+    );
+    for first in [0, 2] {
+        let error = chain.seal_from(first, 3).unwrap_err();
+        assert!(error.contains(&bad_start), "first {first}: {error}");
+    }
+    let config = chain.config();
+    assert_eq!((config.paid_through, config.bundled_through), (1, 1));
 }
 
 #[test]

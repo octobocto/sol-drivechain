@@ -21,11 +21,13 @@ use crate::{
     bridge::{self, Config, WithdrawalRecord},
     credit,
     enforcer::{BundleEvent, Enforcer, PegEvent},
+    loaded,
     m6::{self, Payout},
     proto::mainchain::WithdrawalBundlePolicy,
 };
 
-/// The most records that one close tx takes.
+/// The most records that one close tx takes. Records with large owners take
+/// fewer, so the tx stays below the loaded data limit.
 const CLOSE_BATCH: usize = 10;
 
 pub struct Settings {
@@ -554,6 +556,7 @@ async fn pass(
                     bridge::seal_bundle_ix(
                         program_id,
                         &oracle.pubkey(),
+                        start,
                         end,
                         &m6id.to_byte_array(),
                     ),
@@ -679,12 +682,22 @@ async fn close_paid(
         CommitmentConfig::processed(),
     )
     .await?;
-    for batch in records.chunks(CLOSE_BATCH) {
-        let instructions: Vec<Instruction> = batch
-            .iter()
-            .map(|record| bridge::close_record_ix(program_id, &record.owner, record.index))
-            .collect();
-        send_all(rpc, oracle, &instructions).await?;
+    let instructions: Vec<Instruction> = records
+        .iter()
+        .map(|record| bridge::close_record_ix(program_id, &record.owner, record.index))
+        .collect();
+    let lens = loaded::loaded_lens(
+        rpc,
+        &loaded::tx_keys(&oracle.pubkey(), &instructions),
+        CommitmentConfig::processed(),
+    )
+    .await
+    .map_err(|source| PegError::Rpc {
+        call: "getMultipleAccounts(close accounts)",
+        source,
+    })?;
+    for batch in close_batches(&oracle.pubkey(), &instructions, &lens) {
+        send_all(rpc, oracle, batch).await?;
     }
     let left = read_records(
         rpc,
@@ -695,6 +708,30 @@ async fn close_paid(
     .await?;
     memory.closed_through = closed_through(memory.closed_through, finalized.paid_through, &left);
     Ok(())
+}
+
+/// Splits the close instructions into txs of at most `CLOSE_BATCH` each,
+/// and each tx stays below the loaded data budget.
+pub fn close_batches<'a>(
+    payer: &Pubkey,
+    instructions: &'a [Instruction],
+    lens: &std::collections::HashMap<Pubkey, u64>,
+) -> Vec<&'a [Instruction]> {
+    let items: Vec<Vec<Pubkey>> = instructions.iter().map(loaded::instruction_keys).collect();
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < instructions.len() {
+        let count = loaded::fitting(
+            &[*payer],
+            &items[start..],
+            lens,
+            loaded::LOADED_DATA_BUDGET,
+            CLOSE_BATCH,
+        );
+        batches.push(&instructions[start..start + count]);
+        start += count;
+    }
+    batches
 }
 
 /// The new close cursor: the lowest record of `left` that the BMM root still
@@ -937,7 +974,7 @@ mod tests {
                         self.sealed
                             .lock()
                             .unwrap()
-                            .push(tx[at + 8..at + 48].to_vec());
+                            .push(tx[at + 8..at + 56].to_vec());
                     }
                     if name == "close_record" {
                         return Err(ClientRpcError::ForUser(
@@ -1071,7 +1108,12 @@ mod tests {
         let m6id = m6::m6id(&bundle_of(&records[1..]).unwrap());
         assert_eq!(
             *sealed.lock().unwrap(),
-            [[&3u64.to_le_bytes()[..], &m6id.to_byte_array()].concat()]
+            [[
+                &1u64.to_le_bytes()[..],
+                &3u64.to_le_bytes(),
+                &m6id.to_byte_array()
+            ]
+            .concat()]
         );
     }
 
@@ -1093,7 +1135,12 @@ mod tests {
         let m6id = m6::m6id(&bundle_of(&rooted[1..]).unwrap());
         assert_eq!(
             *sealed.lock().unwrap(),
-            [[&2u64.to_le_bytes()[..], &m6id.to_byte_array()].concat()]
+            [[
+                &1u64.to_le_bytes()[..],
+                &2u64.to_le_bytes(),
+                &m6id.to_byte_array()
+            ]
+            .concat()]
         );
     }
 
@@ -1416,6 +1463,38 @@ mod tests {
             bundle_of(&[record]),
             Err(crate::m6::M6Error::FirstRecordTooLarge(_))
         ));
+    }
+
+    #[test]
+    fn a_close_batch_stays_under_the_loaded_data_limit() {
+        const MIB: u64 = 1024 * 1024;
+        let program_id = Pubkey::new_from_array([3u8; 32]);
+        let payer = Pubkey::new_from_array([4u8; 32]);
+        let records: Vec<WithdrawalRecord> =
+            (0..14).map(|index| a_record(index, 5_000, 1)).collect();
+        let instructions: Vec<Instruction> = records
+            .iter()
+            .map(|record| bridge::close_record_ix(&program_id, &record.owner, record.index))
+            .collect();
+        let mut lens: std::collections::HashMap<Pubkey, u64> =
+            loaded::tx_keys(&payer, &instructions)
+                .into_iter()
+                .map(|key| (key, loaded::ACCOUNT_BASE_LEN + 200))
+                .collect();
+        lens.insert(program_id, loaded::ACCOUNT_BASE_LEN + MIB);
+        for record in &records[..7] {
+            lens.insert(record.owner, loaded::ACCOUNT_BASE_LEN + 10 * MIB);
+        }
+        let batches = close_batches(&payer, &instructions, &lens);
+        let sizes: Vec<usize> = batches.iter().map(|batch| batch.len()).collect();
+        assert_eq!(sizes, [5, 9]);
+        for batch in batches {
+            let mut keys = loaded::tx_keys(&payer, batch);
+            keys.sort();
+            keys.dedup();
+            let total: u64 = keys.iter().map(|key| lens[key]).sum();
+            assert!(total <= loaded::LOADED_DATA_BUDGET, "{total}");
+        }
     }
 
     #[test]
